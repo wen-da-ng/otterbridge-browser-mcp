@@ -1,5 +1,13 @@
-// ===== Cursor element =====
+// ===== OtterBridge cursor (designed in Cursor Studio) =====
+const CURSOR_SIZE = 32;
+const CURSOR_TIP = { x: (4 / 24) * CURSOR_SIZE, y: (2 / 24) * CURSOR_SIZE }; // arrow hotspot
+const CURSOR_GLOW =
+  "drop-shadow(0 0 10px rgba(247,98,36,0.65)) drop-shadow(0 0 19px rgba(247,98,36,0.36))";
+const IDLE_DRIFT = true; // subtle at-rest cursor drift (human tell)
+
 let cursor = null;
+let restLeft = 40, restTop = 40;   // logical resting position of the cursor's top-left
+let isAnimating = false;
 
 function ensureCursor() {
   if (cursor && document.documentElement.contains(cursor)) return cursor;
@@ -7,18 +15,28 @@ function ensureCursor() {
   cursor.id = "__agent_cursor";
   Object.assign(cursor.style, {
     position: "fixed",
-    left: "40px",
-    top: "40px",
-    width: "24px",
-    height: "24px",
-    zIndex: "2147483647",     // stay on top of everything
-    pointerEvents: "none",     // CRITICAL: real clicks must pass through it
+    left: restLeft + "px",
+    top: restTop + "px",
+    width: CURSOR_SIZE + "px",
+    height: CURSOR_SIZE + "px",
+    zIndex: "2147483647",      // stay on top of everything
+    pointerEvents: "none",      // CRITICAL: real clicks must pass through it
     transition: "none",
     transform: "scale(1)",
+    transformOrigin: "0 0",
+    filter: CURSOR_GLOW,
   });
-  cursor.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24">
-    <path d="M4 2 L4 20 L9 15 L12 22 L15 20.5 L12 14 L19 14 Z"
-          fill="#111" stroke="#fff" stroke-width="1.5"/>
+  cursor.innerHTML = `<svg viewBox="0 0 24 24" width="${CURSOR_SIZE}" height="${CURSOR_SIZE}">
+    <defs>
+      <linearGradient id="__agent_cursor_grad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#FFE014"/>
+        <stop offset="1" stop-color="#F24E07"/>
+      </linearGradient>
+    </defs>
+    <path d="M4 2 L4 21 L9.6 16 L12.6 23 L16 21.4 L12.9 15 L20 15 Z"
+          fill="url(#__agent_cursor_grad)"
+          stroke="#F24E07" stroke-width="1.25"
+          stroke-linejoin="round" stroke-linecap="round"/>
   </svg>`;
   document.documentElement.appendChild(cursor);
   return cursor;
@@ -51,24 +69,75 @@ function moveCursorTo(tx, ty, samples = 12) {
       path.push({ x: Math.round(p.x), y: Math.round(p.y) });
     }
 
+    isAnimating = true;
     const start = performance.now();
     function frame(now) {
       const t = Math.min(1, (now - start) / duration);
       const p = bezier(ease(t));
       c.style.left = p.x + "px";
       c.style.top = p.y + "px";
-      if (t < 1) requestAnimationFrame(frame);
-      else resolve({ path });
+      if (t < 1) {
+        requestAnimationFrame(frame);
+      } else {
+        restLeft = tx; restTop = ty; isAnimating = false;
+        resolve({ path });
+      }
     }
     requestAnimationFrame(frame);
   });
 }
 
-// ===== Click pulse (press-down effect) =====
+// ===== Click pulse (press-down effect) + expanding ring ripple =====
 function clickPulse() {
   const c = ensureCursor();
-  c.style.transform = "scale(0.85)";
-  setTimeout(() => (c.style.transform = "scale(1)"), 120);
+  c.style.transition = "transform .12s ease";
+  c.style.transform = "scale(0.82)";
+  setTimeout(() => (c.style.transform = "scale(1)"), 130);
+
+  // Ring ripple centered on the cursor's tip (the actual click point).
+  const cx = (parseFloat(c.style.left) || 0) + CURSOR_TIP.x;
+  const cy = (parseFloat(c.style.top) || 0) + CURSOR_TIP.y;
+  const ring = document.createElement("div");
+  Object.assign(ring.style, {
+    position: "fixed",
+    left: cx + "px",
+    top: cy + "px",
+    width: CURSOR_SIZE * 0.5 + "px",
+    height: CURSOR_SIZE * 0.5 + "px",
+    border: "2px solid rgba(242,78,7,0.9)",   // #F24E07
+    borderRadius: "50%",
+    transform: "translate(-50%, -50%)",
+    pointerEvents: "none",
+    zIndex: "2147483646",
+    opacity: "1",
+    transition: "width .45s ease-out, height .45s ease-out, opacity .45s ease-out",
+  });
+  document.documentElement.appendChild(ring);
+  requestAnimationFrame(() => {
+    const end = CURSOR_SIZE * 2.6;
+    ring.style.width = end + "px";
+    ring.style.height = end + "px";
+    ring.style.opacity = "0";
+  });
+  setTimeout(() => ring.remove(), 480);
+}
+
+// ===== Idle micro-drift: tiny at-rest movement (subtle human tell) =====
+function startDrift() {
+  if (!IDLE_DRIFT) return;
+  let phase = 0;
+  function step() {
+    const c = ensureCursor();
+    if (!isAnimating) {
+      phase += 0.05;
+      const dx = Math.sin(phase * 1.3) * 0.6 + (Math.random() - 0.5) * 0.35;
+      const dy = Math.cos(phase) * 0.6 + (Math.random() - 0.5) * 0.35;
+      c.style.left = restLeft + dx + "px";
+      c.style.top = restTop + dy + "px";
+    }
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
 }
 
 // ===== Message handling =====
@@ -83,6 +152,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === "placeCursor") {
     const c = ensureCursor();
+    restLeft = msg.x; restTop = msg.y;
     c.style.left = msg.x + "px";
     c.style.top = msg.y + "px";
     sendResponse({ ok: true });
@@ -90,3 +160,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 ensureCursor();
+startDrift();
