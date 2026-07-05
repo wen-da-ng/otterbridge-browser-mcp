@@ -1,0 +1,17 @@
+[project]
+name = "otterbridge"
+version = "0.1.0"
+description = "OtterBridge - standard MCP server bridging browser actions to the Otter Chrome extension"
+requires-python = ">=3.11"
+authors = [{ name = "wen-da-ng", email = "lenus.ng.wen.da@gmail.com" }]
+# Pinned exactly: the FastMCP API (run_streamable_http_async, Image, Context.elicit)
+# is version-sensitive — the dev guide warns it drifts between mcp releases.
+# These are the versions this project was built and verified against.
+dependencies = [
+    "mcp==1.28.1",
+    "websockets==16.0",
+]
+
+# Not a distributable package — the server runs as a plain script
+# (`python server/server.py`). This file documents deps; install via the
+# repo-root requirements.txt: `uv pip install -r requirements.txt`.

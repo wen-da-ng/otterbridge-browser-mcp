@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Env / secrets
+.env
+*.local
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Runtime audit log
+server/agent_actions.log
+
+# OS / crash dumps
+Thumbs.db
+.DS_Store
+*.stackdump

@@ -1,0 +1,6 @@
+# OtterBridge server dependencies (by wen-da-ng) — pinned to the versions this project was built and
+# verified against. The FastMCP API (run_streamable_http_async, Image,
+# Context.elicit) is version-sensitive; see browser-agent-dev-guide.md section 5.
+#   Install:  uv pip install -r requirements.txt
+mcp==1.28.1
+websockets==16.0
