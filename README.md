@@ -7,7 +7,7 @@ MCP Inspector, or a LangGraph/Ollama agent loop.
 
 _Built by **wen-da-ng** · OtterBridge_
 
-![OtterBridge](https://raw.githubusercontent.com/wen-da-ng/otterbridge-browser-mcp/blob/main/static/otterbridge-banner.png)
+![OtterBridge](static/otterbridge-banner.png)
 
 > **For personal use only.** Not for publication or distribution. It operates
 > your real, logged-in browser (see [Security](#security)).
