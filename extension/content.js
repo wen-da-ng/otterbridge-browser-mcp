@@ -1,13 +1,20 @@
 // ===== OtterBridge cursor (designed in Cursor Studio) =====
+// The cursor is only shown while the agent is acting. It's created lazily on
+// the first cursor command and fades out after a short idle period, so it
+// never appears during normal browsing.
 const CURSOR_SIZE = 32;
 const CURSOR_TIP = { x: (4 / 24) * CURSOR_SIZE, y: (2 / 24) * CURSOR_SIZE }; // arrow hotspot
 const CURSOR_GLOW =
   "drop-shadow(0 0 10px rgba(247,98,36,0.65)) drop-shadow(0 0 19px rgba(247,98,36,0.36))";
-const IDLE_DRIFT = true; // subtle at-rest cursor drift (human tell)
+const IDLE_DRIFT = true;      // subtle at-rest cursor drift (human tell)
+const HIDE_AFTER_MS = 4000;   // fade the cursor out this long after the last action
 
 let cursor = null;
 let restLeft = 40, restTop = 40;   // logical resting position of the cursor's top-left
 let isAnimating = false;
+let visible = false;
+let hideTimer = null;
+let driftRaf = null;
 
 function ensureCursor() {
   if (cursor && document.documentElement.contains(cursor)) return cursor;
@@ -21,7 +28,8 @@ function ensureCursor() {
     height: CURSOR_SIZE + "px",
     zIndex: "2147483647",      // stay on top of everything
     pointerEvents: "none",      // CRITICAL: real clicks must pass through it
-    transition: "none",
+    opacity: "0",               // hidden until the agent acts
+    transition: "opacity .25s ease, transform .12s ease",
     transform: "scale(1)",
     transformOrigin: "0 0",
     filter: CURSOR_GLOW,
@@ -40,6 +48,22 @@ function ensureCursor() {
   </svg>`;
   document.documentElement.appendChild(cursor);
   return cursor;
+}
+
+// ===== Show / hide lifecycle =====
+function showCursor() {
+  const c = ensureCursor();
+  visible = true;
+  c.style.opacity = "1";
+  startDrift();
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(hideCursor, HIDE_AFTER_MS);
+}
+
+function hideCursor() {
+  visible = false;
+  stopDrift();
+  if (cursor) cursor.style.opacity = "0";
 }
 
 // ===== Human-like motion: quadratic bezier + ease-in-out =====
@@ -90,7 +114,6 @@ function moveCursorTo(tx, ty, samples = 12) {
 // ===== Click pulse (press-down effect) + expanding ring ripple =====
 function clickPulse() {
   const c = ensureCursor();
-  c.style.transition = "transform .12s ease";
   c.style.transform = "scale(0.82)";
   setTimeout(() => (c.style.transform = "scale(1)"), 130);
 
@@ -124,29 +147,34 @@ function clickPulse() {
 
 // ===== Idle micro-drift: tiny at-rest movement (subtle human tell) =====
 function startDrift() {
-  if (!IDLE_DRIFT) return;
+  if (!IDLE_DRIFT || driftRaf) return;
   let phase = 0;
   function step() {
-    const c = ensureCursor();
-    if (!isAnimating) {
+    if (cursor && visible && !isAnimating) {
       phase += 0.05;
       const dx = Math.sin(phase * 1.3) * 0.6 + (Math.random() - 0.5) * 0.35;
       const dy = Math.cos(phase) * 0.6 + (Math.random() - 0.5) * 0.35;
-      c.style.left = restLeft + dx + "px";
-      c.style.top = restTop + dy + "px";
+      cursor.style.left = restLeft + dx + "px";
+      cursor.style.top = restTop + dy + "px";
     }
-    requestAnimationFrame(step);
+    driftRaf = requestAnimationFrame(step);
   }
-  requestAnimationFrame(step);
+  driftRaf = requestAnimationFrame(step);
 }
 
-// ===== Message handling =====
+function stopDrift() {
+  if (driftRaf) { cancelAnimationFrame(driftRaf); driftRaf = null; }
+}
+
+// ===== Message handling (each cursor command shows it & resets the hide timer) =====
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "moveCursor") {
+    showCursor();
     moveCursorTo(msg.x, msg.y, msg.samples).then(sendResponse);
     return true; // async response
   }
   if (msg.type === "clickPulse") {
+    showCursor();
     clickPulse();
     sendResponse({ ok: true });
   }
@@ -155,9 +183,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     restLeft = msg.x; restTop = msg.y;
     c.style.left = msg.x + "px";
     c.style.top = msg.y + "px";
+    showCursor();
     sendResponse({ ok: true });
   }
 });
-
-ensureCursor();
-startDrift();

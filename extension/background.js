@@ -132,6 +132,13 @@ async function collectEls(tabId, scrollToIndex) {
   return res.result || [];
 }
 
+// ===== Cursor visibility gating =====
+// The animated cursor is only shown while the agent is active. We stamp the
+// time of each real command; the post-navigation cursor restore only fires
+// within this window, so ordinary browsing never shows the cursor.
+let lastAgentActivity = 0;
+const CURSOR_ACTIVE_WINDOW_MS = 15000;
+
 // ===== Command handlers =====
 async function handle(action, p) {
   // ping needs no tab — keep it above activeTab() so the Phase 1 echo test
@@ -140,6 +147,7 @@ async function handle(action, p) {
     return { pong: true, ts: Date.now() };
   }
 
+  lastAgentActivity = Date.now();
   const tab = await activeTab();
 
   switch (action) {
@@ -234,6 +242,7 @@ async function handle(action, p) {
       await cdp(tab.id, "Input.dispatchMouseEvent", {
         type: "mouseReleased", x, y, button: "left", clickCount: 1,
       });
+      lastCursor = { x, y };
       return `Clicked at (${x}, ${y})`;
     }
 
@@ -329,7 +338,10 @@ function waitForLoad(tabId, timeoutMs = 15000) {
 // Re-inject cursor position after navigation (content scripts die on nav).
 let lastCursor = { x: 40, y: 40 };
 chrome.tabs.onUpdated.addListener(async (tabId, info) => {
-  if (info.status === "complete") {
+  // Only restore the cursor after navigation if the agent has acted recently —
+  // otherwise the user's own browsing would keep re-showing it.
+  if (info.status === "complete" &&
+      Date.now() - lastAgentActivity < CURSOR_ACTIVE_WINDOW_MS) {
     try {
       await chrome.tabs.sendMessage(tabId, {
         type: "placeCursor", ...lastCursor,

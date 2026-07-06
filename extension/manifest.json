@@ -4,6 +4,21 @@
   "version": "0.1.0",
   "description": "Personal browser automation agent, driven by the OtterBridge MCP server.",
   "author": "wen-da-ng",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Otter — Browser Agent",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
   "permissions": ["tabs", "activeTab", "scripting", "debugger", "storage", "alarms"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
