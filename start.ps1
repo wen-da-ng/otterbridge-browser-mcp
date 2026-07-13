@@ -2,16 +2,20 @@
 # Loads the WebSocket bridge (ws://localhost:8765) and the standard MCP
 # streamable-HTTP endpoint (http://localhost:8000/mcp).
 #
-# Prerequisite (one time): load the unpacked extension in Chrome -
-#   chrome://extensions -> Developer mode -> Load unpacked -> .\extension
+# Prerequisites (one time):
+#   1. .\bootstrap.ps1                        (installs uv + Python + deps)
+#   2. Load the unpacked extension in Chrome -
+#      chrome://extensions -> Developer mode -> Load unpacked -> .\extension
 #
-# Usage:  .\start.ps1
+# Usage:  .\start.ps1            # HTTP transport (Claude Code / Inspector)
+#         .\start.ps1 --stdio    # stdio transport (Claude Desktop launches
+#                                # this itself; rarely run by hand - see README)
 $ErrorActionPreference = "Stop"
 $py = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $server = Join-Path $PSScriptRoot "server\server.py"
 
 if (-not (Test-Path $py)) {
-    Write-Error "venv python not found at $py - create it with: uv venv"
+    Write-Error "venv python not found at $py - run .\bootstrap.ps1 first"
     exit 1
 }
 
@@ -21,4 +25,4 @@ Write-Host "  MCP endpoint     : http://localhost:8000/mcp" -ForegroundColor Dar
 Write-Host "  Audit log        : server\agent_actions.log" -ForegroundColor DarkGray
 Write-Host "(Ctrl+C to stop)" -ForegroundColor DarkGray
 
-& $py $server
+& $py $server @args

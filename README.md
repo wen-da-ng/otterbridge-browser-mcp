@@ -23,23 +23,103 @@ vision (screenshots), and server-side safety are all implemented and verified.
 | `server/` | **OtterBridge** — standard MCP server (FastMCP, streamable HTTP at `http://localhost:8000/mcp`) bridging tools to the extension over `ws://localhost:8765`. |
 | `agent/` | *Optional* example MCP client (LangGraph). Not needed — any MCP client can attach. Deferred. |
 
+The server speaks **two transports from one codebase**: streamable HTTP at
+`http://localhost:8000/mcp` (default — for Claude Code, MCP Inspector, any HTTP
+client) and **stdio** (`--stdio` — for Claude Desktop, which launches the
+server itself). Both modes host the `ws://localhost:8765` bridge to the
+extension.
+
 ## Quick start
 
-1. **Install deps** (one time — into the `.venv`):
-   ```
-   uv pip install -r requirements.txt
-   ```
-2. **Load the extension** (one time): Chrome → `chrome://extensions` → enable
-   **Developer mode** → **Load unpacked** → select `.\extension`.
-3. **Start the server:**
-   ```
-   .\start.ps1
-   ```
+### Step 1 — Load the Otter extension *(everyone, one time)*
+
+Chrome → `chrome://extensions` → enable **Developer mode** → **Load unpacked** →
+select the `extension` folder. Required regardless of which client you use.
+
+### Step 2 — Set up the server *(everyone, one time — no prerequisites)*
+
+You do **not** need Python or `uv` pre-installed; the bootstrap installs both
+(via [uv](https://docs.astral.sh/uv/), which downloads Python 3.12 for you).
+
+| OS | Run |
+|---|---|
+| Windows | `.\bootstrap.ps1` |
+| macOS / Linux | `chmod +x bootstrap.sh start.sh && ./bootstrap.sh` |
+
+### Step 3 — Attach your MCP client
+
+Pick the one you use:
+
+<details open>
+<summary><b>A · Claude Code</b> — Windows / macOS / Linux</summary>
+
+1. Start the server — `.\start.ps1` (Windows) or `./start.sh` (macOS/Linux).
    Wait for `[bridge] extension connected` (the extension auto-reconnects).
-4. **Attach a client:**
-   - **Claude Code:** `claude mcp add --transport http otterbridge http://localhost:8000/mcp`
-   - **MCP Inspector:** `npx @modelcontextprotocol/inspector` → Transport `Streamable HTTP` → `http://localhost:8000/mcp`
-   - **Any MCP client:** streamable HTTP at `http://localhost:8000/mcp`
+2. Register it (once):
+   ```
+   claude mcp add --transport http otterbridge http://localhost:8000/mcp
+   ```
+</details>
+
+<details>
+<summary><b>B · Claude Desktop</b> — Windows / macOS / Linux (beta)</summary>
+
+Desktop **launches the server for you** over stdio, so do **not** run
+`start.ps1`/`start.sh` — that would fight for the `:8765` bridge port. You only
+need the extension loaded (Step 1) and the venv created (Step 2).
+
+Open **Settings → Developer → Edit Config**, then add the block below, using
+**absolute paths** to this repo. Restart Claude Desktop afterward.
+
+The config file lives at:
+
+| OS | Path |
+|---|---|
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Linux | `~/.config/Claude/claude_desktop_config.json` |
+
+**Windows** (note the doubled backslashes):
+```json
+{
+  "mcpServers": {
+    "otterbridge": {
+      "command": "C:\\path\\to\\Otter-Chrome\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\Otter-Chrome\\server\\server.py", "--stdio"]
+    }
+  }
+}
+```
+
+**macOS / Linux:**
+```json
+{
+  "mcpServers": {
+    "otterbridge": {
+      "command": "/path/to/Otter-Chrome/.venv/bin/python",
+      "args": ["/path/to/Otter-Chrome/server/server.py", "--stdio"]
+    }
+  }
+}
+```
+
+> Claude Desktop only speaks **stdio** to local servers — a plain `"url"` entry
+> is silently ignored, and Custom Connectors require a public `https://` URL, so
+> neither can reach `http://localhost:8000` directly. The `--stdio` launch above
+> is the supported path; a stdio→HTTP `mcp-remote` bridge is the alternative if
+> you prefer to keep a standalone HTTP server running.
+</details>
+
+<details>
+<summary><b>C · MCP Inspector / any other MCP client</b></summary>
+
+Start the server (`start.ps1` / `start.sh`), then point the client at the
+streamable-HTTP endpoint:
+```
+npx @modelcontextprotocol/inspector
+```
+Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
+</details>
 
 ## Tools
 
@@ -75,7 +155,8 @@ vision (screenshots), and server-side safety are all implemented and verified.
 | Changed | Do |
 |---|---|
 | `extension/*.js` | Reload the extension at `chrome://extensions` (↻). |
-| `server/server.py` | Restart the server; in Claude Code run `/mcp` to reconnect. |
+| `server/server.py` (Claude Code / Inspector) | Restart the server; in Claude Code run `/mcp` to reconnect. |
+| `server/server.py` (Claude Desktop) | Fully quit and reopen Claude Desktop — it relaunches the stdio server. |
 
 ## Notes & gotchas
 
@@ -85,6 +166,28 @@ vision (screenshots), and server-side safety are all implemented and verified.
   `chrome.debugger`; websites cannot see it.
 - Detection avoidance comes from running in your real browser, not the cursor
   animation. See `browser-agent-dev-guide.md` §10.
+
+## Setup difficulty by audience
+
+| You are | Path | Prerequisites |
+|---|---|---|
+| Comfortable with a terminal | Run `bootstrap` + `start`, register the client. | None — bootstrap installs `uv` + Python. |
+| Not technical | Wait for the phase-2 one-click packaging below. | (planned: none) |
+
+The remaining friction for a non-technical friend is *two* manual steps that
+no script can remove today: loading an **unpacked** Chrome extension (needs
+Developer mode) and editing a JSON config / running a terminal command. Phase 2
+removes both.
+
+## Roadmap — phase 2 (true one-click, for non-technical users)
+
+- **Chrome Web Store (unlisted):** publish the extension so it installs with one
+  click from a private link — no Developer mode, no unpacked folder.
+- **`.mcpb` Desktop Extension:** package the server as an MCP Bundle for
+  double-click install in Claude Desktop (Settings → Extensions → Install).
+  Node.js ships inside Claude Desktop but Python does not, so this likely means
+  porting the ~250-line server to the TypeScript MCP SDK (`ws` for the bridge)
+  so the bundle needs **zero** runtime prerequisites.
 
 ## Not done (optional)
 

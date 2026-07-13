@@ -1,19 +1,16 @@
 // ===== OtterBridge cursor (designed in Cursor Studio) =====
-// The cursor is only shown while the agent is acting. It's created lazily on
-// the first cursor command and fades out after a short idle period, so it
-// never appears during normal browsing.
+// The cursor is created lazily on the first agent command (so it never appears
+// during normal browsing) and then stays visible for the life of the page.
 const CURSOR_SIZE = 32;
 const CURSOR_TIP = { x: (4 / 24) * CURSOR_SIZE, y: (2 / 24) * CURSOR_SIZE }; // arrow hotspot
 const CURSOR_GLOW =
   "drop-shadow(0 0 10px rgba(247,98,36,0.65)) drop-shadow(0 0 19px rgba(247,98,36,0.36))";
 const IDLE_DRIFT = true;      // subtle at-rest cursor drift (human tell)
-const HIDE_AFTER_MS = 4000;   // fade the cursor out this long after the last action
 
 let cursor = null;
 let restLeft = 40, restTop = 40;   // logical resting position of the cursor's top-left
 let isAnimating = false;
 let visible = false;
-let hideTimer = null;
 let driftRaf = null;
 
 function ensureCursor() {
@@ -50,14 +47,15 @@ function ensureCursor() {
   return cursor;
 }
 
-// ===== Show / hide lifecycle =====
+// ===== Show lifecycle =====
+// Once the agent acts, the cursor appears and stays visible until the page
+// reloads/navigates (a fresh page starts hidden again). hideCursor is kept
+// available but not called automatically.
 function showCursor() {
   const c = ensureCursor();
   visible = true;
   c.style.opacity = "1";
   startDrift();
-  clearTimeout(hideTimer);
-  hideTimer = setTimeout(hideCursor, HIDE_AFTER_MS);
 }
 
 function hideCursor() {
