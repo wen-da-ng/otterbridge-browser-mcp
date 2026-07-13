@@ -16,12 +16,20 @@ import base64
 import json
 import os
 import re
+import sys
 import uuid
 from datetime import datetime, timezone
 
 import websockets
 from mcp.server.fastmcp import Context, FastMCP, Image
 from pydantic import BaseModel
+
+
+# All diagnostics go to STDERR, never STDOUT. In --stdio mode STDOUT is the MCP
+# transport channel, so a stray print there corrupts the protocol. STDERR is
+# safe in both modes (Claude Desktop captures it to mcp-server-OtterBridge.log).
+def log(*args) -> None:
+    print(*args, file=sys.stderr, flush=True)
 
 mcp = FastMCP(
     "OtterBridge",
@@ -61,12 +69,12 @@ def audit(action: str, params: dict | None = None, note: str = "") -> None:
         "params": params or {},
         "note": note,
     })
-    print(f"[audit] {line}")
+    log(f"[audit] {line}")
     try:
         with open(AUDIT_LOG, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError as e:
-        print(f"[audit] WARNING could not write log: {e}")
+        log(f"[audit] WARNING could not write log: {e}")
 
 
 class Confirm(BaseModel):
@@ -95,7 +103,7 @@ pending: dict[str, asyncio.Future] = {}
 async def ws_handler(ws):
     global ext_socket
     ext_socket = ws
-    print("[bridge] extension connected")
+    log("[bridge] extension connected")
     try:
         async for msg in ws:
             data = json.loads(msg)
@@ -105,7 +113,7 @@ async def ws_handler(ws):
     finally:
         if ext_socket is ws:
             ext_socket = None
-        print("[bridge] extension disconnected")
+        log("[bridge] extension disconnected")
 
 
 async def send_cmd(action: str, params: dict | None = None, timeout: float = 30):
@@ -235,14 +243,34 @@ async def screenshot() -> Image:
 
 
 # ===== Run both servers =====
+# Two transports, one codebase. In BOTH modes we host the WebSocket bridge on
+# :8765 so the Otter extension can attach; only the MCP-client-facing transport
+# differs:
+#   (default)  streamable HTTP at http://localhost:8000/mcp  — for Claude Code,
+#              MCP Inspector, or any HTTP MCP client you start the server for.
+#   --stdio    stdio transport — for Claude Desktop, which LAUNCHES this script
+#              itself (via claude_desktop_config.json) and speaks over stdio.
+#              STDOUT is the protocol channel here; keep all logging on STDERR.
 async def main():
+    use_stdio = "--stdio" in sys.argv
     # max_size raised well above the 1 MiB default: screenshot PNGs of large
     # viewports easily exceed it, which otherwise closes the socket with a
     # 1009 "message too big" error mid-capture.
-    await websockets.serve(ws_handler, "localhost", 8765, max_size=32 * 1024 * 1024)
-    print("[bridge] WebSocket listening on ws://localhost:8765")
-    # streamable HTTP MCP endpoint (default: http://localhost:8000/mcp)
-    await mcp.run_streamable_http_async()
+    try:
+        await websockets.serve(ws_handler, "localhost", 8765, max_size=32 * 1024 * 1024)
+        log("[bridge] WebSocket listening on ws://localhost:8765")
+    except OSError as e:
+        # Most commonly: another OtterBridge instance already owns :8765. Only
+        # one process can bridge the extension at a time (run EITHER the HTTP
+        # server OR let Claude Desktop launch the --stdio one, not both).
+        log(f"[bridge] FATAL could not bind ws://localhost:8765: {e}")
+        raise
+    if use_stdio:
+        log("[bridge] MCP transport: stdio (Claude Desktop)")
+        await mcp.run_stdio_async()
+    else:
+        log("[bridge] MCP transport: streamable HTTP at http://localhost:8000/mcp")
+        await mcp.run_streamable_http_async()
 
 
 if __name__ == "__main__":
