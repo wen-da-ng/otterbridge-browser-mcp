@@ -1,3 +1,16 @@
+// config.js defines OtterConfig (shared DEFAULTS / PRESETS / helpers). Must be
+// imported before anything reads settings.
+importScripts("config.js");
+
+// Live settings from chrome.storage.sync, refreshed whenever they change.
+let S = OtterConfig.DEFAULTS;
+OtterConfig.load().then((s) => { S = s; });
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync" && changes[OtterConfig.KEY]) {
+    S = OtterConfig.normalize(changes[OtterConfig.KEY].newValue);
+  }
+});
+
 // ===== WebSocket bridge =====
 let ws;
 
@@ -66,7 +79,7 @@ async function moveWithHoverTrail(tabId, x, y) {
   const pts = await chrome.tabs.sendMessage(tabId, {
     type: "moveCursor",
     x, y,
-    samples: 12,
+    samples: S.trailSamples,
   });
   for (const p of pts.path) {
     await cdp(tabId, "Input.dispatchMouseEvent", {
@@ -248,13 +261,12 @@ async function handle(action, p) {
 
     case "type_text": {
       // Human-like typing: per-character key events with jittered timing.
+      // Speed and the occasional "thinking" pause are settings-driven.
       const text = p.text || "";
       for (const ch of text) {
         await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", text: ch });
         await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", text: ch });
-        const base = 60 + Math.random() * 100;
-        const pause = Math.random() < 0.08 ? base + 200 + Math.random() * 300 : base;
-        await sleep(pause);
+        await sleep(OtterConfig.typeDelay(S, Math.random));
       }
       return `Typed ${text.length} chars`;
     }
@@ -268,13 +280,13 @@ async function handle(action, p) {
     }
 
     case "scroll": {
-      // Variable increments read more naturally than fixed jumps.
-      const target = p.deltaY ?? 600;
-      const jitter = target * (0.85 + Math.random() * 0.3);
+      // Variable increments read more naturally than fixed jumps. Distance and
+      // whether to jitter are settings-driven; an explicit deltaY still wins.
+      const amount = OtterConfig.scrollAmount(S, p.deltaY, Math.random);
       await cdp(tab.id, "Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x: p.x ?? 400, y: p.y ?? 300,
-        deltaX: 0, deltaY: Math.round(jitter),
+        deltaX: 0, deltaY: Math.round(amount),
       });
       return "Scrolled";
     }
@@ -338,10 +350,16 @@ function waitForLoad(tabId, timeoutMs = 15000) {
 // Re-inject cursor position after navigation (content scripts die on nav).
 let lastCursor = { x: 40, y: 40 };
 chrome.tabs.onUpdated.addListener(async (tabId, info) => {
-  // Only restore the cursor after navigation if the agent has acted recently —
-  // otherwise the user's own browsing would keep re-showing it.
-  if (info.status === "complete" &&
-      Date.now() - lastAgentActivity < CURSOR_ACTIVE_WINDOW_MS) {
+  if (info.status !== "complete") return;
+  // Respect the cursor visibility setting:
+  //   off / disabled -> never restore
+  //   always         -> restore on every navigation
+  //   active         -> only if the agent acted recently (default; otherwise
+  //                     the user's own browsing would keep re-showing it)
+  if (!S.cursorEnabled || S.cursorVisibility === "off") return;
+  const withinWindow = Date.now() - lastAgentActivity < CURSOR_ACTIVE_WINDOW_MS;
+  if (S.cursorVisibility === "active" && !withinWindow) return;
+  {
     try {
       await chrome.tabs.sendMessage(tabId, {
         type: "placeCursor", ...lastCursor,

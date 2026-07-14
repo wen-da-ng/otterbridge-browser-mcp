@@ -1,17 +1,53 @@
 // ===== OtterBridge cursor (designed in Cursor Studio) =====
 // The cursor is created lazily on the first agent command (so it never appears
 // during normal browsing) and then stays visible for the life of the page.
-const CURSOR_SIZE = 32;
-const CURSOR_TIP = { x: (4 / 24) * CURSOR_SIZE, y: (2 / 24) * CURSOR_SIZE }; // arrow hotspot
-const CURSOR_GLOW =
-  "drop-shadow(0 0 10px rgba(247,98,36,0.65)) drop-shadow(0 0 19px rgba(247,98,36,0.36))";
-const IDLE_DRIFT = true;      // subtle at-rest cursor drift (human tell)
+//
+// All tunables (size, colors, glow, motion speed/curve/easing, drift, click FX,
+// visibility) come from OtterConfig / chrome.storage.sync and update live via
+// storage.onChanged — no page reload needed. config.js runs before this file
+// (see manifest content_scripts), so OtterConfig is available here.
+
+let S = OtterConfig.DEFAULTS; // live settings; replaced once storage loads
+OtterConfig.load().then((s) => {
+  S = s;
+  applyAppearance();
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync" && changes[OtterConfig.KEY]) {
+    S = OtterConfig.normalize(changes[OtterConfig.KEY].newValue);
+    applyAppearance();
+    // If the cursor was turned off, hide it immediately.
+    if (!cursorShowable()) hideCursor();
+  }
+});
+
+const CURSOR_TIP_RATIO = { x: 4 / 24, y: 2 / 24 }; // arrow hotspot, as fraction of size
+const tip = () => ({ x: CURSOR_TIP_RATIO.x * S.size, y: CURSOR_TIP_RATIO.y * S.size });
+
+// Neon glow derived from the gradient's start color.
+function glowFilter() {
+  if (!S.glow) return "none";
+  const c = hexToRgb(S.colorStart) || { r: 247, g: 152, b: 36 };
+  return (
+    `drop-shadow(0 0 10px rgba(${c.r},${c.g},${c.b},0.65)) ` +
+    `drop-shadow(0 0 19px rgba(${c.r},${c.g},${c.b},0.36))`
+  );
+}
+
+function hexToRgb(hex) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || "");
+  return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : null;
+}
 
 let cursor = null;
-let restLeft = 40, restTop = 40;   // logical resting position of the cursor's top-left
+let restLeft = 40, restTop = 40; // logical resting position of the cursor's top-left
 let isAnimating = false;
 let visible = false;
 let driftRaf = null;
+
+function cursorShowable() {
+  return S.cursorEnabled && S.cursorVisibility !== "off";
+}
 
 function ensureCursor() {
   if (cursor && document.documentElement.contains(cursor)) return cursor;
@@ -21,30 +57,36 @@ function ensureCursor() {
     position: "fixed",
     left: restLeft + "px",
     top: restTop + "px",
-    width: CURSOR_SIZE + "px",
-    height: CURSOR_SIZE + "px",
-    zIndex: "2147483647",      // stay on top of everything
-    pointerEvents: "none",      // CRITICAL: real clicks must pass through it
-    opacity: "0",               // hidden until the agent acts
+    zIndex: "2147483647", // stay on top of everything
+    pointerEvents: "none", // CRITICAL: real clicks must pass through it
+    opacity: "0", // hidden until the agent acts
     transition: "opacity .25s ease, transform .12s ease",
     transform: "scale(1)",
     transformOrigin: "0 0",
-    filter: CURSOR_GLOW,
   });
-  cursor.innerHTML = `<svg viewBox="0 0 24 24" width="${CURSOR_SIZE}" height="${CURSOR_SIZE}">
+  document.documentElement.appendChild(cursor);
+  applyAppearance();
+  return cursor;
+}
+
+// Apply size/colors/glow to the (possibly already-rendered) cursor element.
+function applyAppearance() {
+  if (!cursor) return;
+  cursor.style.width = S.size + "px";
+  cursor.style.height = S.size + "px";
+  cursor.style.filter = glowFilter();
+  cursor.innerHTML = `<svg viewBox="0 0 24 24" width="${S.size}" height="${S.size}">
     <defs>
       <linearGradient id="__agent_cursor_grad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0" stop-color="#FFE014"/>
-        <stop offset="1" stop-color="#F24E07"/>
+        <stop offset="0" stop-color="${S.colorStart}"/>
+        <stop offset="1" stop-color="${S.colorEnd}"/>
       </linearGradient>
     </defs>
     <path d="M4 2 L4 21 L9.6 16 L12.6 23 L16 21.4 L12.9 15 L20 15 Z"
           fill="url(#__agent_cursor_grad)"
-          stroke="#F24E07" stroke-width="1.25"
+          stroke="${S.colorEnd}" stroke-width="1.25"
           stroke-linejoin="round" stroke-linecap="round"/>
   </svg>`;
-  document.documentElement.appendChild(cursor);
-  return cursor;
 }
 
 // ===== Show lifecycle =====
@@ -52,6 +94,7 @@ function ensureCursor() {
 // reloads/navigates (a fresh page starts hidden again). hideCursor is kept
 // available but not called automatically.
 function showCursor() {
+  if (!cursorShowable()) return; // respect master switch / "off" visibility
   const c = ensureCursor();
   visible = true;
   c.style.opacity = "1";
@@ -64,30 +107,32 @@ function hideCursor() {
   if (cursor) cursor.style.opacity = "0";
 }
 
-// ===== Human-like motion: quadratic bezier + ease-in-out =====
+// ===== Human-like motion: quadratic bezier + configurable easing =====
 // Returns sampled path points so background.js can fire CDP mouseMoved
 // along the same trajectory (hover states trigger for real).
-function moveCursorTo(tx, ty, samples = 12) {
+function moveCursorTo(tx, ty, samples) {
   return new Promise((resolve) => {
     const c = ensureCursor();
+    const n = samples || S.trailSamples;
     const sx = parseFloat(c.style.left) || 0;
     const sy = parseFloat(c.style.top) || 0;
     const dist = Math.hypot(tx - sx, ty - sy);
-    const duration = Math.min(1200, 200 + dist * 1.5); // farther = longer, capped
+    const duration = OtterConfig.moveDuration(dist, S);
 
-    // Control point offset perpendicular to the path -> gentle arc
-    const mx = (sx + tx) / 2 + (ty - sy) * 0.15;
-    const my = (sy + ty) / 2 - (tx - sx) * 0.15;
+    // Control point offset perpendicular to the path -> gentle arc.
+    const k = OtterConfig.curveFactor(S);
+    const mx = (sx + tx) / 2 + (ty - sy) * k;
+    const my = (sy + ty) / 2 - (tx - sx) * k;
 
-    const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+    const ease = OtterConfig.easingFn(S);
     const bezier = (e) => ({
       x: (1 - e) ** 2 * sx + 2 * (1 - e) * e * mx + e * e * tx,
       y: (1 - e) ** 2 * sy + 2 * (1 - e) * e * my + e * e * ty,
     });
 
     const path = [];
-    for (let i = 1; i <= samples; i++) {
-      const p = bezier(ease(i / samples));
+    for (let i = 1; i <= n; i++) {
+      const p = bezier(ease(i / n));
       path.push({ x: Math.round(p.x), y: Math.round(p.y) });
     }
 
@@ -112,20 +157,25 @@ function moveCursorTo(tx, ty, samples = 12) {
 // ===== Click pulse (press-down effect) + expanding ring ripple =====
 function clickPulse() {
   const c = ensureCursor();
-  c.style.transform = "scale(0.82)";
-  setTimeout(() => (c.style.transform = "scale(1)"), 130);
+  if (S.clickPulse) {
+    c.style.transform = "scale(0.82)";
+    setTimeout(() => (c.style.transform = "scale(1)"), 130);
+  }
 
+  if (!S.ripple) return;
   // Ring ripple centered on the cursor's tip (the actual click point).
-  const cx = (parseFloat(c.style.left) || 0) + CURSOR_TIP.x;
-  const cy = (parseFloat(c.style.top) || 0) + CURSOR_TIP.y;
+  const t = tip();
+  const cx = (parseFloat(c.style.left) || 0) + t.x;
+  const cy = (parseFloat(c.style.top) || 0) + t.y;
+  const rgb = hexToRgb(S.colorEnd) || { r: 242, g: 78, b: 7 };
   const ring = document.createElement("div");
   Object.assign(ring.style, {
     position: "fixed",
     left: cx + "px",
     top: cy + "px",
-    width: CURSOR_SIZE * 0.5 + "px",
-    height: CURSOR_SIZE * 0.5 + "px",
-    border: "2px solid rgba(242,78,7,0.9)",   // #F24E07
+    width: S.size * 0.5 + "px",
+    height: S.size * 0.5 + "px",
+    border: `2px solid rgba(${rgb.r},${rgb.g},${rgb.b},0.9)`,
     borderRadius: "50%",
     transform: "translate(-50%, -50%)",
     pointerEvents: "none",
@@ -135,7 +185,7 @@ function clickPulse() {
   });
   document.documentElement.appendChild(ring);
   requestAnimationFrame(() => {
-    const end = CURSOR_SIZE * 2.6;
+    const end = S.size * 2.6;
     ring.style.width = end + "px";
     ring.style.height = end + "px";
     ring.style.opacity = "0";
@@ -145,13 +195,15 @@ function clickPulse() {
 
 // ===== Idle micro-drift: tiny at-rest movement (subtle human tell) =====
 function startDrift() {
-  if (!IDLE_DRIFT || driftRaf) return;
+  if (!S.idleDrift || driftRaf) return;
   let phase = 0;
   function step() {
-    if (cursor && visible && !isAnimating) {
+    if (cursor && visible && !isAnimating && S.idleDrift) {
+      const amp = 0.6 * (S.driftIntensity || 1);
+      const rnd = 0.35 * (S.driftIntensity || 1);
       phase += 0.05;
-      const dx = Math.sin(phase * 1.3) * 0.6 + (Math.random() - 0.5) * 0.35;
-      const dy = Math.cos(phase) * 0.6 + (Math.random() - 0.5) * 0.35;
+      const dx = Math.sin(phase * 1.3) * amp + (Math.random() - 0.5) * rnd;
+      const dy = Math.cos(phase) * amp + (Math.random() - 0.5) * rnd;
       cursor.style.left = restLeft + dx + "px";
       cursor.style.top = restTop + dy + "px";
     }
@@ -164,10 +216,12 @@ function stopDrift() {
   if (driftRaf) { cancelAnimationFrame(driftRaf); driftRaf = null; }
 }
 
-// ===== Message handling (each cursor command shows it & resets the hide timer) =====
+// ===== Message handling (each cursor command shows it) =====
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "moveCursor") {
     showCursor();
+    // Still return a path even if the cursor is hidden, so background.js can
+    // fire the CDP hover trail regardless of cursor visibility.
     moveCursorTo(msg.x, msg.y, msg.samples).then(sendResponse);
     return true; // async response
   }

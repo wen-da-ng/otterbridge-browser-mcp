@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OtterBridge — Settings</title>
+  <style>
+    :root {
+      --accent: #F24E07;
+      --accent2: #FFC814;
+      --bg: #ffffff;
+      --panel: #f6f7f9;
+      --border: #e3e6ea;
+      --text: #1b1f24;
+      --muted: #6b7280;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16191d; --panel: #1f242a; --border: #2c333b;
+        --text: #e8eaed; --muted: #9aa4af;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 28px 24px 60px; }
+    header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+    header h1 { font-size: 20px; margin: 0; }
+    header .logo {
+      width: 34px; height: 34px; border-radius: 9px;
+      background: linear-gradient(160deg, var(--accent2), var(--accent));
+      display: grid; place-items: center; color: #fff; font-weight: 700;
+    }
+    .sub { color: var(--muted); margin: 0 0 20px; }
+
+    .presets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+    .preset {
+      padding: 8px 16px; border: 1px solid var(--border); background: var(--panel);
+      border-radius: 999px; cursor: pointer; font-weight: 600; color: var(--text);
+    }
+    .preset[aria-pressed="true"] {
+      border-color: var(--accent); background: var(--accent); color: #fff;
+    }
+    .preset.custom { font-style: italic; }
+
+    .preview {
+      position: relative; height: 150px; border: 1px dashed var(--border);
+      border-radius: 12px; background: var(--panel); overflow: hidden; margin-bottom: 22px;
+    }
+    .preview .dot {
+      position: absolute; width: 12px; height: 12px; border-radius: 50%;
+      background: var(--border); transform: translate(-50%, -50%);
+    }
+    .preview .hint { position: absolute; top: 8px; left: 12px; color: var(--muted); font-size: 12px; }
+
+    section { border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; overflow: hidden; }
+    section > h2 {
+      font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+      margin: 0; padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    }
+    .controls { padding: 6px 16px; }
+    .row {
+      display: grid; grid-template-columns: 200px 1fr 64px; align-items: center;
+      gap: 14px; padding: 11px 0; border-bottom: 1px solid var(--border);
+    }
+    .row:last-child { border-bottom: none; }
+    .row label { font-weight: 600; }
+    .row .val { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+    input[type=range] { width: 100%; accent-color: var(--accent); }
+    select {
+      width: 100%; padding: 7px 8px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text);
+    }
+    input[type=color] {
+      width: 100%; height: 34px; padding: 0; border: 1px solid var(--border);
+      border-radius: 8px; background: var(--bg); cursor: pointer;
+    }
+    .switch { justify-self: start; position: relative; width: 44px; height: 24px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0; background: var(--border); border-radius: 999px;
+      transition: .2s; cursor: pointer;
+    }
+    .slider::before {
+      content: ""; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px;
+      background: #fff; border-radius: 50%; transition: .2s;
+    }
+    .switch input:checked + .slider { background: var(--accent); }
+    .switch input:checked + .slider::before { transform: translateX(20px); }
+    .row.toggle { grid-template-columns: 200px 1fr; }
+
+    .footer { display: flex; align-items: center; gap: 14px; margin-top: 8px; }
+    button.reset {
+      padding: 9px 16px; border: 1px solid var(--border); background: var(--panel);
+      border-radius: 8px; cursor: pointer; color: var(--text); font-weight: 600;
+    }
+    .saved { color: var(--accent); font-weight: 600; opacity: 0; transition: opacity .2s; }
+    .saved.show { opacity: 1; }
+    .disabled { opacity: .45; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo">O</div>
+      <h1>OtterBridge — Cursor & Input Settings</h1>
+    </header>
+    <p class="sub">Tune how the agent's cursor moves, types, and scrolls. Changes apply live to open tabs.</p>
+
+    <div class="presets" id="presets">
+      <button class="preset" data-preset="natural" aria-pressed="false">Natural</button>
+      <button class="preset" data-preset="fast" aria-pressed="false">Fast</button>
+      <button class="preset" data-preset="instant" aria-pressed="false">Instant</button>
+      <button class="preset custom" data-preset="custom" aria-pressed="false" disabled>Custom</button>
+    </div>
+
+    <div class="preview" id="preview">
+      <span class="hint">Live preview</span>
+      <div class="dot" id="dotA"></div>
+      <div class="dot" id="dotB"></div>
+      <!-- preview cursor injected by options.js -->
+    </div>
+
+    <section>
+      <h2>Motion</h2>
+      <div class="controls" data-group="motion"></div>
+    </section>
+    <section>
+      <h2>Typing</h2>
+      <div class="controls" data-group="typing"></div>
+    </section>
+    <section>
+      <h2>Scrolling</h2>
+      <div class="controls" data-group="scroll"></div>
+    </section>
+    <section>
+      <h2>Behavior</h2>
+      <div class="controls" data-group="behavior"></div>
+    </section>
+    <section>
+      <h2>Appearance</h2>
+      <div class="controls" data-group="appearance"></div>
+    </section>
+
+    <div class="footer">
+      <button class="reset" id="reset">Reset to defaults</button>
+      <span class="saved" id="saved">Saved ✓</span>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root { --accent:#F24E07; --accent2:#FFC814; --bg:#fff; --panel:#f6f7f9; --border:#e3e6ea; --text:#1b1f24; --muted:#6b7280; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#16191d; --panel:#1f242a; --border:#2c333b; --text:#e8eaed; --muted:#9aa4af; } }
+    * { box-sizing: border-box; }
+    body { width: 260px; margin: 0; padding: 14px; font: 13px/1.45 system-ui, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+    .head { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+    .logo { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(160deg, var(--accent2), var(--accent)); display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 13px; }
+    .head b { font-size: 14px; }
+    .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 12px 0 6px; }
+    .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .preset { padding: 8px 6px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; cursor: pointer; font-weight: 600; color: var(--text); text-align: center; }
+    .preset[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: #fff; }
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; }
+    .switch { position: relative; width: 42px; height: 23px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; inset: 0; background: var(--border); border-radius: 999px; transition: .2s; cursor: pointer; }
+    .slider::before { content: ""; position: absolute; height: 17px; width: 17px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+    .switch input:checked + .slider { background: var(--accent); }
+    .switch input:checked + .slider::before { transform: translateX(19px); }
+    .adv { display: block; width: 100%; margin-top: 14px; padding: 9px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; cursor: pointer; color: var(--text); font-weight: 600; }
+    .adv:hover { border-color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="head"><div class="logo">O</div><b>OtterBridge</b></div>
+
+  <div class="lbl">Speed preset</div>
+  <div class="presets" id="presets">
+    <button class="preset" data-preset="natural" aria-pressed="false">Natural</button>
+    <button class="preset" data-preset="fast" aria-pressed="false">Fast</button>
+    <button class="preset" data-preset="instant" aria-pressed="false">Instant</button>
+    <button class="preset" data-preset="custom" aria-pressed="false" disabled>Custom</button>
+  </div>
+
+  <div class="toggle-row">
+    <span><b>Show cursor</b></span>
+    <label class="switch"><input type="checkbox" id="cursorEnabled" /><span class="slider"></span></label>
+  </div>
+
+  <button class="adv" id="adv">Advanced settings…</button>
+
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
