@@ -13,8 +13,8 @@ dist/
 # Claude Code local settings
 .claude/settings.local.json
 
-# Runtime audit log
-server/agent_actions.log
+# Runtime audit log (Node server/ and legacy Python)
+**/agent_actions.log
 
 # OS / crash dumps
 Thumbs.db

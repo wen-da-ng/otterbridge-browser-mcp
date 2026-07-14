@@ -23,7 +23,7 @@ fi
 echo "Starting OtterBridge MCP server..."
 echo "  WebSocket bridge : ws://localhost:8765"
 echo "  MCP endpoint     : http://localhost:8000/mcp"
-echo "  Audit log        : server/agent_actions.log"
+echo "  Audit log        : server-python/agent_actions.log"
 echo "(Ctrl+C to stop)"
 
-exec "$PY" server/server.py "$@"
+exec "$PY" server-python/server.py "$@"

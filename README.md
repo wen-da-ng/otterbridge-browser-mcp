@@ -2,8 +2,8 @@
 
 A personal "Claude in Chrome"-style browser agent. The **Otter** Chrome
 extension is the hands & eyes; **OtterBridge** is the standard MCP server that
-any MCP client can use to drive your real Chrome — Claude Code, Claude Cowork,
-MCP Inspector, or a LangGraph/Ollama agent loop.
+any MCP client can use to drive your real Chrome — Claude Code, Claude Desktop,
+MCP Inspector, or any MCP client.
 
 _Built by **wen-da-ng** · OtterBridge_
 
@@ -12,23 +12,21 @@ _Built by **wen-da-ng** · OtterBridge_
 > **For personal use only.** Not for publication or distribution. It operates
 > your real, logged-in browser (see [Security](#security)).
 
-**Status: complete.** Bridge, observation tools, input + animated cursor,
-vision (screenshots), and server-side safety are all implemented and verified.
+**Status: complete.** Bridge, observation tools, input + animated cursor, vision
+(screenshots), server-side safety, in-extension settings UI, and **multi-tab /
+multi-agent** control are all implemented and verified.
 
 ## Components
 
 | Path | What it is |
 |---|---|
-| `extension/` | Chrome MV3 extension — the hands & eyes. WebSocket client + `chrome.debugger` (CDP) input + animated fake cursor. |
-| `server/` | **OtterBridge (Python)** — standard MCP server (FastMCP, streamable HTTP at `http://localhost:8000/mcp`) bridging tools to the extension over `ws://localhost:8765`. The reference implementation. |
-| `server-node/` | **OtterBridge (Node)** — a TypeScript port of the same server with an identical protocol, tools, and safety model. Packs into a `.mcpb` for **one-click** install in Claude Desktop (Node ships inside Desktop; Python does not). |
+| `extension/` | Chrome MV3 extension — the hands & eyes. WebSocket client + `chrome.debugger` (CDP) input + animated fake cursor + a settings UI (popup + options page). |
+| `server/` | **OtterBridge (Node/TypeScript)** — the MCP server. Bridges browser actions to the extension over `ws://localhost:8765`, with two transports from one codebase: **stdio** (for the `.mcpb` / Claude Desktop) and **streamable HTTP** at `http://localhost:8000/mcp` (for Claude Code, MCP Inspector). Bundles into a one-click `.mcpb`. |
+| `legacy/` | The original **Python** (FastMCP) server + its setup scripts, kept as a reference/fallback. Single-tab only. See [`legacy/README.md`](legacy/README.md). |
 | `agent/` | *Optional* example MCP client (LangGraph). Not needed — any MCP client can attach. Deferred. |
 
-Either server speaks **two transports from one codebase**: streamable HTTP at
-`http://localhost:8000/mcp` (default — for Claude Code, MCP Inspector, any HTTP
-client) and **stdio** (`--stdio` — for Claude Desktop, which launches the
-server itself). Both modes host the `ws://localhost:8765` bridge to the
-extension. Run **only one** server at a time — they share the `:8765` bridge.
+Run **only one** server at a time (Node **or** legacy Python) — they share the
+`ws://localhost:8765` bridge and only one process can own it.
 
 ## Quick start
 
@@ -37,109 +35,53 @@ extension. Run **only one** server at a time — they share the `:8765` bridge.
 Chrome → `chrome://extensions` → enable **Developer mode** → **Load unpacked** →
 select the `extension` folder. Required regardless of which client you use.
 
-### Step 2 — Set up the server *(everyone, one time — no prerequisites)*
-
-You do **not** need Python or `uv` pre-installed; the bootstrap installs both
-(via [uv](https://docs.astral.sh/uv/), which downloads Python 3.12 for you).
-
-| OS | Run |
-|---|---|
-| Windows | `.\bootstrap.ps1` |
-| macOS / Linux | `chmod +x bootstrap.sh start.sh && ./bootstrap.sh` |
-
-### Step 3 — Attach your MCP client
-
-Pick the one you use:
-
-<details open>
-<summary><b>A · Claude Code</b> — Windows / macOS / Linux</summary>
-
-1. Start the server — `.\start.ps1` (Windows) or `./start.sh` (macOS/Linux).
-   Wait for `[bridge] extension connected` (the extension auto-reconnects).
-2. Register it (once):
-   ```
-   claude mcp add --transport http otterbridge http://localhost:8000/mcp
-   ```
-</details>
+### Step 2 — Attach your MCP client
 
 <details>
-<summary><b>B · Claude Desktop</b> — Windows / macOS / Linux (beta)</summary>
+<summary><b>A · Claude Desktop</b> — the one-click <code>.mcpb</code> (recommended, no prerequisites)</summary>
 
-Desktop **launches the server for you** over stdio, so do **not** run
-`start.ps1`/`start.sh` — that would fight for the `:8765` bridge port. You still
-need the extension loaded (Step 1). Two ways to attach:
-
-#### Option 1 — `.mcpb` bundle *(recommended: one-click, no Python)*
-
-The Node port packages into a Desktop Extension that installs by double-click.
-The Python setup in Step 2 is **not required** — Node ships inside Claude
-Desktop. Build the bundle once:
+Node ships **inside** Claude Desktop, so there's nothing to install. Build the
+bundle once (or use a shared `server/otterbridge.mcpb`):
 
 ```bash
-cd server-node
-npm ci --ignore-scripts   # reproducible, no dependency install scripts
-npm run build             # esbuild -> single bundled dist/index.js
+cd server
+npm ci --ignore-scripts   # reproducible install, no dependency install scripts
+npm run build             # esbuild → single bundled dist/index.js
 npx @anthropic-ai/mcpb pack . otterbridge.mcpb
 ```
 
-The server is bundled into one self-contained file, so the `.mcpb` ships a
-single reviewed `dist/index.js` — no `node_modules` tree in the artifact.
+Then double-click `server/otterbridge.mcpb` (or Claude Desktop → **Settings →
+Extensions → Advanced → Install Extension**). Two checkboxes appear for the
+safety gate; the defaults (approval on, fail-open off) are the safe ones. That's
+it — no terminal, no config file. This is the path a non-technical user gets
+when the bundle is shared with them directly.
 
-Then double-click `server-node/otterbridge.mcpb` (or Claude Desktop → **Settings
-→ Extensions → Advanced → Install Extension**). Two checkboxes appear for the
-safety gate; the defaults (approval on, fail-open off) are the safe ones. This
-is the path a non-technical user gets once the bundle is shared with them
-directly — no terminal, no config file.
+The bundle is a single self-contained `dist/index.js` (no `node_modules` tree in
+the artifact). Claude Desktop launches it over stdio and hosts the `:8765`
+bridge; do **not** also run a standalone server.
+</details>
 
-#### Option 2 — Python stdio config *(fallback)*
+<details open>
+<summary><b>B · Claude Code</b> — Windows / macOS / Linux</summary>
 
-Set up the Python server (Step 2), then open **Settings → Developer → Edit
-Config** and add the block below, using **absolute paths** to this repo. Restart
-Claude Desktop afterward.
-
-The config file lives at:
-
-| OS | Path |
-|---|---|
-| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
-| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| Linux | `~/.config/Claude/claude_desktop_config.json` |
-
-**Windows** (note the doubled backslashes):
-```json
-{
-  "mcpServers": {
-    "otterbridge": {
-      "command": "C:\\path\\to\\Otter-Chrome\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\path\\to\\Otter-Chrome\\server\\server.py", "--stdio"]
-    }
-  }
-}
+```bash
+cd server
+npm ci --ignore-scripts
+npm run build
+npm start                 # streamable HTTP at http://localhost:8000/mcp
 ```
 
-**macOS / Linux:**
-```json
-{
-  "mcpServers": {
-    "otterbridge": {
-      "command": "/path/to/Otter-Chrome/.venv/bin/python",
-      "args": ["/path/to/Otter-Chrome/server/server.py", "--stdio"]
-    }
-  }
-}
+Wait for `[bridge] extension connected` (the extension auto-reconnects), then
+register it once:
 ```
-
-> Claude Desktop only speaks **stdio** to local servers — a plain `"url"` entry
-> is silently ignored, and Custom Connectors require a public `https://` URL, so
-> neither can reach `http://localhost:8000` directly. The `--stdio` launch above
-> is the supported path; a stdio→HTTP `mcp-remote` bridge is the alternative if
-> you prefer to keep a standalone HTTP server running.
+claude mcp add --transport http otterbridge http://localhost:8000/mcp
+```
 </details>
 
 <details>
 <summary><b>C · MCP Inspector / any other MCP client</b></summary>
 
-Start the server (`start.ps1` / `start.sh`), then point the client at the
+Start the server (`cd server && npm start`), then point the client at the
 streamable-HTTP endpoint:
 ```
 npx @modelcontextprotocol/inspector
@@ -147,19 +89,45 @@ npx @modelcontextprotocol/inspector
 Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
 </details>
 
+<details>
+<summary><b>Legacy Python server</b> — reference / fallback</summary>
+
+The original Python implementation lives in [`legacy/`](legacy/) with its own
+setup scripts (`bootstrap` + `start`) and docs. It's single-tab only. See
+[`legacy/README.md`](legacy/README.md).
+</details>
+
 ## Tools
+
+The 9 core tools each take an **optional `tab` id** (from `open_tab`/`list_tabs`);
+omit it to use the session's current tab, or the active tab if none.
 
 | Tool | Does |
 |---|---|
-| `navigate(url)` | Point the active tab at a URL, wait for load. |
-| `read_page()` | URL, title, visible text (≤20k chars) + `devicePixelRatio`. |
-| `read_elements()` | Numbered interactive elements with center coordinates. |
-| `click_element(index)` | **Preferred.** Clicks a `read_elements` entry by index; coordinate is resolved in-page, so it never drifts through screenshot scaling. |
-| `click(x, y)` | Animated-cursor move + trusted CDP click at raw coordinates. Destructive targets prompt for approval. |
-| `type_text(text)` | Per-character typing with human-like jitter. |
-| `press_key(key)` | e.g. `Enter`, `Tab`, `Escape`. |
-| `scroll(delta_y)` | Vertical scroll with jittered delta. |
-| `screenshot()` | JPEG image of the viewport for *seeing* the page. For precise clicks use `read_elements` + `click_element`. |
+| `navigate(url, tab?)` | Point a tab at a URL, wait for load. |
+| `read_page(tab?)` | URL, title, visible text (≤20k chars). |
+| `read_elements(tab?)` | Numbered interactive elements with center coordinates. |
+| `click_element(index, tab?)` | **Preferred.** Clicks a `read_elements` entry by index; coordinate resolved in-page, so it never drifts through screenshot scaling. |
+| `click(x, y, tab?)` | Animated-cursor move + trusted CDP click at raw coordinates. Destructive targets prompt for approval. |
+| `type_text(text, tab?)` | Per-character typing with human-like jitter. |
+| `press_key(key, tab?)` | e.g. `Enter`, `Tab`, `Escape`. |
+| `scroll(delta_y, tab?)` | Vertical scroll with jittered delta. |
+| `screenshot(tab?)` | JPEG image of a tab's viewport (via CDP — works on background tabs too). |
+
+**Multi-tab / multi-agent** (Node server): each MCP **session** is an agent with
+its own colored Chrome **tab group**. Manage tabs with `open_tab(url?)`,
+`list_tabs()`, `use_tab(tab)`, `close_tab(tab)`. Multiple agents (sessions) can
+drive multiple tabs **simultaneously** — the server routes each session's
+commands to its own tab, and a single agent never steals focus from another
+(background tabs are driven via CDP without activation).
+
+## Cursor & input settings
+
+The extension has a settings UI — the toolbar **popup** (preset switch + master
+cursor toggle) and a full **options page** (right-click the icon → Options).
+Tune move speed, curvature, easing, typing speed, scroll, idle drift, cursor
+size/colors/glow, and visibility — with **presets** (Natural / Fast / Instant)
+and a live preview. Settings sync via `chrome.storage.sync` and apply live.
 
 ## Security
 
@@ -168,9 +136,10 @@ Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
   (`buy/pay/delete/send/submit/checkout/confirm/transfer/…`) is hit-tested at
   dispatch and requires human approval via MCP elicitation. Works for every
   click — vision-mode, `read_elements`, or raw coordinates.
-  - `BROWSER_AGENT_GATE=elicit` (default) | `off`
+  - `BROWSER_AGENT_GATE=elicit` (default) | `off` (also accepts `true`/`false`)
   - `BROWSER_AGENT_GATE_FALLBACK=deny` (default) | `allow` — used only if a
-    client can't show an elicitation prompt.
+    client can't show an elicitation prompt. (The `.mcpb` exposes both as
+    checkboxes in Claude Desktop's settings.)
 - Servers bind to **localhost only**. Never expose them on the network.
 - **Bridge & endpoint are origin/host-locked** (defense against local-page
   attacks): the `ws://localhost:8765` bridge only accepts the extension
@@ -178,6 +147,9 @@ Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
   can't connect to eavesdrop on or displace it. The HTTP endpoint rejects
   requests whose `Host`/`Origin` isn't loopback, blocking DNS-rebinding attempts
   to drive the browser from a malicious site.
+- **Supply chain:** install with `npm ci --ignore-scripts`; no production
+  dependency runs install scripts, and the committed `package-lock.json` pins
+  versions. The shipped `.mcpb` is a single bundled file (no loose deps).
 - Runs in your **real Chrome profile** (real logins). For isolation, load the
   extension in a dedicated Chrome profile instead.
 - Main residual threat is **prompt injection** from page content; keep the gate on.
@@ -186,46 +158,34 @@ Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
 
 | Changed | Do |
 |---|---|
-| `extension/*.js` | Reload the extension at `chrome://extensions` (↻). |
-| `server/server.py` (Claude Code / Inspector) | Restart the server; in Claude Code run `/mcp` to reconnect. |
-| `server/server.py` (Claude Desktop) | Fully quit and reopen Claude Desktop — it relaunches the stdio server. |
-| `server-node/src/*.ts` | `npm run build` in `server-node/`; restart the client. If installed as a `.mcpb`, re-pack and reinstall (or reinstall the updated bundle). |
+| `extension/*.js` | Reload the extension at `chrome://extensions` (↻), then refresh open tabs. |
+| `server/src/*.ts` (Claude Code / Inspector) | `npm run build` in `server/`; restart the server; in Claude Code run `/mcp` to reconnect. |
+| `server/src/*.ts` (Claude Desktop `.mcpb`) | Re-pack (`npm run build && npx @anthropic-ai/mcpb pack . otterbridge.mcpb`) and reinstall the bundle. |
+| `legacy/server-python/server.py` | See [`legacy/README.md`](legacy/README.md). |
 
 ## Notes & gotchas
 
-- Tools act on the **focused Chrome tab**. `chrome://` pages, the Web Store, and
-  PDFs can't be read or clicked (they reject script injection).
+- `chrome://` pages, the Web Store, and PDFs can't be read or clicked (they
+  reject script injection).
 - The **"Chrome is being debugged" banner** is cosmetic and unavoidable with
   `chrome.debugger`; websites cannot see it.
 - Detection avoidance comes from running in your real browser, not the cursor
-  animation. See `browser-agent-dev-guide.md` §10.
+  animation.
+- Some sites (e.g. Shopee) gate automated browsing of logged-out sessions behind
+  an anti-bot / login wall; log in first for deep browsing.
 
-## Setup difficulty by audience
+## Roadmap
 
-| You are | Path | Prerequisites |
-|---|---|---|
-| Comfortable with a terminal | Run `bootstrap` + `start`, register the client. | None — bootstrap installs `uv` + Python. |
-| Not technical, on Claude Desktop | Double-click the shared `.mcpb`. | None — Node ships inside Claude Desktop. |
-
-The server side is now one step for a non-technical friend on Claude Desktop:
-double-click the `.mcpb` (no Python, no terminal, no config file). The **last**
-remaining manual step is loading the **unpacked** Chrome extension (needs
-Developer mode) — the Chrome Web Store publish in the roadmap removes it.
-
-## Roadmap — phase 2 (true one-click, for non-technical users)
-
-- **✅ `.mcpb` Desktop Extension — done.** The server is ported to the TypeScript
-  MCP SDK (`ws` for the bridge) in `server-node/` and packages into a `.mcpb`
-  for double-click install in Claude Desktop, with **zero** runtime
-  prerequisites (Node ships inside Desktop). Same protocol, tools, and safety
-  model as the Python server. See Quick start → Claude Desktop → Option 1.
-- **⬜ Chrome Web Store (unlisted):** publish the extension so it installs with
-  one click from a private link — no Developer mode, no unpacked folder. This is
+- **✅ `.mcpb` Desktop Extension** — Node/TS server in `server/`, bundled for
+  double-click install in Claude Desktop, zero prerequisites.
+- **✅ Multi-tab / multi-agent** — per-session tab groups + parallel control.
+- **⬜ Chrome Web Store (unlisted)** — publish the extension so it installs with
+  one click from a private link (no Developer mode / unpacked folder). This is
   the last manual step remaining for a non-technical user.
 
 ## Not done (optional)
 
-- §10 detection refinements: brief-attach debugger, extra behavioral jitter,
-  cursor overshoot. Only matters against aggressive anti-bot sites.
+- Detection refinements: brief-attach debugger, extra behavioral jitter, cursor
+  overshoot. Only matters against aggressive anti-bot sites.
 - The standalone LangGraph client in `agent/` (deferred — Claude Code already
   serves as a working agent client).

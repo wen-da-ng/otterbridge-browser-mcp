@@ -1,4 +1,4 @@
-# OtterBridge — Node server (`server-node/`)
+# OtterBridge — Node server (`server/`)
 
 The Node/TypeScript port of the OtterBridge MCP server. One codebase, two
 transports, byte-compatible with the same unchanged Otter Chrome extension:

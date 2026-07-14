@@ -12,7 +12,7 @@
 #                                # this itself; rarely run by hand - see README)
 $ErrorActionPreference = "Stop"
 $py = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-$server = Join-Path $PSScriptRoot "server\server.py"
+$server = Join-Path $PSScriptRoot "server-python\server.py"
 
 if (-not (Test-Path $py)) {
     Write-Error "venv python not found at $py - run .\bootstrap.ps1 first"
@@ -22,7 +22,7 @@ if (-not (Test-Path $py)) {
 Write-Host "Starting OtterBridge MCP server..." -ForegroundColor Cyan
 Write-Host "  WebSocket bridge : ws://localhost:8765" -ForegroundColor DarkGray
 Write-Host "  MCP endpoint     : http://localhost:8000/mcp" -ForegroundColor DarkGray
-Write-Host "  Audit log        : server\agent_actions.log" -ForegroundColor DarkGray
+Write-Host "  Audit log        : server-python\agent_actions.log" -ForegroundColor DarkGray
 Write-Host "(Ctrl+C to stop)" -ForegroundColor DarkGray
 
 & $py $server @args

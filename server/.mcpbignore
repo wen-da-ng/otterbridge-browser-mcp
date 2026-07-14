@@ -3,6 +3,7 @@
 node_modules/
 src/
 test/
+demo/
 build.mjs
 tsconfig.json
 package-lock.json
