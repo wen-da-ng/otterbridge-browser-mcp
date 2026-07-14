@@ -8,7 +8,7 @@
     * { box-sizing: border-box; }
     body { width: 260px; margin: 0; padding: 14px; font: 13px/1.45 system-ui, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
     .head { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
-    .logo { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(160deg, var(--accent2), var(--accent)); display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 13px; }
+    .logo { width: 26px; height: 26px; border-radius: 7px; object-fit: contain; display: block; }
     .head b { font-size: 14px; }
     .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 12px 0 6px; }
     .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
@@ -26,7 +26,7 @@
   </style>
 </head>
 <body>
-  <div class="head"><div class="logo">O</div><b>OtterBridge</b></div>
+  <div class="head"><img class="logo" src="icons/icon128.png" alt="OtterBridge logo" /><b>OtterBridge</b></div>
 
   <div class="lbl">Speed preset</div>
   <div class="presets" id="presets">

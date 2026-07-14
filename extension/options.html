@@ -30,8 +30,7 @@
     header h1 { font-size: 20px; margin: 0; }
     header .logo {
       width: 34px; height: 34px; border-radius: 9px;
-      background: linear-gradient(160deg, var(--accent2), var(--accent));
-      display: grid; place-items: center; color: #fff; font-weight: 700;
+      object-fit: contain; display: block;
     }
     .sub { color: var(--muted); margin: 0 0 20px; }
 
@@ -104,7 +103,7 @@
 <body>
   <div class="wrap">
     <header>
-      <div class="logo">O</div>
+      <img class="logo" src="icons/icon128.png" alt="OtterBridge logo" />
       <h1>OtterBridge — Cursor & Input Settings</h1>
     </header>
     <p class="sub">Tune how the agent's cursor moves, types, and scrolls. Changes apply live to open tabs.</p>
