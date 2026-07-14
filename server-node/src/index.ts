@@ -215,6 +215,10 @@ async function approved(server: McpServer, message: string): Promise<boolean> {
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
 
+// One MCP session == one agent == one Chrome tab group. Each buildServer() call
+// (per HTTP session, or the single stdio session) gets its own agent number.
+let agentSeq = 0;
+
 // ===== MCP server + tools =====
 // A factory so each streamable-HTTP session gets its own McpServer instance
 // (elicitation routes back to that session's client), while stdio uses one.
@@ -226,23 +230,48 @@ function buildServer(): McpServer {
         "OtterBridge controls the user's real Chrome browser through the Otter " +
         "extension. Observe with read_page / read_elements, then act with " +
         "click_element (preferred) / type_text / press_key / navigate / scroll. " +
-        "Built by wen-da-ng.",
+        "Open extra tabs with open_tab (each joins this session's tab group); " +
+        "every tool takes an optional 'tab' id, defaulting to this session's " +
+        "current tab. Built by wen-da-ng.",
     },
   );
+
+  // Per-session identity + owned-tab state. open_tab sets currentTab; tools
+  // target `tab` ?? currentTab ?? the browser's active tab.
+  const agentNum = ++agentSeq;
+  const agentId = "a" + agentNum;
+  const agentLabel = `Otter · agent ${agentNum}`;
+  const sess: { currentTab: number | null } = { currentTab: null };
+  const withTab = (tab: number | undefined, params: Record<string, unknown> = {}) => {
+    const t = tab != null ? tab : sess.currentTab;
+    return t != null ? { ...params, tabId: t } : params;
+  };
+  const TAB = {
+    tab: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Target tab id (from open_tab/list_tabs). Omit to use this session's current tab, or the active tab if none.",
+      ),
+  };
 
   server.registerTool(
     "navigate",
     {
-      description: "Navigate the active browser tab to a URL and wait for load.",
-      inputSchema: { url: z.string() },
+      description: "Navigate a browser tab to a URL and wait for load.",
+      inputSchema: { url: z.string(), ...TAB },
     },
-    async ({ url }) => text(await sendCmd("navigate", { url })),
+    async ({ url, tab }) => text(await sendCmd("navigate", withTab(tab, { url }))),
   );
 
   server.registerTool(
     "read_page",
-    { description: "Read the active tab: URL, title, and visible text (truncated)." },
-    async () => text(JSON.stringify(await sendCmd("read_page"))),
+    {
+      description: "Read a tab: URL, title, and visible text (truncated).",
+      inputSchema: { ...TAB },
+    },
+    async ({ tab }) => text(JSON.stringify(await sendCmd("read_page", withTab(tab)))),
   );
 
   server.registerTool(
@@ -251,8 +280,9 @@ function buildServer(): McpServer {
       description:
         "List interactive elements on the page as numbered entries with center " +
         "coordinates. Use the coordinates with the click tool.",
+      inputSchema: { ...TAB },
     },
-    async () => text(JSON.stringify(await sendCmd("read_elements"))),
+    async ({ tab }) => text(JSON.stringify(await sendCmd("read_elements", withTab(tab)))),
   );
 
   server.registerTool(
@@ -262,14 +292,14 @@ function buildServer(): McpServer {
         "Move the cursor with a human-like animation to viewport coordinates " +
         "(x, y) and click there. Destructive targets (buy, pay, delete, send, " +
         "submit, ...) require human approval before dispatch.",
-      inputSchema: { x: z.number().int(), y: z.number().int() },
+      inputSchema: { x: z.number().int(), y: z.number().int(), ...TAB },
     },
-    async ({ x, y }) => {
+    async ({ x, y, tab }) => {
       // Hit-test the actual element at (x, y) so the gate works for every
       // click - vision-mode, read_elements, or raw coordinates alike.
       let targetText = "";
       try {
-        const info = await sendCmd("hit_test", { x, y });
+        const info = await sendCmd("hit_test", withTab(tab, { x, y }));
         targetText = (info?.text as string) ?? "";
       } catch (e) {
         await audit("hit_test", { x, y }, `failed (${(e as Error).message}); proceeding`);
@@ -280,7 +310,7 @@ function buildServer(): McpServer {
           return text(`Action denied by user: click on '${label}'.`);
         }
       }
-      return text(await sendCmd("click", { x, y }));
+      return text(await sendCmd("click", withTab(tab, { x, y })));
     },
   );
 
@@ -292,10 +322,10 @@ function buildServer(): McpServer {
         "PREFERRED over click(x, y): the coordinate is resolved inside the page, " +
         "so it can't drift through screenshot scaling. Call read_elements first " +
         "to get indices, then click_element(index).",
-      inputSchema: { index: z.number().int() },
+      inputSchema: { index: z.number().int(), ...TAB },
     },
-    async ({ index }) => {
-      const info = await sendCmd("locate_element", { index });
+    async ({ index, tab }) => {
+      const info = await sendCmd("locate_element", withTab(tab, { index }));
       if (!info || !info.found) {
         return text(
           `No interactive element with index ${index}. ` +
@@ -311,7 +341,7 @@ function buildServer(): McpServer {
       }
       // Pass index so the extension re-resolves the live position right before
       // pressing (immune to reflow during the cursor animation).
-      return text(await sendCmd("click", { x: info.x, y: info.y, index }));
+      return text(await sendCmd("click", withTab(tab, { x: info.x, y: info.y, index })));
     },
   );
 
@@ -319,27 +349,27 @@ function buildServer(): McpServer {
     "type_text",
     {
       description: "Type text into the currently focused element.",
-      inputSchema: { text: z.string() },
+      inputSchema: { text: z.string(), ...TAB },
     },
-    async ({ text: t }) => text(await sendCmd("type_text", { text: t })),
+    async ({ text: t, tab }) => text(await sendCmd("type_text", withTab(tab, { text: t }))),
   );
 
   server.registerTool(
     "press_key",
     {
       description: "Press a keyboard key, e.g. 'Enter', 'Tab', 'Escape'.",
-      inputSchema: { key: z.string() },
+      inputSchema: { key: z.string(), ...TAB },
     },
-    async ({ key }) => text(await sendCmd("press_key", { key })),
+    async ({ key, tab }) => text(await sendCmd("press_key", withTab(tab, { key }))),
   );
 
   server.registerTool(
     "scroll",
     {
       description: "Scroll the page vertically. Positive = down, negative = up.",
-      inputSchema: { delta_y: z.number().int().default(600) },
+      inputSchema: { delta_y: z.number().int().default(600), ...TAB },
     },
-    async ({ delta_y }) => text(await sendCmd("scroll", { deltaY: delta_y })),
+    async ({ delta_y, tab }) => text(await sendCmd("scroll", withTab(tab, { deltaY: delta_y }))),
   );
 
   server.registerTool(
@@ -351,9 +381,10 @@ function buildServer(): McpServer {
         "click via read_elements + click_element(index) for pixel-accurate " +
         "clicks. (Coordinates eyeballed off an image can drift; index-based " +
         "clicking does not.)",
+      inputSchema: { ...TAB },
     },
-    async () => {
-      const result = await sendCmd("screenshot");
+    async ({ tab }) => {
+      const result = await sendCmd("screenshot", withTab(tab));
       await audit(
         "screenshot",
         undefined,
@@ -370,6 +401,57 @@ function buildServer(): McpServer {
           },
         ],
       };
+    },
+  );
+
+  // ===== Multi-tab management =====
+  server.registerTool(
+    "open_tab",
+    {
+      description:
+        "Open a new browser tab in THIS session's tab group and make it the " +
+        "session's current tab. Returns the tab id to pass as 'tab' to other tools.",
+      inputSchema: { url: z.string().optional().describe("URL to load; omit for a blank tab.") },
+    },
+    async ({ url }) => {
+      const info = await sendCmd("open_tab", { agentId, agentLabel, url });
+      sess.currentTab = info.tabId;
+      return text(
+        `Opened tab ${info.tabId} in group "${agentLabel}"` +
+          (info.url ? ` → ${info.url}` : "") +
+          `. It is now this session's current tab.`,
+      );
+    },
+  );
+
+  server.registerTool(
+    "list_tabs",
+    { description: "List the tabs this session has opened (id, title, url, active)." },
+    async () => text(JSON.stringify(await sendCmd("list_tabs", { agentId }))),
+  );
+
+  server.registerTool(
+    "use_tab",
+    {
+      description: "Set this session's current tab (subsequent tools default to it).",
+      inputSchema: { tab: z.number().int().describe("Tab id from open_tab/list_tabs.") },
+    },
+    async ({ tab }) => {
+      sess.currentTab = tab;
+      return text(`Current tab set to ${tab}.`);
+    },
+  );
+
+  server.registerTool(
+    "close_tab",
+    {
+      description: "Close a tab this session opened.",
+      inputSchema: { tab: z.number().int().describe("Tab id to close.") },
+    },
+    async ({ tab }) => {
+      await sendCmd("close_tab", { tabId: tab });
+      if (sess.currentTab === tab) sess.currentTab = null;
+      return text(`Closed tab ${tab}.`);
     },
   );
 

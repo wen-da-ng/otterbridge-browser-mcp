@@ -111,31 +111,31 @@ function hideCursor() {
 // Returns sampled path points so background.js can fire CDP mouseMoved
 // along the same trajectory (hover states trigger for real).
 function moveCursorTo(tx, ty, samples) {
-  return new Promise((resolve) => {
-    const c = ensureCursor();
-    const n = samples || S.trailSamples;
-    const sx = parseFloat(c.style.left) || 0;
-    const sy = parseFloat(c.style.top) || 0;
-    const dist = Math.hypot(tx - sx, ty - sy);
-    const duration = OtterConfig.moveDuration(dist, S);
+  const c = ensureCursor();
+  const n = samples || S.trailSamples;
+  const sx = parseFloat(c.style.left) || 0;
+  const sy = parseFloat(c.style.top) || 0;
+  const dist = Math.hypot(tx - sx, ty - sy);
+  const duration = OtterConfig.moveDuration(dist, S);
 
-    // Control point offset perpendicular to the path -> gentle arc.
-    const k = OtterConfig.curveFactor(S);
-    const mx = (sx + tx) / 2 + (ty - sy) * k;
-    const my = (sy + ty) / 2 - (tx - sx) * k;
+  // Control point offset perpendicular to the path -> gentle arc.
+  const k = OtterConfig.curveFactor(S);
+  const mx = (sx + tx) / 2 + (ty - sy) * k;
+  const my = (sy + ty) / 2 - (tx - sx) * k;
 
-    const ease = OtterConfig.easingFn(S);
-    const bezier = (e) => ({
-      x: (1 - e) ** 2 * sx + 2 * (1 - e) * e * mx + e * e * tx,
-      y: (1 - e) ** 2 * sy + 2 * (1 - e) * e * my + e * e * ty,
-    });
+  const ease = OtterConfig.easingFn(S);
+  const bezier = (e) => ({
+    x: (1 - e) ** 2 * sx + 2 * (1 - e) * e * mx + e * e * tx,
+    y: (1 - e) ** 2 * sy + 2 * (1 - e) * e * my + e * e * ty,
+  });
 
-    const path = [];
-    for (let i = 1; i <= n; i++) {
-      const p = bezier(ease(i / n));
-      path.push({ x: Math.round(p.x), y: Math.round(p.y) });
-    }
+  const path = [];
+  for (let i = 1; i <= n; i++) {
+    const p = bezier(ease(i / n));
+    path.push({ x: Math.round(p.x), y: Math.round(p.y) });
+  }
 
+  const animate = (onDone) => {
     isAnimating = true;
     const start = performance.now();
     function frame(now) {
@@ -143,15 +143,22 @@ function moveCursorTo(tx, ty, samples) {
       const p = bezier(ease(t));
       c.style.left = p.x + "px";
       c.style.top = p.y + "px";
-      if (t < 1) {
-        requestAnimationFrame(frame);
-      } else {
-        restLeft = tx; restTop = ty; isAnimating = false;
-        resolve({ path });
-      }
+      if (t < 1) requestAnimationFrame(frame);
+      else { restLeft = tx; restTop = ty; isAnimating = false; if (onDone) onDone(); }
     }
     requestAnimationFrame(frame);
-  });
+  };
+
+  // Visible tab: await the animation so the click syncs with the cursor's
+  // arrival (nice for the watching user). Hidden/background tab: rAF is
+  // throttled/paused, so awaiting would hang the click — resolve the path
+  // immediately and let the (cosmetic) animation run detached. This is what
+  // lets parallel agents click tabs the user isn't looking at.
+  if (document.hidden) {
+    animate();
+    return Promise.resolve({ path });
+  }
+  return new Promise((resolve) => animate(() => resolve({ path })));
 }
 
 // ===== Click pulse (press-down effect) + expanding ring ripple =====

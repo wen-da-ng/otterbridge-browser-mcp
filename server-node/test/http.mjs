@@ -86,8 +86,11 @@ async function main() {
     const client = await mkClient({ elicit: true });
 
     const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-    const expected = ["click", "click_element", "navigate", "press_key", "read_elements", "read_page", "screenshot", "scroll", "type_text"];
-    ok("tools/list has all 9 tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
+    const expected = [
+      "click", "click_element", "close_tab", "list_tabs", "navigate", "open_tab",
+      "press_key", "read_elements", "read_page", "screenshot", "scroll", "type_text", "use_tab",
+    ];
+    ok("tools/list has all 9 core + 4 tab tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
 
     const rp = await client.callTool({ name: "read_page", arguments: {} });
     ok("read_page returns JSON text", firstText(rp).includes("example.com"));

@@ -71,6 +71,39 @@ async function activeTab() {
   return tab;
 }
 
+// ===== Multi-tab: per-agent tab groups =====
+// Each MCP session (agent) owns a colored, titled Chrome tab group. Tabs it
+// opens are added to that group so parallel agents stay visually separated.
+const agentGroups = {}; // agentId -> chrome tab group id
+const GROUP_COLORS = ["orange", "blue", "green", "purple", "cyan", "pink", "yellow", "red", "grey"];
+let groupColorIx = 0;
+
+async function ensureAgentGroup(agentId, agentLabel, tabId) {
+  if (!agentId) return undefined; // ungrouped (legacy / no session id)
+  let groupId = agentGroups[agentId];
+  try {
+    if (groupId != null) {
+      await chrome.tabs.group({ groupId, tabIds: [tabId] });
+    } else {
+      groupId = await chrome.tabs.group({ tabIds: [tabId] });
+      agentGroups[agentId] = groupId;
+      const color = GROUP_COLORS[groupColorIx++ % GROUP_COLORS.length];
+      await chrome.tabGroups.update(groupId, { title: agentLabel || "OtterBridge", color });
+    }
+  } catch (_) { /* grouping is best-effort; never block the action */ }
+  return groupId;
+}
+
+// Resolve which tab a command targets: explicit params.tabId, else the active
+// tab (legacy single-tab behavior when a session hasn't opened its own tab).
+async function resolveTab(p) {
+  if (p && p.tabId != null) {
+    try { return await chrome.tabs.get(p.tabId); }
+    catch (_) { throw new Error(`Tab ${p.tabId} not found (was it closed?).`); }
+  }
+  return activeTab();
+}
+
 // ===== Cursor orchestration =====
 // Animate the fake cursor (content script) while firing real CDP mouseMoved
 // events along the same path so :hover states genuinely trigger.
@@ -160,8 +193,37 @@ async function handle(action, p) {
     return { pong: true, ts: Date.now() };
   }
 
+  // ----- Multi-tab management (no pre-existing active tab required) -----
+  if (action === "open_tab") {
+    const created = await chrome.tabs.create({ url: p.url || "about:blank", active: true });
+    if (p.url) await waitForLoad(created.id);
+    const groupId = await ensureAgentGroup(p.agentId, p.agentLabel, created.id);
+    const fresh = await chrome.tabs.get(created.id);
+    return { tabId: created.id, url: fresh.url, title: fresh.title, groupId };
+  }
+  if (action === "list_tabs") {
+    const groupId = agentGroups[p.agentId];
+    const tabs = groupId != null ? await chrome.tabs.query({ groupId }) : [];
+    return tabs.map((t) => ({ tabId: t.id, title: t.title, url: t.url, active: t.active }));
+  }
+  if (action === "close_tab") {
+    try { await chrome.tabs.remove(p.tabId); } catch (_) {}
+    return { closed: p.tabId };
+  }
+
   lastAgentActivity = Date.now();
-  const tab = await activeTab();
+  const tab = await resolveTab(p);
+  // Focus-aware activation: when a SINGLE agent is running, bring its tab to the
+  // front on visible actions so the user can watch. When MULTIPLE agents are
+  // active (parallel), never steal focus — they'd fight over it. All actions
+  // work on background tabs anyway (CDP input + scripting + CDP screenshot), so
+  // activation is purely cosmetic. screenshot is excluded (it uses CDP capture,
+  // which needs no focus).
+  const VISIBLE = new Set(["navigate", "click", "type_text", "press_key", "scroll"]);
+  const parallel = Object.keys(agentGroups).length > 1;
+  if (p.tabId != null && VISIBLE.has(action) && !parallel && !tab.active) {
+    await chrome.tabs.update(tab.id, { active: true });
+  }
 
   switch (action) {
     case "navigate": {
@@ -292,10 +354,13 @@ async function handle(action, p) {
     }
 
     case "screenshot": {
-      // captureVisibleTab grabs the viewport at PHYSICAL pixels (viewport
-      // CSS size x devicePixelRatio). We scale it back down to CSS pixels
-      // in an OffscreenCanvas so coordinates read off the image map 1:1 to
-      // the CSS viewport coords that click() expects — no DPR math needed.
+      // CDP Page.captureScreenshot (NOT chrome.tabs.captureVisibleTab) so we can
+      // capture BACKGROUND tabs too — essential for parallel agents, each
+      // screenshotting its own tab without stealing focus. Like captureVisibleTab
+      // it grabs the viewport at PHYSICAL pixels (CSS size x devicePixelRatio);
+      // we scale back down to CSS pixels in an OffscreenCanvas so coordinates
+      // read off the image map 1:1 to the CSS viewport coords click() expects.
+      await ensureDebugger(tab.id);
       const [meta] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => ({
@@ -306,10 +371,12 @@ async function handle(action, p) {
       });
       const { w, h, dpr } = meta.result;
       // JPEG q80: ~5-10x smaller than PNG on photo-heavy pages.
-      const dataUrl = await chrome.tabs.captureVisibleTab(null, {
+      const cap = await cdp(tab.id, "Page.captureScreenshot", {
         format: "jpeg", quality: 80,
       });
-      const bitmap = await createImageBitmap(await (await fetch(dataUrl)).blob());
+      const bitmap = await createImageBitmap(
+        await (await fetch(`data:image/jpeg;base64,${cap.data}`)).blob(),
+      );
       const canvas = new OffscreenCanvas(w, h);
       canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
       const buf = await (await canvas.convertToBlob({
