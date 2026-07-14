@@ -1,0 +1,14 @@
+# The server ships as a single bundled dist/index.js (see build.mjs), so the
+# whole dependency tree is intentionally excluded from the .mcpb.
+node_modules/
+src/
+test/
+build.mjs
+tsconfig.json
+package-lock.json
+.gitignore
+.mcpbignore
+*.mcpb
+agent_actions.log
+**/*.map
+**/*.ts

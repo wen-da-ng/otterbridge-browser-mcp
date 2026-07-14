@@ -20,14 +20,15 @@ vision (screenshots), and server-side safety are all implemented and verified.
 | Path | What it is |
 |---|---|
 | `extension/` | Chrome MV3 extension — the hands & eyes. WebSocket client + `chrome.debugger` (CDP) input + animated fake cursor. |
-| `server/` | **OtterBridge** — standard MCP server (FastMCP, streamable HTTP at `http://localhost:8000/mcp`) bridging tools to the extension over `ws://localhost:8765`. |
+| `server/` | **OtterBridge (Python)** — standard MCP server (FastMCP, streamable HTTP at `http://localhost:8000/mcp`) bridging tools to the extension over `ws://localhost:8765`. The reference implementation. |
+| `server-node/` | **OtterBridge (Node)** — a TypeScript port of the same server with an identical protocol, tools, and safety model. Packs into a `.mcpb` for **one-click** install in Claude Desktop (Node ships inside Desktop; Python does not). |
 | `agent/` | *Optional* example MCP client (LangGraph). Not needed — any MCP client can attach. Deferred. |
 
-The server speaks **two transports from one codebase**: streamable HTTP at
+Either server speaks **two transports from one codebase**: streamable HTTP at
 `http://localhost:8000/mcp` (default — for Claude Code, MCP Inspector, any HTTP
 client) and **stdio** (`--stdio` — for Claude Desktop, which launches the
 server itself). Both modes host the `ws://localhost:8765` bridge to the
-extension.
+extension. Run **only one** server at a time — they share the `:8765` bridge.
 
 ## Quick start
 
@@ -65,11 +66,36 @@ Pick the one you use:
 <summary><b>B · Claude Desktop</b> — Windows / macOS / Linux (beta)</summary>
 
 Desktop **launches the server for you** over stdio, so do **not** run
-`start.ps1`/`start.sh` — that would fight for the `:8765` bridge port. You only
-need the extension loaded (Step 1) and the venv created (Step 2).
+`start.ps1`/`start.sh` — that would fight for the `:8765` bridge port. You still
+need the extension loaded (Step 1). Two ways to attach:
 
-Open **Settings → Developer → Edit Config**, then add the block below, using
-**absolute paths** to this repo. Restart Claude Desktop afterward.
+#### Option 1 — `.mcpb` bundle *(recommended: one-click, no Python)*
+
+The Node port packages into a Desktop Extension that installs by double-click.
+The Python setup in Step 2 is **not required** — Node ships inside Claude
+Desktop. Build the bundle once:
+
+```bash
+cd server-node
+npm ci --ignore-scripts   # reproducible, no dependency install scripts
+npm run build             # esbuild -> single bundled dist/index.js
+npx @anthropic-ai/mcpb pack . otterbridge.mcpb
+```
+
+The server is bundled into one self-contained file, so the `.mcpb` ships a
+single reviewed `dist/index.js` — no `node_modules` tree in the artifact.
+
+Then double-click `server-node/otterbridge.mcpb` (or Claude Desktop → **Settings
+→ Extensions → Advanced → Install Extension**). Two checkboxes appear for the
+safety gate; the defaults (approval on, fail-open off) are the safe ones. This
+is the path a non-technical user gets once the bundle is shared with them
+directly — no terminal, no config file.
+
+#### Option 2 — Python stdio config *(fallback)*
+
+Set up the Python server (Step 2), then open **Settings → Developer → Edit
+Config** and add the block below, using **absolute paths** to this repo. Restart
+Claude Desktop afterward.
 
 The config file lives at:
 
@@ -146,6 +172,12 @@ Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
   - `BROWSER_AGENT_GATE_FALLBACK=deny` (default) | `allow` — used only if a
     client can't show an elicitation prompt.
 - Servers bind to **localhost only**. Never expose them on the network.
+- **Bridge & endpoint are origin/host-locked** (defense against local-page
+  attacks): the `ws://localhost:8765` bridge only accepts the extension
+  (`chrome-extension://` origin) or non-browser clients — a web page you visit
+  can't connect to eavesdrop on or displace it. The HTTP endpoint rejects
+  requests whose `Host`/`Origin` isn't loopback, blocking DNS-rebinding attempts
+  to drive the browser from a malicious site.
 - Runs in your **real Chrome profile** (real logins). For isolation, load the
   extension in a dedicated Chrome profile instead.
 - Main residual threat is **prompt injection** from page content; keep the gate on.
@@ -157,6 +189,7 @@ Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
 | `extension/*.js` | Reload the extension at `chrome://extensions` (↻). |
 | `server/server.py` (Claude Code / Inspector) | Restart the server; in Claude Code run `/mcp` to reconnect. |
 | `server/server.py` (Claude Desktop) | Fully quit and reopen Claude Desktop — it relaunches the stdio server. |
+| `server-node/src/*.ts` | `npm run build` in `server-node/`; restart the client. If installed as a `.mcpb`, re-pack and reinstall (or reinstall the updated bundle). |
 
 ## Notes & gotchas
 
@@ -172,22 +205,23 @@ Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
 | You are | Path | Prerequisites |
 |---|---|---|
 | Comfortable with a terminal | Run `bootstrap` + `start`, register the client. | None — bootstrap installs `uv` + Python. |
-| Not technical | Wait for the phase-2 one-click packaging below. | (planned: none) |
+| Not technical, on Claude Desktop | Double-click the shared `.mcpb`. | None — Node ships inside Claude Desktop. |
 
-The remaining friction for a non-technical friend is *two* manual steps that
-no script can remove today: loading an **unpacked** Chrome extension (needs
-Developer mode) and editing a JSON config / running a terminal command. Phase 2
-removes both.
+The server side is now one step for a non-technical friend on Claude Desktop:
+double-click the `.mcpb` (no Python, no terminal, no config file). The **last**
+remaining manual step is loading the **unpacked** Chrome extension (needs
+Developer mode) — the Chrome Web Store publish in the roadmap removes it.
 
 ## Roadmap — phase 2 (true one-click, for non-technical users)
 
-- **Chrome Web Store (unlisted):** publish the extension so it installs with one
-  click from a private link — no Developer mode, no unpacked folder.
-- **`.mcpb` Desktop Extension:** package the server as an MCP Bundle for
-  double-click install in Claude Desktop (Settings → Extensions → Install).
-  Node.js ships inside Claude Desktop but Python does not, so this likely means
-  porting the ~250-line server to the TypeScript MCP SDK (`ws` for the bridge)
-  so the bundle needs **zero** runtime prerequisites.
+- **✅ `.mcpb` Desktop Extension — done.** The server is ported to the TypeScript
+  MCP SDK (`ws` for the bridge) in `server-node/` and packages into a `.mcpb`
+  for double-click install in Claude Desktop, with **zero** runtime
+  prerequisites (Node ships inside Desktop). Same protocol, tools, and safety
+  model as the Python server. See Quick start → Claude Desktop → Option 1.
+- **⬜ Chrome Web Store (unlisted):** publish the extension so it installs with
+  one click from a private link — no Developer mode, no unpacked folder. This is
+  the last manual step remaining for a non-technical user.
 
 ## Not done (optional)
 

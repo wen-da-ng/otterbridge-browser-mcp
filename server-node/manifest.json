@@ -1,0 +1,63 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/dist/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "otterbridge",
+  "display_name": "OtterBridge",
+  "version": "0.1.0",
+  "description": "Drive your real Chrome browser from Claude through the Otter extension.",
+  "long_description": "OtterBridge lets Claude observe and act in your real Chrome browser: read the page, list interactive elements, click, type, scroll, navigate, and take screenshots. It talks to the companion Otter Chrome extension over a localhost-only WebSocket. Clicks on destructive controls (buy, pay, delete, send, submit, ...) require your approval first. Everything runs on your machine; no browsing data leaves it.",
+  "author": {
+    "name": "wen-da-ng",
+    "email": "lenus.ng.wen.da@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wen-da-ng/otterbridge-browser-mcp"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "icon": "icon.png",
+  "keywords": ["browser", "automation", "chrome", "agent", "otter"],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js", "--stdio"],
+      "env": {
+        "BROWSER_AGENT_GATE": "${user_config.gate_enabled}",
+        "BROWSER_AGENT_GATE_FALLBACK": "${user_config.fallback_allow}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "navigate", "description": "Navigate the active tab to a URL." },
+    { "name": "read_page", "description": "Read the active tab's URL, title, and visible text." },
+    { "name": "read_elements", "description": "List interactive elements with indices and coordinates." },
+    { "name": "click_element", "description": "Click an interactive element by index (preferred, drift-free)." },
+    { "name": "click", "description": "Click at viewport coordinates (x, y)." },
+    { "name": "type_text", "description": "Type text into the focused element." },
+    { "name": "press_key", "description": "Press a keyboard key (Enter, Tab, Escape, ...)." },
+    { "name": "scroll", "description": "Scroll the page vertically." },
+    { "name": "screenshot", "description": "Capture the visible viewport as an image." }
+  ],
+  "user_config": {
+    "gate_enabled": {
+      "type": "boolean",
+      "title": "Require approval for destructive clicks",
+      "description": "Ask for confirmation before clicking controls like Buy, Pay, Delete, Send, or Submit. Strongly recommended.",
+      "default": true
+    },
+    "fallback_allow": {
+      "type": "boolean",
+      "title": "Allow destructive clicks when approval can't be shown",
+      "description": "If the app can't display an approval prompt, allow the click anyway. Leave OFF for fail-safe (blocked) behavior.",
+      "default": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18"
+    }
+  }
+}

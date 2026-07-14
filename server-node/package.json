@@ -1,0 +1,37 @@
+{
+  "name": "otterbridge-server",
+  "version": "0.1.0",
+  "description": "OtterBridge - Node/TypeScript MCP server bridging browser actions to the Otter Chrome extension. Supports stdio (Claude Desktop / .mcpb) and streamable HTTP (Claude Code / MCP Inspector).",
+  "author": "wen-da-ng (OtterBridge)",
+  "license": "SEE LICENSE IN ../LICENSE",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "otterbridge": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node build.mjs",
+    "start": "node dist/index.js",
+    "start:stdio": "node dist/index.js --stdio",
+    "pretest": "npm run typecheck && npm run build",
+    "test": "node test/http.mjs && node test/stdio.mjs && node test/env.mjs && node test/security.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "ws": "8.21.0",
+    "zod": "^3.25.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "@types/ws": "^8.18.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.6.0"
+  }
+}

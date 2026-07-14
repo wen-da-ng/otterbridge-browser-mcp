@@ -100,8 +100,22 @@ ext_socket = None            # the connected extension, if any
 pending: dict[str, asyncio.Future] = {}
 
 
+def _origin_allowed(origin) -> bool:
+    # Only the Otter extension (chrome-extension:// Origin) or a non-browser
+    # local client (no Origin header) may attach. A web page the user visits can
+    # otherwise open ws://localhost:8765 and displace the extension —
+    # intercepting agent commands (incl. typed secrets) and feeding back
+    # fabricated page data. Any http(s) page Origin is rejected.
+    return origin is None or origin.startswith("chrome-extension://")
+
+
 async def ws_handler(ws):
     global ext_socket
+    origin = ws.request.headers.get("Origin")
+    if not _origin_allowed(origin):
+        log(f"[bridge] rejected connection from origin: {origin}")
+        await ws.close(code=1008, reason="origin not allowed")
+        return
     ext_socket = ws
     log("[bridge] extension connected")
     try:
@@ -270,7 +284,29 @@ async def main():
         await mcp.run_stdio_async()
     else:
         log("[bridge] MCP transport: streamable HTTP at http://localhost:8000/mcp")
-        await mcp.run_streamable_http_async()
+        await run_http_guarded()
+
+
+async def run_http_guarded():
+    """Serve the streamable-HTTP app with a Host allowlist (DNS-rebinding
+    defense). A malicious site can rebind its name to 127.0.0.1 and reach this
+    endpoint same-origin (bypassing CORS), then drive the browser via MCP tools;
+    the rebound request still carries the attacker's name in the Host header, so
+    we reject any Host that isn't loopback. Replaces mcp.run_streamable_http_async()
+    (same app, host, and port) with the middleware added."""
+    import uvicorn
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    app = mcp.streamable_http_app()
+    # TrustedHostMiddleware compares the Host header (port stripped) to this list.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+    config = uvicorn.Config(
+        app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level="warning",
+    )
+    await uvicorn.Server(config).serve()
 
 
 if __name__ == "__main__":

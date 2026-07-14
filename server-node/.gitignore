@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.mcpb
+agent_actions.log
