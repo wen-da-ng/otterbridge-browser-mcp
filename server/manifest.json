@@ -4,8 +4,8 @@
   "name": "otterbridge",
   "display_name": "OtterBridge",
   "version": "0.1.0",
-  "description": "Drive your real Chrome browser from Claude through the Otter extension.",
-  "long_description": "OtterBridge lets Claude observe and act in your real Chrome browser: read the page, list interactive elements, click, type, scroll, navigate, and take screenshots. It talks to the companion Otter Chrome extension over a localhost-only WebSocket. Clicks on destructive controls (buy, pay, delete, send, submit, ...) require your approval first. Everything runs on your machine; no browsing data leaves it.",
+  "description": "Drive your real Chrome browser from any AI agent through the Otter extension.",
+  "long_description": "OtterBridge lets AI agents observe and act in your real Chrome browser: read the page, list interactive elements, click, type, scroll, navigate, and take screenshots. It talks to the companion Otter Chrome extension over a localhost-only WebSocket. Clicks on destructive controls (buy, pay, delete, send, submit, ...) require your approval first. Everything runs on your machine; no browsing data leaves it.",
   "author": {
     "name": "wen-da-ng",
     "email": "lenus.ng.wen.da@gmail.com"

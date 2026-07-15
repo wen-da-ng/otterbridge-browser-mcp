@@ -1,7 +1,7 @@
 {
   "name": "otterbridge-server",
   "version": "0.1.0",
-  "description": "OtterBridge - Node/TypeScript MCP server bridging browser actions to the Otter Chrome extension. Supports stdio (Claude Desktop / .mcpb) and streamable HTTP (Claude Code / MCP Inspector).",
+  "description": "OtterBridge - Node/TypeScript MCP server bridging browser actions to the Otter Chrome extension. Supports stdio (desktop MCP hosts / .mcpb) and streamable HTTP (CLI agents / MCP Inspector).",
   "author": "wen-da-ng (OtterBridge)",
   "license": "SEE LICENSE IN ../LICENSE",
   "type": "module",
