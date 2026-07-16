@@ -57,16 +57,24 @@ the WebSocket with canned responses, and drive the real MCP tools — covering a
 transport, the single-instance `:8765` guard, the env-string parsing the
 `.mcpb` relies on, and the origin/host security guards.
 
-## Package the `.mcpb`
+## Get the `.mcpb`
+
+**Most users should not build anything** — download the prebuilt
+`otterbridge.mcpb` from the
+[Releases page](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases)
+(built and attached automatically by CI on every version tag), or grab the
+copy committed right here as `server/otterbridge.mcpb`.
+
+To build it from source instead:
+
+```bash
+npm ci --ignore-scripts
+npm run pack     # build (esbuild) + copy LICENSE in + mcpb pack -> otterbridge.mcpb
+```
 
 The server is bundled by `build.mjs` (esbuild) into one self-contained
 `dist/index.js`, so the `.mcpb` ships a single reviewed file — no `node_modules`
-tree — and `mcpb pack` needs no prune step:
-
-```bash
-npm run build
-npx @anthropic-ai/mcpb pack . otterbridge.mcpb
-```
+tree — and `mcpb pack` needs no prune step.
 
 Then double-click `otterbridge.mcpb` in Claude Desktop (or Settings →
 Extensions → Advanced → Install Extension). See `manifest.json` for the bundle

@@ -1,0 +1,40 @@
+name: Release .mcpb
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install (lockfile-exact, no install scripts)
+        run: npm ci --ignore-scripts
+
+      - name: Test (typecheck + build + end-to-end)
+        run: npm test
+
+      - name: Pack .mcpb
+        run: npm run pack
+
+      - name: Create GitHub release with the .mcpb attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" otterbridge.mcpb
+          --title "OtterBridge $GITHUB_REF_NAME"
+          --generate-notes

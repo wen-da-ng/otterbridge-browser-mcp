@@ -1,4 +1,5 @@
 node_modules/
 dist/
-*.mcpb
 agent_actions.log
+# copied from ../LICENSE by `npm run pack` so it ships inside the .mcpb
+LICENSE

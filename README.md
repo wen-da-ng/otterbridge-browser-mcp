@@ -40,14 +40,16 @@ select the `extension` folder. Required regardless of which client you use.
 <details>
 <summary><b>A · Claude Desktop</b> — the one-click <code>.mcpb</code> (recommended, no prerequisites)</summary>
 
-Node ships **inside** Claude Desktop, so there's nothing to install. Build the
-bundle once (or use a shared `server/otterbridge.mcpb`):
+Node ships **inside** Claude Desktop, so there's nothing to install or compile.
+**Download `otterbridge.mcpb` from the
+[Releases page](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases)**
+(CI builds and attaches it on every version tag), grab the committed copy at
+[`server/otterbridge.mcpb`](server/otterbridge.mcpb), or build it from source:
 
 ```bash
 cd server
 npm ci --ignore-scripts   # reproducible install, no dependency install scripts
-npm run build             # esbuild → single bundled dist/index.js
-npx @anthropic-ai/mcpb pack . otterbridge.mcpb
+npm run pack              # esbuild bundle + mcpb pack → otterbridge.mcpb
 ```
 
 Then double-click `server/otterbridge.mcpb` (or Claude Desktop → **Settings →
@@ -160,7 +162,7 @@ and a live preview. Settings sync via `chrome.storage.sync` and apply live.
 |---|---|
 | `extension/*.js` | Reload the extension at `chrome://extensions` (↻), then refresh open tabs. |
 | `server/src/*.ts` (Claude Code / Inspector) | `npm run build` in `server/`; restart the server; in Claude Code run `/mcp` to reconnect. |
-| `server/src/*.ts` (Claude Desktop `.mcpb`) | Re-pack (`npm run build && npx @anthropic-ai/mcpb pack . otterbridge.mcpb`) and reinstall the bundle. |
+| `server/src/*.ts` (Claude Desktop `.mcpb`) | Re-pack (`npm run pack` in `server/`) and reinstall the bundle. |
 | `legacy/server-python/server.py` | See [`legacy/README.md`](legacy/README.md). |
 
 ## Notes & gotchas
