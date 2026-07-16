@@ -23,7 +23,6 @@ multi-agent** control are all implemented and verified.
 | `extension/` | Chrome MV3 extension — the hands & eyes. WebSocket client + `chrome.debugger` (CDP) input + animated fake cursor + a settings UI (popup + options page). |
 | `server/` | **OtterBridge (Node/TypeScript)** — the MCP server. Bridges browser actions to the extension over `ws://localhost:8765`, with two transports from one codebase: **stdio** (for the `.mcpb` / Claude Desktop) and **streamable HTTP** at `http://localhost:8000/mcp` (for Claude Code, MCP Inspector). Bundles into a one-click `.mcpb`. |
 | `legacy/` | The original **Python** (FastMCP) server + its setup scripts, kept as a reference/fallback. Single-tab only. See [`legacy/README.md`](legacy/README.md). |
-| `agent/` | *Optional* example MCP client (LangGraph). Not needed — any MCP client can attach. Deferred. |
 
 Run **only one** server at a time (Node **or** legacy Python) — they share the
 `ws://localhost:8765` bridge and only one process can own it.
@@ -189,5 +188,6 @@ and a live preview. Settings sync via `chrome.storage.sync` and apply live.
 
 - Detection refinements: brief-attach debugger, extra behavioral jitter, cursor
   overshoot. Only matters against aggressive anti-bot sites.
-- The standalone LangGraph client in `agent/` (deferred — Claude Code already
-  serves as a working agent client).
+- A standalone example agent client (e.g. LangGraph/Ollama) — any MCP client
+  can attach to the HTTP endpoint, and Claude Code already serves as a working
+  agent client. (A first attempt lived in `agent/`, removed as stale.)
