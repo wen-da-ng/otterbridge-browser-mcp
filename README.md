@@ -1,107 +1,92 @@
-# Otter — Browser Agent · OtterBridge
-
-A personal "Claude in Chrome"-style browser agent. The **Otter** Chrome
-extension is the hands & eyes; **OtterBridge** is the standard MCP server that
-any MCP client can use to drive your real Chrome — Claude Code, Claude Desktop,
-MCP Inspector, or any MCP client.
-
-_Built by **wen-da-ng** · OtterBridge_
+<div align="center">
 
 ![OtterBridge](static/otterbridge-banner.png)
 
+# Otter — Browser Agent · OtterBridge
+
+**Let your AI assistant drive your real Chrome — and ask you first before anything risky.**
+
+[![Release](https://img.shields.io/github/v/release/wen-da-ng/otterbridge-browser-mcp?label=release&color=2ea44f)](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases/latest)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![Protocol](https://img.shields.io/badge/protocol-MCP-8A2BE2)](https://modelcontextprotocol.io)
+[![Chrome](https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white)](extension/)
+[![Claude Desktop](https://img.shields.io/badge/Claude%20Desktop-one--click%20.mcpb-D97757)](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases/latest)
+
+[Install](#install--claude-desktop) ·
+[How it works](#how-it-works) ·
+[Tools](#what-the-agent-can-do) ·
+[Security](#safety--security) ·
+[For developers](#for-developers)
+
+</div>
+
 > **For personal use only.** Not for publication or distribution. It operates
-> your real, logged-in browser (see [Security](#security)).
+> your real, logged-in browser (see [Security](#safety--security)).
 
-**Status: complete.** Bridge, observation tools, input + animated cursor, vision
-(screenshots), server-side safety, in-extension settings UI, and **multi-tab /
-multi-agent** control are all implemented and verified.
+## How it works
 
-## Components
+Two pieces work together: the **Otter** Chrome extension (the hands & eyes) and
+the **OtterBridge** MCP server (the connector). Any MCP client can drive it —
+Claude Desktop, Claude Code, MCP Inspector, or your own agent.
 
-| Path | What it is |
-|---|---|
-| `extension/` | Chrome MV3 extension — the hands & eyes. WebSocket client + `chrome.debugger` (CDP) input + animated fake cursor + a settings UI (popup + options page). |
-| `server/` | **OtterBridge (Node/TypeScript)** — the MCP server. Bridges browser actions to the extension over `ws://localhost:8765`, with two transports from one codebase: **stdio** (for the `.mcpb` / Claude Desktop) and **streamable HTTP** at `http://localhost:8000/mcp` (for Claude Code, MCP Inspector). Bundles into a one-click `.mcpb`. |
-| `legacy/` | The original **Python** (FastMCP) server + its setup scripts, kept as a reference/fallback. Single-tab only. See [`legacy/README.md`](legacy/README.md). |
+```mermaid
+flowchart LR
+    A["Claude Desktop<br/>(or any MCP client)"] -- "MCP" --> B["OtterBridge<br/>server"]
+    B -- "WebSocket<br/>localhost:8765" --> C["Otter<br/>extension"]
+    C -- "CDP" --> D["Your real<br/>Chrome"]
+```
 
-Run **only one** server at a time (Node **or** legacy Python) — they share the
-`ws://localhost:8765` bridge and only one process can own it.
+The agent reads pages, clicks, types, scrolls, and takes screenshots — with a
+visible animated cursor, an audit log, and a hard rule: clicks on anything that
+looks destructive (*Buy, Pay, Send, Delete…*) stop and ask **you** first.
 
-## Quick start
+## Install — Claude Desktop
 
-### Step 1 — Load the Otter extension *(everyone, one time)*
+All you need is **Google Chrome** and **Claude Desktop** — no Node.js, no git,
+no terminal.
 
-Chrome → `chrome://extensions` → enable **Developer mode** → **Load unpacked** →
-select the `extension` folder. Required regardless of which client you use.
+**1 — Download two files** from the
+[latest release](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases/latest):
+`otterbridge.mcpb` and `otter-extension.zip`.
 
-### Step 2 — Attach your MCP client
+**2 — Add the extension to Chrome:** unzip `otter-extension.zip` to a permanent
+spot (e.g. `Documents\Otter` — Chrome keeps loading it from there, so don't
+delete it later). Then open `chrome://extensions`, switch on **Developer mode**
+(top-right), click **Load unpacked**, and pick the unzipped `extension` folder.
+
+**3 — Add the bridge to Claude Desktop:** double-click `otterbridge.mcpb` and
+confirm the install. Two safety checkboxes appear — **keep the defaults**.
+
+**4 — Try it:** with Chrome open, ask Claude:
+*"Open example.com and tell me what's on the page."*
 
 <details>
-<summary><b>A · Claude Desktop</b> — the one-click <code>.mcpb</code> (recommended, no prerequisites)</summary>
+<summary><b>No release download available?</b></summary>
 
-Node ships **inside** Claude Desktop, so there's nothing to install or compile.
-**Download `otterbridge.mcpb` from the
-[Releases page](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases)**
-(CI builds and attaches it on every version tag), grab the committed copy at
-[`server/otterbridge.mcpb`](server/otterbridge.mcpb), or build it from source:
-
-```bash
-cd server
-npm ci --ignore-scripts   # reproducible install, no dependency install scripts
-npm run pack              # esbuild bundle + mcpb pack → otterbridge.mcpb
-```
-
-Then double-click `server/otterbridge.mcpb` (or Claude Desktop → **Settings →
-Extensions → Advanced → Install Extension**). Two checkboxes appear for the
-safety gate; the defaults (approval on, fail-open off) are the safe ones. That's
-it — no terminal, no config file. This is the path a non-technical user gets
-when the bundle is shared with them directly.
-
-The bundle is a single self-contained `dist/index.js` (no `node_modules` tree in
-the artifact). Claude Desktop launches it over stdio and hosts the `:8765`
-bridge; do **not** also run a standalone server.
-</details>
-
-<details open>
-<summary><b>B · Claude Code</b> — Windows / macOS / Linux</summary>
-
-```bash
-cd server
-npm ci --ignore-scripts
-npm run build
-npm start                 # streamable HTTP at http://localhost:8000/mcp
-```
-
-Wait for `[bridge] extension connected` (the extension auto-reconnects), then
-register it once:
-```
-claude mcp add --transport http otterbridge http://localhost:8000/mcp
-```
+Use the direct copy of
+[`otterbridge.mcpb`](https://github.com/wen-da-ng/otterbridge-browser-mcp/raw/main/server/otterbridge.mcpb),
+and for the extension click the green **Code** button on the repo page →
+**Download ZIP** (the extension is the `extension` folder inside).
 </details>
 
 <details>
-<summary><b>C · MCP Inspector / any other MCP client</b></summary>
+<summary><b>Troubleshooting</b></summary>
 
-Start the server (`cd server && npm start`), then point the client at the
-streamable-HTTP endpoint:
-```
-npx @modelcontextprotocol/inspector
-```
-Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
+- **Nothing happens?** Make sure Chrome is open and the Otter extension is
+  loaded (`chrome://extensions`). The extension reconnects automatically.
+- A **"Chrome is being debugged" banner** appears at the top — normal and
+  harmless; websites can't see it.
+- `chrome://` pages, the Chrome Web Store, and PDFs can't be read or clicked —
+  Chrome doesn't allow it.
 </details>
+
+## What the agent can do
+
+Nine core tools, each taking an optional `tab` id — plus multi-tab, multi-agent
+control where every MCP session gets its own colored Chrome tab group.
 
 <details>
-<summary><b>Legacy Python server</b> — reference / fallback</summary>
-
-The original Python implementation lives in [`legacy/`](legacy/) with its own
-setup scripts (`bootstrap` + `start`) and docs. It's single-tab only. See
-[`legacy/README.md`](legacy/README.md).
-</details>
-
-## Tools
-
-The 9 core tools each take an **optional `tab` id** (from `open_tab`/`list_tabs`);
-omit it to use the session's current tab, or the active tab if none.
+<summary><b>The 9 core tools</b></summary>
 
 | Tool | Does |
 |---|---|
@@ -114,23 +99,36 @@ omit it to use the session's current tab, or the active tab if none.
 | `press_key(key, tab?)` | e.g. `Enter`, `Tab`, `Escape`. |
 | `scroll(delta_y, tab?)` | Vertical scroll with jittered delta. |
 | `screenshot(tab?)` | JPEG image of a tab's viewport (via CDP — works on background tabs too). |
+</details>
 
-**Multi-tab / multi-agent** (Node server): each MCP **session** is an agent with
-its own colored Chrome **tab group**. Manage tabs with `open_tab(url?)`,
-`list_tabs()`, `use_tab(tab)`, `close_tab(tab)`. Multiple agents (sessions) can
-drive multiple tabs **simultaneously** — the server routes each session's
-commands to its own tab, and a single agent never steals focus from another
-(background tabs are driven via CDP without activation).
+<details>
+<summary><b>Multi-tab / multi-agent</b></summary>
 
-## Cursor & input settings
+Each MCP **session** is an agent with its own colored Chrome **tab group**.
+Manage tabs with `open_tab(url?)`, `list_tabs()`, `use_tab(tab)`,
+`close_tab(tab)`. Multiple agents (sessions) can drive multiple tabs
+**simultaneously** — the server routes each session's commands to its own tab,
+and a single agent never steals focus from another (background tabs are driven
+via CDP without activation).
+</details>
+
+<details>
+<summary><b>Cursor &amp; input settings</b></summary>
 
 The extension has a settings UI — the toolbar **popup** (preset switch + master
 cursor toggle) and a full **options page** (right-click the icon → Options).
 Tune move speed, curvature, easing, typing speed, scroll, idle drift, cursor
 size/colors/glow, and visibility — with **presets** (Natural / Fast / Instant)
 and a live preview. Settings sync via `chrome.storage.sync` and apply live.
+</details>
 
-## Security
+## Safety & security
+
+Every action is **audit-logged**, destructive clicks require **your approval**,
+and everything binds to **localhost only** — nothing is exposed to the network.
+
+<details>
+<summary><b>Full security model</b></summary>
 
 - **Audit log:** every dispatched action is appended to `server/agent_actions.log`.
 - **Destructive-action gate:** a `click` whose target text matches danger words
@@ -154,8 +152,78 @@ and a live preview. Settings sync via `chrome.storage.sync` and apply live.
 - Runs in your **real Chrome profile** (real logins). For isolation, load the
   extension in a dedicated Chrome profile instead.
 - Main residual threat is **prompt injection** from page content; keep the gate on.
+</details>
 
-## Reloading after code changes
+## For developers
+
+Everything below needs **git** and **Node.js ≥ 18** — regular Claude Desktop
+users never touch this. Run **only one** server at a time (Node, legacy Python,
+**or** the `.mcpb` inside Claude Desktop) — they share the `ws://localhost:8765`
+bridge and only one process can own it.
+
+<details>
+<summary><b>Components</b></summary>
+
+| Path | What it is |
+|---|---|
+| `extension/` | Chrome MV3 extension — the hands & eyes. WebSocket client + `chrome.debugger` (CDP) input + animated fake cursor + a settings UI (popup + options page). |
+| `server/` | **OtterBridge (Node/TypeScript)** — the MCP server. Bridges browser actions to the extension over `ws://localhost:8765`, with two transports from one codebase: **stdio** (for the `.mcpb` / Claude Desktop) and **streamable HTTP** at `http://localhost:8000/mcp` (for Claude Code, MCP Inspector). Bundles into a one-click `.mcpb`. |
+| `legacy/` | The original **Python** (FastMCP) server + its setup scripts, kept as a reference/fallback. Single-tab only. See [`legacy/README.md`](legacy/README.md). |
+</details>
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+```bash
+git clone https://github.com/wen-da-ng/otterbridge-browser-mcp.git
+cd otterbridge-browser-mcp/server
+npm ci --ignore-scripts   # reproducible install, no dependency install scripts
+npm run build
+npm start                 # streamable HTTP at http://localhost:8000/mcp
+```
+
+Load the extension from your clone's `extension/` folder, wait for
+`[bridge] extension connected`, then register the server once:
+
+```
+claude mcp add --transport http otterbridge http://localhost:8000/mcp
+```
+</details>
+
+<details>
+<summary><b>MCP Inspector / any other MCP client</b></summary>
+
+Start the server (`cd server && npm start`), then point the client at the
+streamable-HTTP endpoint:
+```
+npx @modelcontextprotocol/inspector
+```
+Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
+</details>
+
+<details>
+<summary><b>Build the <code>.mcpb</code> from source / releases</b></summary>
+
+```bash
+cd server
+npm ci --ignore-scripts
+npm run pack              # esbuild bundle + LICENSE + mcpb pack → otterbridge.mcpb
+```
+
+Releases are automated: pushing a `v*` tag makes CI run the test suite, pack
+`otterbridge.mcpb`, zip the extension, and attach both to a GitHub release.
+</details>
+
+<details>
+<summary><b>Legacy Python server</b></summary>
+
+The original Python implementation lives in [`legacy/`](legacy/) with its own
+setup scripts (`bootstrap` + `start`) and docs. It's single-tab only. See
+[`legacy/README.md`](legacy/README.md).
+</details>
+
+<details>
+<summary><b>Reloading after code changes</b></summary>
 
 | Changed | Do |
 |---|---|
@@ -163,8 +231,10 @@ and a live preview. Settings sync via `chrome.storage.sync` and apply live.
 | `server/src/*.ts` (Claude Code / Inspector) | `npm run build` in `server/`; restart the server; in Claude Code run `/mcp` to reconnect. |
 | `server/src/*.ts` (Claude Desktop `.mcpb`) | Re-pack (`npm run pack` in `server/`) and reinstall the bundle. |
 | `legacy/server-python/server.py` | See [`legacy/README.md`](legacy/README.md). |
+</details>
 
-## Notes & gotchas
+<details>
+<summary><b>Notes &amp; gotchas</b></summary>
 
 - `chrome://` pages, the Web Store, and PDFs can't be read or clicked (they
   reject script injection).
@@ -174,20 +244,21 @@ and a live preview. Settings sync via `chrome.storage.sync` and apply live.
   animation.
 - Some sites (e.g. Shopee) gate automated browsing of logged-out sessions behind
   an anti-bot / login wall; log in first for deep browsing.
+</details>
 
 ## Roadmap
 
-- **✅ `.mcpb` Desktop Extension** — Node/TS server in `server/`, bundled for
-  double-click install in Claude Desktop, zero prerequisites.
-- **✅ Multi-tab / multi-agent** — per-session tab groups + parallel control.
-- **⬜ Chrome Web Store (unlisted)** — publish the extension so it installs with
-  one click from a private link (no Developer mode / unpacked folder). This is
-  the last manual step remaining for a non-technical user.
+- [x] `.mcpb` Desktop Extension — one-click install in Claude Desktop, zero prerequisites
+- [x] Multi-tab / multi-agent — per-session tab groups + parallel control
+- [x] Rookie-friendly releases — prebuilt `.mcpb` + extension zip on every release
+- [ ] Chrome Web Store (unlisted) — extension installs from a link, no Developer mode
+- [ ] Detection refinements — brief-attach debugger, extra behavioral jitter, cursor overshoot
+- [ ] Standalone example agent client (LangGraph/Ollama) — any MCP client can already attach
 
-## Not done (optional)
+---
 
-- Detection refinements: brief-attach debugger, extra behavioral jitter, cursor
-  overshoot. Only matters against aggressive anti-bot sites.
-- A standalone example agent client (e.g. LangGraph/Ollama) — any MCP client
-  can attach to the HTTP endpoint, and Claude Code already serves as a working
-  agent client. (A first attempt lived in `agent/`, removed as stale.)
+<div align="center">
+
+_Built by <b>wen-da-ng</b> · OtterBridge_
+
+</div>

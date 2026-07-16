@@ -1,6 +1,6 @@
 {
   "name": "otterbridge-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OtterBridge - Node/TypeScript MCP server bridging browser actions to the Otter Chrome extension. Supports stdio (desktop MCP hosts / .mcpb) and streamable HTTP (CLI agents / MCP Inspector).",
   "author": "wen-da-ng (OtterBridge)",
   "license": "SEE LICENSE IN ../LICENSE",

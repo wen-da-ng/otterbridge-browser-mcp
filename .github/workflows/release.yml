@@ -31,10 +31,14 @@ jobs:
       - name: Pack .mcpb
         run: npm run pack
 
-      - name: Create GitHub release with the .mcpb attached
+      - name: Zip the Chrome extension
+        working-directory: .
+        run: zip -r otter-extension.zip extension
+
+      - name: Create GitHub release with the .mcpb and extension zip attached
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "$GITHUB_REF_NAME" otterbridge.mcpb
+          gh release create "$GITHUB_REF_NAME" otterbridge.mcpb ../otter-extension.zip
           --title "OtterBridge $GITHUB_REF_NAME"
           --generate-notes
