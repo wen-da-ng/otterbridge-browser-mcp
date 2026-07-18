@@ -21,6 +21,8 @@ const SCHEMA = [
   { group: "behavior", key: "idleDrift", label: "Idle drift", type: "toggle" },
   { group: "behavior", key: "driftIntensity", label: "Drift intensity", type: "range", min: 0, max: 2, step: 0.1, fmt: (v) => v.toFixed(1) + "×", dependsOn: "idleDrift" },
 
+  { group: "advanced", key: "allowJsEval", label: "Allow evaluate_js (run JS in pages)", type: "toggle" },
+
   { group: "appearance", key: "size", label: "Cursor size", type: "range", min: 20, max: 48, step: 1, fmt: (v) => v + "px" },
   { group: "appearance", key: "colorStart", label: "Color (top)", type: "color" },
   { group: "appearance", key: "colorEnd", label: "Color (bottom / stroke)", type: "color" },

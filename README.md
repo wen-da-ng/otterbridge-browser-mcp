@@ -2,7 +2,7 @@
 
 ![OtterBridge](static/otterbridge-banner.png)
 
-# Otter — Browser Agent · OtterBridge
+# Otter & OtterBridge — Browser MCP
 
 **Let your AI assistant drive your real Chrome — and ask you first before anything risky.**
 
@@ -14,7 +14,7 @@
 
 [Install](#install--claude-desktop) ·
 [How it works](#how-it-works) ·
-[Tools](#what-the-agent-can-do) ·
+[Tools](#what-your-ai-can-do) ·
 [Security](#safety--security) ·
 [For developers](#for-developers)
 
@@ -36,9 +36,11 @@ flowchart LR
     C -- "CDP" --> D["Your real<br/>Chrome"]
 ```
 
-The agent reads pages, clicks, types, scrolls, and takes screenshots — with a
-visible animated cursor, an audit log, and a hard rule: clicks on anything that
-looks destructive (*Buy, Pay, Send, Delete…*) stop and ask **you** first.
+Your AI assistant reads pages, clicks, fills forms, scrolls, waits for dynamic
+content, takes screenshots — and debugs web apps via the captured console and
+network traffic — with a visible animated cursor, an audit log, and a hard
+rule: clicks on anything that looks destructive (*Buy, Pay, Send, Delete…*)
+stop and ask **you** first.
 
 ## Install — Claude Desktop
 
@@ -80,25 +82,52 @@ and for the extension click the green **Code** button on the repo page →
   Chrome doesn't allow it.
 </details>
 
-## What the agent can do
+## What your AI can do
 
-Nine core tools, each taking an optional `tab` id — plus multi-tab, multi-agent
-control where every MCP session gets its own colored Chrome tab group.
+Twenty-six tools, each taking an optional `tab` id — plus multi-tab,
+multi-agent control where every MCP session gets its own colored Chrome tab
+group.
 
 <details>
-<summary><b>The 9 core tools</b></summary>
+<summary><b>Observe &amp; navigate (9)</b></summary>
 
 | Tool | Does |
 |---|---|
 | `navigate(url, tab?)` | Point a tab at a URL, wait for load. |
-| `read_page(tab?)` | URL, title, visible text (≤20k chars). |
+| `go_back(tab?)` / `go_forward(tab?)` | Move through the tab's history. |
+| `reload(hard?, tab?)` | Reload the tab; `hard` bypasses the cache. |
+| `read_page(offset?, max_chars?, tab?)` | URL, title, visible text — paginated: result carries `total_chars`, pass `offset` for the next chunk. |
 | `read_elements(tab?)` | Numbered interactive elements with center coordinates. |
+| `find_text(query, nth?, scroll?, tab?)` | Case-insensitive text search: match coordinates + context, auto-scrolls a match into view. |
+| `wait_for(text?, selector?, timeout_ms?, tab?)` | Wait for dynamic content (text and/or CSS selector) instead of polling screenshots. |
+| `screenshot(full_page?, tab?)` | JPEG of the viewport — or the whole page — via CDP (works on background tabs too). |
+</details>
+
+<details>
+<summary><b>Act (9)</b></summary>
+
+| Tool | Does |
+|---|---|
 | `click_element(index, tab?)` | **Preferred.** Clicks a `read_elements` entry by index; coordinate resolved in-page, so it never drifts through screenshot scaling. |
 | `click(x, y, tab?)` | Animated-cursor move + trusted CDP click at raw coordinates. Destructive targets prompt for approval. |
-| `type_text(text, tab?)` | Per-character typing with human-like jitter. |
+| `fill_element(index, text, tab?)` | Focus + select-all + type over, atomically — the reliable way to fill form fields. Empty text clears. |
+| `select_option(index, value?/label?, tab?)` | Pick an option in a native `<select>` (dropdowns can't be clicked). |
+| `hover(index?/x,y?, tab?)` | Animated hover — opens hover menus, tooltips, `:hover` states. |
+| `drag(from_x, from_y, to_x, to_y, tab?)` | Press–glide–release — sliders, sortable lists, canvas tools. |
+| `type_text(text, tab?)` | Per-character typing with human-like jitter, into the focused element. |
 | `press_key(key, tab?)` | e.g. `Enter`, `Tab`, `Escape`. |
 | `scroll(delta_y, tab?)` | Vertical scroll with jittered delta. |
-| `screenshot(tab?)` | JPEG image of a tab's viewport (via CDP — works on background tabs too). |
+</details>
+
+<details>
+<summary><b>Debug web apps (4)</b></summary>
+
+| Tool | Does |
+|---|---|
+| `read_console(level?, limit?, clear?, tab?)` | Captured `console.*` output, uncaught exceptions, and browser log (500-entry ring buffer per tab). |
+| `read_network(filter?, limit?, clear?, tab?)` | Captured requests: URL, method, status, type, size (300-entry ring buffer). |
+| `get_network_body(request_id, tab?)` | Response body of a captured request (truncated at 50k chars). |
+| `evaluate_js(code, tab?)` | Run JavaScript in the page. **Off by default** — enable in the extension options, and every call still asks for your approval. |
 </details>
 
 <details>
@@ -139,6 +168,9 @@ and everything binds to **localhost only** — nothing is exposed to the network
   - `BROWSER_AGENT_GATE_FALLBACK=deny` (default) | `allow` — used only if a
     client can't show an elicitation prompt. (The `.mcpb` exposes both as
     checkboxes in Claude Desktop's settings.)
+- **`evaluate_js` is doubly gated:** disabled unless you switch it on in the
+  extension's options page (Advanced), and even then every call goes through
+  the same human-approval elicitation as destructive clicks.
 - Servers bind to **localhost only**. Never expose them on the network.
 - **Bridge & endpoint are origin/host-locked** (defense against local-page
   attacks): the `ws://localhost:8765` bridge only accepts the extension

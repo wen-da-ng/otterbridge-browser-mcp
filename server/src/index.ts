@@ -224,15 +224,18 @@ let agentSeq = 0;
 // (elicitation routes back to that session's client), while stdio uses one.
 function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "OtterBridge", version: "0.1.0" },
+    { name: "OtterBridge", version: "0.2.0" },
     {
       instructions:
         "OtterBridge controls the user's real Chrome browser through the Otter " +
-        "extension. Observe with read_page / read_elements, then act with " +
-        "click_element (preferred) / type_text / press_key / navigate / scroll. " +
-        "Open extra tabs with open_tab (each joins this session's tab group); " +
-        "every tool takes an optional 'tab' id, defaulting to this session's " +
-        "current tab. Built by wen-da-ng.",
+        "extension. Observe with read_page / read_elements / screenshot / " +
+        "find_text; act with click_element (preferred) / fill_element / " +
+        "select_option / press_key / navigate / scroll. Use wait_for for " +
+        "dynamic content instead of polling screenshots. Debug web apps with " +
+        "read_console / read_network / get_network_body. Open extra tabs with " +
+        "open_tab (each joins this session's tab group); every tool takes an " +
+        "optional 'tab' id, defaulting to this session's current tab. Built by " +
+        "wen-da-ng.",
     },
   );
 
@@ -266,12 +269,64 @@ function buildServer(): McpServer {
   );
 
   server.registerTool(
-    "read_page",
+    "go_back",
     {
-      description: "Read a tab: URL, title, and visible text (truncated).",
+      description: "Go back one step in the tab's history (like the Back button).",
       inputSchema: { ...TAB },
     },
-    async ({ tab }) => text(JSON.stringify(await sendCmd("read_page", withTab(tab)))),
+    async ({ tab }) => text(await sendCmd("go_back", withTab(tab))),
+  );
+
+  server.registerTool(
+    "go_forward",
+    {
+      description: "Go forward one step in the tab's history.",
+      inputSchema: { ...TAB },
+    },
+    async ({ tab }) => text(await sendCmd("go_forward", withTab(tab))),
+  );
+
+  server.registerTool(
+    "reload",
+    {
+      description: "Reload the tab. Set hard=true to bypass the HTTP cache.",
+      inputSchema: {
+        hard: z.boolean().optional().describe("Bypass the cache (like Ctrl+Shift+R)."),
+        ...TAB,
+      },
+    },
+    async ({ hard, tab }) => text(await sendCmd("reload", withTab(tab, { hard }))),
+  );
+
+  server.registerTool(
+    "read_page",
+    {
+      description:
+        "Read a tab: URL, title, and visible text. Long pages paginate: the " +
+        "result carries total_chars; pass offset to read the next chunk.",
+      inputSchema: {
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Character offset into the page text (default 0)."),
+        max_chars: z
+          .number()
+          .int()
+          .min(1)
+          .max(100000)
+          .optional()
+          .describe("Max characters to return (default 20000)."),
+        ...TAB,
+      },
+    },
+    async ({ offset, max_chars, tab }) =>
+      text(
+        JSON.stringify(
+          await sendCmd("read_page", withTab(tab, { offset, maxChars: max_chars })),
+        ),
+      ),
   );
 
   server.registerTool(
@@ -346,6 +401,154 @@ function buildServer(): McpServer {
   );
 
   server.registerTool(
+    "fill_element",
+    {
+      description:
+        "Focus the interactive element with the given read_elements index, " +
+        "select its current content, and type the text over it with human-like " +
+        "keystrokes. Empty text clears the field.\n\n" +
+        "PREFERRED over click + type_text for form inputs: focusing and " +
+        "clearing are atomic, so the text can't land in the wrong field.",
+      inputSchema: {
+        index: z.number().int().describe("Element index from read_elements."),
+        text: z.string().describe("Text to type; empty string clears the field."),
+        ...TAB,
+      },
+    },
+    async ({ index, text: t, tab }) =>
+      text(await sendCmd("fill_element", withTab(tab, { index, text: t }))),
+  );
+
+  server.registerTool(
+    "select_option",
+    {
+      description:
+        "Pick an option in a native <select> dropdown by value or visible " +
+        "label (native dropdowns can't be driven by clicks). On no match, the " +
+        "error lists the available options.",
+      inputSchema: {
+        index: z.number().int().describe("read_elements index of the <select> element."),
+        value: z.string().optional().describe("Option value attribute (exact match)."),
+        label: z.string().optional().describe("Visible option text (exact, then substring match)."),
+        ...TAB,
+      },
+    },
+    async ({ index, value, label, tab }) => {
+      if (value == null && label == null) {
+        return text("Provide 'value' or 'label' to pick an option.");
+      }
+      return text(await sendCmd("select_option", withTab(tab, { index, value, label })));
+    },
+  );
+
+  server.registerTool(
+    "hover",
+    {
+      description:
+        "Move the cursor to an element (by read_elements index) or to viewport " +
+        "coordinates and hover there — triggers :hover styles, tooltips, and " +
+        "hover-opened menus. Prefer index over raw coordinates.",
+      inputSchema: {
+        index: z.number().int().optional().describe("Element index from read_elements (preferred)."),
+        x: z.number().int().optional().describe("Viewport x, if no index is given."),
+        y: z.number().int().optional().describe("Viewport y, if no index is given."),
+        ...TAB,
+      },
+    },
+    async ({ index, x, y, tab }) => {
+      if (index == null && (x == null || y == null)) {
+        return text("Provide 'index', or both 'x' and 'y'.");
+      }
+      return text(await sendCmd("hover", withTab(tab, { index, x, y })));
+    },
+  );
+
+  server.registerTool(
+    "drag",
+    {
+      description:
+        "Press the mouse at (from_x, from_y), glide to (to_x, to_y) with the " +
+        "button held, and release — for sliders, sortable lists, canvas tools. " +
+        "(HTML5 draggable=\"true\" native drag-and-drop may not respond to " +
+        "synthetic events.)",
+      inputSchema: {
+        from_x: z.number().int(),
+        from_y: z.number().int(),
+        to_x: z.number().int(),
+        to_y: z.number().int(),
+        ...TAB,
+      },
+    },
+    async ({ from_x, from_y, to_x, to_y, tab }) =>
+      text(
+        await sendCmd(
+          "drag",
+          withTab(tab, { fromX: from_x, fromY: from_y, toX: to_x, toY: to_y }),
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "find_text",
+    {
+      description:
+        "Search the page's visible text (case-insensitive) and return up to 50 " +
+        "matches with center coordinates and surrounding context. By default " +
+        "scrolls the first match into view — coordinates are post-scroll, so " +
+        "they can be clicked directly.",
+      inputSchema: {
+        query: z.string().describe("Text to find."),
+        nth: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Which match to scroll into view (default 0 = first)."),
+        scroll: z
+          .boolean()
+          .optional()
+          .describe("Scroll the nth match into view (default true)."),
+        ...TAB,
+      },
+    },
+    async ({ query, nth, scroll, tab }) =>
+      text(JSON.stringify(await sendCmd("find_text", withTab(tab, { query, nth, scroll })))),
+  );
+
+  server.registerTool(
+    "wait_for",
+    {
+      description:
+        "Wait until the page contains the given text (case-insensitive) and/or " +
+        "an element matching the CSS selector appears. Use after actions that " +
+        "load content dynamically instead of polling with screenshots.",
+      inputSchema: {
+        text: z.string().optional().describe("Visible text to wait for."),
+        selector: z.string().optional().describe("CSS selector to wait for."),
+        timeout_ms: z
+          .number()
+          .int()
+          .min(100)
+          .max(60000)
+          .optional()
+          .describe("Max wait in milliseconds (default 10000)."),
+        ...TAB,
+      },
+    },
+    async ({ text: t, selector, timeout_ms, tab }) => {
+      if (t == null && selector == null) {
+        return text("Provide 'text' and/or 'selector' to wait for.");
+      }
+      const result = await sendCmd(
+        "wait_for",
+        withTab(tab, { text: t, selector, timeoutMs: timeout_ms }),
+        (timeout_ms ?? 10000) + 15000, // bridge timeout must outlast the poll
+      );
+      return text(JSON.stringify(result));
+    },
+  );
+
+  server.registerTool(
     "type_text",
     {
       description: "Type text into the currently focused element.",
@@ -381,10 +584,18 @@ function buildServer(): McpServer {
         "click via read_elements + click_element(index) for pixel-accurate " +
         "clicks. (Coordinates eyeballed off an image can drift; index-based " +
         "clicking does not.)",
-      inputSchema: { ...TAB },
+      inputSchema: {
+        full_page: z
+          .boolean()
+          .optional()
+          .describe(
+            "Capture the whole page height (capped at 8000px), not just the viewport.",
+          ),
+        ...TAB,
+      },
     },
-    async ({ tab }) => {
-      const result = await sendCmd("screenshot", withTab(tab));
+    async ({ full_page, tab }) => {
+      const result = await sendCmd("screenshot", withTab(tab, { fullPage: full_page }));
       await audit(
         "screenshot",
         undefined,
@@ -401,6 +612,111 @@ function buildServer(): McpServer {
           },
         ],
       };
+    },
+  );
+
+  // ===== Web-dev debugging (CDP capture) =====
+  server.registerTool(
+    "read_console",
+    {
+      description:
+        "Read the tab's captured console output: console.* calls, uncaught " +
+        "exceptions, and browser log entries (newest last, 500-entry ring " +
+        "buffer). Capture starts when the tab first gets CDP attention " +
+        "(open_tab attaches immediately); reload the tab to capture a full " +
+        "page load.",
+      inputSchema: {
+        level: z
+          .string()
+          .optional()
+          .describe("Filter by level: log | info | warning | error | debug."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe("Max entries to return (default 50)."),
+        clear: z.boolean().optional().describe("Clear the buffer after reading."),
+        ...TAB,
+      },
+    },
+    async ({ level, limit, clear, tab }) =>
+      text(
+        JSON.stringify(await sendCmd("read_console", withTab(tab, { level, limit, clear }))),
+      ),
+  );
+
+  server.registerTool(
+    "read_network",
+    {
+      description:
+        "List the tab's captured network requests (URL, method, status, type, " +
+        "size; newest last, 300-entry ring buffer). Use get_network_body with " +
+        "a requestId to fetch a response body. Capture starts when the tab " +
+        "first gets CDP attention; reload the tab to capture a full page load.",
+      inputSchema: {
+        filter: z
+          .string()
+          .optional()
+          .describe("Substring match on the URL, or a resource type (xhr, fetch, script, document, ...)."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(300)
+          .optional()
+          .describe("Max requests to return (default 50)."),
+        clear: z.boolean().optional().describe("Clear the buffer after reading."),
+        ...TAB,
+      },
+    },
+    async ({ filter, limit, clear, tab }) =>
+      text(
+        JSON.stringify(await sendCmd("read_network", withTab(tab, { filter, limit, clear }))),
+      ),
+  );
+
+  server.registerTool(
+    "get_network_body",
+    {
+      description:
+        "Fetch the response body of a captured network request (requestId from " +
+        "read_network). Truncated at 50k chars; binary bodies come back " +
+        "base64-encoded. Fails if Chrome has already evicted the body from its " +
+        "cache.",
+      inputSchema: {
+        request_id: z.string().describe("requestId from read_network."),
+        ...TAB,
+      },
+    },
+    async ({ request_id, tab }) =>
+      text(
+        JSON.stringify(
+          await sendCmd("get_network_body", withTab(tab, { requestId: request_id })),
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "evaluate_js",
+    {
+      description:
+        "Run a JavaScript expression in the page and return its result " +
+        "(promises are awaited, result JSON-serialized). Doubly gated: the " +
+        "Otter extension options must enable it, AND every call asks the user " +
+        "for approval.",
+      inputSchema: {
+        code: z.string().describe("JavaScript expression to evaluate in the page."),
+        ...TAB,
+      },
+    },
+    async ({ code, tab }) => {
+      const preview = code.length > 200 ? code.slice(0, 200) + "…" : code;
+      if (!(await approved(server, `Approve running JavaScript in the page?\n\n${preview}`))) {
+        return text("Action denied by user: evaluate_js.");
+      }
+      return text(JSON.stringify(await sendCmd("evaluate_js", withTab(tab, { code }))));
     },
   );
 

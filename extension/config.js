@@ -36,6 +36,9 @@
     cursorVisibility: "active", // "always" | "active" | "off"
     cursorEnabled: true, // master switch for the visible cursor
 
+    // --- Advanced ---
+    allowJsEval: false, // permit the evaluate_js tool to run JS in pages (opt-in)
+
     // --- Appearance ---
     size: 32, // px
     colorStart: "#FFE014", // gradient top

@@ -48,9 +48,87 @@ async function ensureDebugger(tabId) {
   if (attached.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, "1.3");
   attached.add(tabId);
+  // Console/network capture rides along with every attach (read_console /
+  // read_network read the buffers below). Best-effort: an enable failure must
+  // never block the action that triggered the attach.
+  try {
+    await Promise.all([
+      chrome.debugger.sendCommand({ tabId }, "Runtime.enable"),
+      chrome.debugger.sendCommand({ tabId }, "Log.enable"),
+      chrome.debugger.sendCommand({ tabId }, "Network.enable"),
+    ]);
+  } catch (_) {}
 }
 
 chrome.debugger.onDetach.addListener(({ tabId }) => attached.delete(tabId));
+
+// ===== Console + network capture (per-tab ring buffers) =====
+// Filled by CDP events while a debugger is attached. Buffers survive a detach
+// (the data stays readable); they're dropped when the tab closes.
+const consoleBuf = new Map(); // tabId -> [{ ts, level, text, url?, source? }]
+const networkBuf = new Map(); // tabId -> Map(requestId -> entry), insertion-ordered
+const CONSOLE_CAP = 500, NETWORK_CAP = 300;
+
+function pushConsole(tabId, entry) {
+  let buf = consoleBuf.get(tabId);
+  if (!buf) consoleBuf.set(tabId, (buf = []));
+  buf.push(entry);
+  if (buf.length > CONSOLE_CAP) buf.splice(0, buf.length - CONSOLE_CAP);
+}
+
+chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
+  if (tabId == null) return;
+  if (method === "Runtime.consoleAPICalled") {
+    const text = (params.args || [])
+      .map((a) => {
+        if (a.value !== undefined) {
+          return typeof a.value === "string" ? a.value : JSON.stringify(a.value);
+        }
+        return a.description || a.type;
+      })
+      .join(" ");
+    pushConsole(tabId, { ts: params.timestamp, level: params.type, text: text.slice(0, 2000) });
+  } else if (method === "Runtime.exceptionThrown") {
+    const d = params.exceptionDetails;
+    const text =
+      (d.exception && (d.exception.description || d.exception.value)) ||
+      d.text || "Uncaught exception";
+    pushConsole(tabId, {
+      ts: params.timestamp, level: "error", text: String(text).slice(0, 2000), url: d.url,
+    });
+  } else if (method === "Log.entryAdded") {
+    const e = params.entry;
+    pushConsole(tabId, {
+      ts: e.timestamp, level: e.level, text: String(e.text).slice(0, 2000),
+      url: e.url, source: e.source,
+    });
+  } else if (method === "Network.requestWillBeSent") {
+    let buf = networkBuf.get(tabId);
+    if (!buf) networkBuf.set(tabId, (buf = new Map()));
+    buf.set(params.requestId, {
+      requestId: params.requestId,
+      url: params.request.url,
+      method: params.request.method,
+      type: params.type,
+      ts: params.wallTime,
+    });
+    if (buf.size > NETWORK_CAP) buf.delete(buf.keys().next().value);
+  } else if (method === "Network.responseReceived") {
+    const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
+    if (e) { e.status = params.response.status; e.mimeType = params.response.mimeType; }
+  } else if (method === "Network.loadingFailed") {
+    const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
+    if (e) e.error = params.errorText;
+  } else if (method === "Network.loadingFinished") {
+    const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
+    if (e) e.encodedBytes = Math.round(params.encodedDataLength);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  consoleBuf.delete(tabId);
+  networkBuf.delete(tabId);
+});
 
 async function cdp(tabId, method, params) {
   await ensureDebugger(tabId);
@@ -121,6 +199,17 @@ async function moveWithHoverTrail(tabId, x, y) {
   }
 }
 
+// ===== Human-like typing (shared by type_text and fill_element) =====
+// Per-character key events with jittered timing. Speed and the occasional
+// "thinking" pause are settings-driven.
+async function typeChars(tabId, text) {
+  for (const ch of text) {
+    await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", text: ch });
+    await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", text: ch });
+    await sleep(OtterConfig.typeDelay(S, Math.random));
+  }
+}
+
 // ===== Interactive-element collection (single source of truth) =====
 // Runs in the page. Semantic controls PLUS elements with computed
 // cursor:pointer (catches React onClick divs that have no role/onclick attr).
@@ -159,6 +248,10 @@ function collectInteractiveEls(scrollToIndex) {
       y: Math.round(r.y + r.height / 2),
     });
   });
+  // Cache the live element references in this isolated world so follow-up
+  // executeScript calls (focus/select_option) can resolve an index without
+  // re-walking the DOM. Refreshed on every collection.
+  window.__otterEls = elems;
   // Scroll the requested element into view if it's off-screen. CDP clicks
   // only land inside the visible viewport, so below-fold targets need this.
   if (typeof scrollToIndex === "number" && elems[scrollToIndex]) {
@@ -196,6 +289,9 @@ async function handle(action, p) {
   // ----- Multi-tab management (no pre-existing active tab required) -----
   if (action === "open_tab") {
     const created = await chrome.tabs.create({ url: p.url || "about:blank", active: true });
+    // Attach CDP immediately (not lazily on first click) so console/network
+    // capture covers the page load. Best-effort: chrome:// pages can't attach.
+    try { await ensureDebugger(created.id); } catch (_) {}
     if (p.url) await waitForLoad(created.id);
     const groupId = await ensureAgentGroup(p.agentId, p.agentLabel, created.id);
     const fresh = await chrome.tabs.get(created.id);
@@ -219,7 +315,11 @@ async function handle(action, p) {
   // work on background tabs anyway (CDP input + scripting + CDP screenshot), so
   // activation is purely cosmetic. screenshot is excluded (it uses CDP capture,
   // which needs no focus).
-  const VISIBLE = new Set(["navigate", "click", "type_text", "press_key", "scroll"]);
+  const VISIBLE = new Set([
+    "navigate", "go_back", "go_forward", "reload",
+    "click", "fill_element", "select_option", "hover", "drag",
+    "type_text", "press_key", "scroll",
+  ]);
   const parallel = Object.keys(agentGroups).length > 1;
   if (p.tabId != null && VISIBLE.has(action) && !parallel && !tab.active) {
     await chrome.tabs.update(tab.id, { active: true });
@@ -232,15 +332,46 @@ async function handle(action, p) {
       return `Navigated to ${p.url}`;
     }
 
+    case "go_back": {
+      try { await chrome.tabs.goBack(tab.id); }
+      catch (_) { return "Cannot go back: no earlier history entry."; }
+      // Same-document (SPA pushState) moves fire no load event; cap the wait.
+      await waitForLoad(tab.id, 4000);
+      const fresh = await chrome.tabs.get(tab.id);
+      return `Went back to ${fresh.url}`;
+    }
+
+    case "go_forward": {
+      try { await chrome.tabs.goForward(tab.id); }
+      catch (_) { return "Cannot go forward: no later history entry."; }
+      await waitForLoad(tab.id, 4000);
+      const fresh = await chrome.tabs.get(tab.id);
+      return `Went forward to ${fresh.url}`;
+    }
+
+    case "reload": {
+      await chrome.tabs.reload(tab.id, { bypassCache: !!p.hard });
+      await waitForLoad(tab.id);
+      return p.hard ? "Hard-reloaded (cache bypassed)" : "Reloaded";
+    }
+
     case "read_page": {
+      const offset = Math.max(0, p.offset || 0);
+      const maxChars = Math.min(Math.max(1, p.maxChars || 20000), 100000);
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: () => ({
-          url: location.href,
-          title: document.title,
-          text: document.body.innerText.slice(0, 20000),
-          devicePixelRatio: window.devicePixelRatio,
-        }),
+        args: [offset, maxChars],
+        func: (offset, maxChars) => {
+          const full = document.body.innerText;
+          return {
+            url: location.href,
+            title: document.title,
+            text: full.slice(offset, offset + maxChars),
+            offset,
+            total_chars: full.length,
+            devicePixelRatio: window.devicePixelRatio,
+          };
+        },
       });
       return res.result;
     }
@@ -322,15 +453,230 @@ async function handle(action, p) {
     }
 
     case "type_text": {
-      // Human-like typing: per-character key events with jittered timing.
-      // Speed and the occasional "thinking" pause are settings-driven.
       const text = p.text || "";
-      for (const ch of text) {
-        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", text: ch });
-        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", text: ch });
-        await sleep(OtterConfig.typeDelay(S, Math.random));
-      }
+      await typeChars(tab.id, text);
       return `Typed ${text.length} chars`;
+    }
+
+    case "fill_element": {
+      // Focus + select-all inside the page, then type over the selection with
+      // real key events (so frameworks see genuine, trusted input).
+      await ensureDebugger(tab.id);
+      await collectEls(tab.id, p.index); // refresh cache + scroll into view
+      await sleep(120);
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [p.index],
+        func: (index) => {
+          const el = (window.__otterEls || [])[index];
+          if (!el) {
+            return { ok: false, error: `No element with index ${index}. Call read_elements first.` };
+          }
+          el.focus();
+          if (typeof el.select === "function") el.select();
+          else if (el.isContentEditable) {
+            const r = document.createRange();
+            r.selectNodeContents(el);
+            const sel = getSelection();
+            sel.removeAllRanges();
+            sel.addRange(r);
+          }
+          return { ok: true, tag: el.tagName.toLowerCase() };
+        },
+      });
+      const info = res.result;
+      if (!info.ok) throw new Error(info.error);
+      const text = p.text || "";
+      if (text) {
+        await typeChars(tab.id, text);
+        return `Filled element ${p.index} (${info.tag}) with ${text.length} chars`;
+      }
+      // Empty text = clear: delete the selected content.
+      await cdp(tab.id, "Input.dispatchKeyEvent", {
+        type: "keyDown", key: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+      });
+      await cdp(tab.id, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+      });
+      return `Cleared element ${p.index} (${info.tag})`;
+    }
+
+    case "select_option": {
+      // Native <select> dropdowns can't be driven by synthetic clicks; set the
+      // value in-page and fire the events frameworks listen for.
+      await collectEls(tab.id); // refresh the element cache
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [p.index, p.value ?? null, p.label ?? null],
+        func: (index, value, label) => {
+          const el = (window.__otterEls || [])[index];
+          if (!el) {
+            return { ok: false, error: `No element with index ${index}. Call read_elements first.` };
+          }
+          if (el.tagName !== "SELECT") {
+            return { ok: false, error: `Element ${index} is a <${el.tagName.toLowerCase()}>, not a <select>.` };
+          }
+          const opts = [...el.options];
+          const norm = (s) => (s || "").trim().toLowerCase();
+          let opt = null;
+          if (value != null) opt = opts.find((o) => o.value === value);
+          if (!opt && label != null) opt = opts.find((o) => norm(o.text) === norm(label));
+          if (!opt && label != null) opt = opts.find((o) => norm(o.text).includes(norm(label)));
+          if (!opt) {
+            return {
+              ok: false,
+              error: "No option matches.",
+              options: opts.slice(0, 30).map((o) => ({ value: o.value, label: o.text.trim() })),
+            };
+          }
+          el.value = opt.value;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return { ok: true, selected: { value: opt.value, label: opt.text.trim() } };
+        },
+      });
+      const r = res.result;
+      if (!r.ok) {
+        throw new Error(r.error + (r.options ? ` Available options: ${JSON.stringify(r.options)}` : ""));
+      }
+      return `Selected '${r.selected.label}' (value=${r.selected.value}) in element ${p.index}`;
+    }
+
+    case "hover": {
+      // click() minus the press/release: animated glide + real mouseMoved so
+      // :hover styles and JS mouseover handlers genuinely trigger.
+      let { x, y, index } = p;
+      const firstAttach = !attached.has(tab.id);
+      await ensureDebugger(tab.id);
+      if (firstAttach) await sleep(200);
+      if (index !== undefined && index !== null) {
+        await collectEls(tab.id, index); // scrolls it into view if needed
+        await sleep(180);
+        const els = await collectEls(tab.id);
+        if (!els[index]) throw new Error(`No interactive element with index ${index}. Call read_elements first.`);
+        x = els[index].x;
+        y = els[index].y;
+      }
+      await moveWithHoverTrail(tab.id, x, y);
+      await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      lastCursor = { x, y };
+      return `Hovering at (${x}, ${y})`;
+    }
+
+    case "drag": {
+      // Mouse-event drag: press at the start point, glide with buttons held,
+      // release at the end. Drives sliders, sortable lists, canvas tools.
+      // (HTML5 draggable="true" native DnD may not respond to synthetic events.)
+      const { fromX, fromY, toX, toY } = p;
+      const firstAttach = !attached.has(tab.id);
+      await ensureDebugger(tab.id);
+      if (firstAttach) await sleep(200);
+      await moveWithHoverTrail(tab.id, fromX, fromY);
+      await chrome.tabs.sendMessage(tab.id, { type: "clickPulse" });
+      await cdp(tab.id, "Input.dispatchMouseEvent", {
+        type: "mousePressed", x: fromX, y: fromY, button: "left", clickCount: 1,
+      });
+      const pts = await chrome.tabs.sendMessage(tab.id, {
+        type: "moveCursor", x: toX, y: toY, samples: S.trailSamples,
+      });
+      for (const pt of pts.path) {
+        await cdp(tab.id, "Input.dispatchMouseEvent", {
+          type: "mouseMoved", x: pt.x, y: pt.y, button: "left", buttons: 1,
+        });
+      }
+      await cdp(tab.id, "Input.dispatchMouseEvent", {
+        type: "mouseReleased", x: toX, y: toY, button: "left", clickCount: 1,
+      });
+      lastCursor = { x: toX, y: toY };
+      return `Dragged (${fromX}, ${fromY}) → (${toX}, ${toY})`;
+    }
+
+    case "find_text": {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [p.query, p.scroll !== false, p.nth || 0],
+        func: (query, scroll, nth) => {
+          const q = query.toLowerCase();
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          const found = []; // { node, ix, context } — internal, holds live nodes
+          let node;
+          while ((node = walker.nextNode()) && found.length < 50) {
+            const t = node.textContent;
+            const tl = t.toLowerCase();
+            let ix = tl.indexOf(q);
+            while (ix !== -1 && found.length < 50) {
+              const range = document.createRange();
+              range.setStart(node, ix);
+              range.setEnd(node, ix + query.length);
+              const r = range.getBoundingClientRect();
+              if (r.width || r.height) { // zero rect = display:none / detached
+                found.push({
+                  node, ix,
+                  context: t.slice(Math.max(0, ix - 60), ix + query.length + 60).trim(),
+                });
+              }
+              ix = tl.indexOf(q, ix + 1);
+            }
+          }
+          if (!found.length) return { count: 0, matches: [] };
+          if (scroll) {
+            const el = found[Math.min(nth, found.length - 1)].node.parentElement;
+            if (el) el.scrollIntoView({ block: "center" });
+          }
+          // Rects are recomputed AFTER the scroll so coordinates are current.
+          const matches = found.map((m, i) => {
+            const range = document.createRange();
+            range.setStart(m.node, m.ix);
+            range.setEnd(m.node, m.ix + query.length);
+            const r = range.getBoundingClientRect();
+            return {
+              nth: i,
+              x: Math.round(r.x + r.width / 2),
+              y: Math.round(r.y + r.height / 2),
+              visible: r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth,
+              context: m.context,
+            };
+          });
+          return { count: matches.length, matches };
+        },
+      });
+      return res.result;
+    }
+
+    case "wait_for": {
+      const timeout = Math.min(Math.max(p.timeoutMs || 10000, 100), 60000);
+      const started = Date.now();
+      const deadline = started + timeout;
+      for (;;) {
+        let res = null;
+        try {
+          [res] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            args: [p.text ?? null, p.selector ?? null],
+            func: (text, selector) => {
+              const textOk =
+                text == null ||
+                document.body.innerText.toLowerCase().includes(text.toLowerCase());
+              let selOk = true;
+              if (selector != null) {
+                try { selOk = !!document.querySelector(selector); }
+                catch (_) { return { invalidSelector: true }; }
+              }
+              return { found: textOk && selOk };
+            },
+          });
+        } catch (_) { /* mid-navigation: frame briefly not scriptable — retry */ }
+        if (res && res.result && res.result.invalidSelector) {
+          throw new Error(`Invalid CSS selector: ${p.selector}`);
+        }
+        if (res && res.result && res.result.found) {
+          return { found: true, elapsed_ms: Date.now() - started };
+        }
+        if (Date.now() >= deadline) {
+          return { found: false, elapsed_ms: Date.now() - started, timeout_ms: timeout };
+        }
+        await sleep(300);
+      }
     }
 
     case "press_key": {
@@ -370,15 +716,26 @@ async function handle(action, p) {
         }),
       });
       const { w, h, dpr } = meta.result;
+      // Full-page mode: clip to the document's content box. Height is capped —
+      // an endless-feed page would otherwise blow past canvas size limits and
+      // the bridge's 32 MiB frame cap.
+      let outW = w, outH = h;
+      const capParams = { format: "jpeg", quality: 80 };
+      if (p.fullPage) {
+        const lm = await cdp(tab.id, "Page.getLayoutMetrics");
+        const size = lm.cssContentSize || lm.contentSize;
+        outW = Math.max(1, Math.round(size.width));
+        outH = Math.max(1, Math.min(Math.round(size.height), 8000));
+        capParams.clip = { x: 0, y: 0, width: outW, height: outH, scale: 1 };
+        capParams.captureBeyondViewport = true;
+      }
       // JPEG q80: ~5-10x smaller than PNG on photo-heavy pages.
-      const cap = await cdp(tab.id, "Page.captureScreenshot", {
-        format: "jpeg", quality: 80,
-      });
+      const cap = await cdp(tab.id, "Page.captureScreenshot", capParams);
       const bitmap = await createImageBitmap(
         await (await fetch(`data:image/jpeg;base64,${cap.data}`)).blob(),
       );
-      const canvas = new OffscreenCanvas(w, h);
-      canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+      const canvas = new OffscreenCanvas(outW, outH);
+      canvas.getContext("2d").drawImage(bitmap, 0, 0, outW, outH);
       const buf = await (await canvas.convertToBlob({
         type: "image/jpeg", quality: 0.8,
       })).arrayBuffer();
@@ -386,11 +743,101 @@ async function handle(action, p) {
       let binary = "";
       for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
       // capturedWidth/Height = native (physical) capture; width/height = CSS
-      // viewport the image is scaled to. Diagnostic for the coordinate drift.
+      // size the image is scaled to. Diagnostic for the coordinate drift.
       return {
         base64: btoa(binary), format: "jpeg",
-        width: w, height: h, dpr,
+        width: outW, height: outH, dpr, fullPage: !!p.fullPage,
         capturedWidth: bitmap.width, capturedHeight: bitmap.height,
+      };
+    }
+
+    case "read_console": {
+      // Attaching now starts capture; Runtime.enable also replays the page's
+      // recent console history, so even a first read returns something.
+      const wasAttached = attached.has(tab.id);
+      await ensureDebugger(tab.id);
+      if (!wasAttached) await sleep(300); // let the replayed events land
+      let out = consoleBuf.get(tab.id) || [];
+      if (p.level) out = out.filter((e) => e.level === p.level);
+      const limit = Math.min(Math.max(p.limit || 50, 1), CONSOLE_CAP);
+      out = out.slice(-limit);
+      if (p.clear) consoleBuf.set(tab.id, []);
+      return {
+        count: out.length,
+        entries: out,
+        note: wasAttached ? undefined :
+          "Capture just started (plus replayed recent history). Reload the tab to capture a full page load.",
+      };
+    }
+
+    case "read_network": {
+      const wasAttached = attached.has(tab.id);
+      await ensureDebugger(tab.id);
+      if (!wasAttached) await sleep(300);
+      const buf = networkBuf.get(tab.id);
+      let out = buf ? [...buf.values()] : [];
+      if (p.filter) {
+        const f = p.filter.toLowerCase();
+        out = out.filter(
+          (e) => e.url.toLowerCase().includes(f) || (e.type || "").toLowerCase() === f,
+        );
+      }
+      const limit = Math.min(Math.max(p.limit || 50, 1), NETWORK_CAP);
+      out = out.slice(-limit);
+      if (p.clear) networkBuf.delete(tab.id);
+      return {
+        count: out.length,
+        requests: out,
+        note: wasAttached ? undefined :
+          "Network capture just started; only requests from now on appear. Reload the tab to capture a full page load.",
+      };
+    }
+
+    case "get_network_body": {
+      await ensureDebugger(tab.id);
+      // Throws "No resource with given identifier" if Chrome evicted the body.
+      const res = await cdp(tab.id, "Network.getResponseBody", { requestId: p.requestId });
+      const MAX = 50000;
+      return {
+        base64Encoded: res.base64Encoded,
+        total_chars: res.body.length,
+        truncated: res.body.length > MAX,
+        body: res.body.slice(0, MAX),
+      };
+    }
+
+    case "evaluate_js": {
+      // Hard-gated by the options-page toggle (off by default); the server
+      // additionally asks the user for approval on every call.
+      if (!S.allowJsEval) {
+        throw new Error(
+          "JavaScript evaluation is disabled. Enable 'Allow evaluate_js' in the " +
+          "Otter extension options (right-click the extension icon → Options → Advanced).",
+        );
+      }
+      await ensureDebugger(tab.id);
+      const res = await cdp(tab.id, "Runtime.evaluate", {
+        expression: p.code,
+        returnByValue: true,
+        awaitPromise: true,
+        userGesture: true,
+      });
+      if (res.exceptionDetails) {
+        const d = res.exceptionDetails;
+        const msg =
+          (d.exception && (d.exception.description || d.exception.value)) || d.text;
+        throw new Error(`Page JS threw: ${String(msg).slice(0, 1000)}`);
+      }
+      const r = res.result || {};
+      const raw =
+        r.value !== undefined
+          ? (typeof r.value === "string" ? r.value : JSON.stringify(r.value))
+          : (r.description || r.type || "undefined");
+      const MAX = 20000;
+      return {
+        type: r.type,
+        result: String(raw).slice(0, MAX),
+        truncated: String(raw).length > MAX,
       };
     }
 

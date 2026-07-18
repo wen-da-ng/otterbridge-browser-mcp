@@ -28,7 +28,7 @@ async function main() {
   await new Promise((res, rej) => { ext.on("open", res); ext.on("error", rej); });
 
   const tools = (await client.listTools()).tools;
-  ok("stdio: tools/list returns 13 tools (9 core + 4 tab)", tools.length === 13, `got ${tools.length}`);
+  ok("stdio: tools/list returns 26 tools (22 core + 4 tab)", tools.length === 26, `got ${tools.length}`);
   const rp = await client.callTool({ name: "read_page", arguments: {} });
   ok("stdio: read_page round-trips through bridge", rp.content[0].text.includes("ok.test"));
 

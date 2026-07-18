@@ -3,9 +3,9 @@
   "manifest_version": "0.4",
   "name": "otterbridge",
   "display_name": "OtterBridge",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Drive your real Chrome browser from any AI agent through the Otter extension.",
-  "long_description": "OtterBridge lets AI agents observe and act in your real Chrome browser: read the page, list interactive elements, click, type, scroll, navigate, and take screenshots. It talks to the companion Otter Chrome extension over a localhost-only WebSocket. Clicks on destructive controls (buy, pay, delete, send, submit, ...) require your approval first. Everything runs on your machine; no browsing data leaves it.",
+  "long_description": "OtterBridge lets AI agents observe and act in your real Chrome browser: read pages, find text, list interactive elements, click, fill forms, pick dropdown options, hover, drag, scroll, navigate, wait for dynamic content, and take viewport or full-page screenshots. It also captures the console and network traffic for web-app debugging. It talks to the companion Otter Chrome extension over a localhost-only WebSocket. Clicks on destructive controls (buy, pay, delete, send, submit, ...) require your approval first, and evaluate_js stays off unless you enable it in the extension options. Everything runs on your machine; no browsing data leaves it.",
   "author": {
     "name": "wen-da-ng",
     "email": "lenus.ng.wen.da@gmail.com"
@@ -30,15 +30,32 @@
     }
   },
   "tools": [
-    { "name": "navigate", "description": "Navigate the active tab to a URL." },
-    { "name": "read_page", "description": "Read the active tab's URL, title, and visible text." },
+    { "name": "navigate", "description": "Navigate a tab to a URL." },
+    { "name": "go_back", "description": "Go back in the tab's history." },
+    { "name": "go_forward", "description": "Go forward in the tab's history." },
+    { "name": "reload", "description": "Reload the tab, optionally bypassing the cache." },
+    { "name": "read_page", "description": "Read a tab's URL, title, and visible text (paginated)." },
     { "name": "read_elements", "description": "List interactive elements with indices and coordinates." },
+    { "name": "find_text", "description": "Find text on the page and get clickable coordinates." },
+    { "name": "wait_for", "description": "Wait for text or a CSS selector to appear." },
+    { "name": "screenshot", "description": "Capture the viewport (or full page) as an image." },
     { "name": "click_element", "description": "Click an interactive element by index (preferred, drift-free)." },
     { "name": "click", "description": "Click at viewport coordinates (x, y)." },
+    { "name": "fill_element", "description": "Focus a field, clear it, and type text into it." },
+    { "name": "select_option", "description": "Pick an option in a native <select> dropdown." },
+    { "name": "hover", "description": "Hover over an element or coordinates." },
+    { "name": "drag", "description": "Drag from one point to another (sliders, reordering)." },
     { "name": "type_text", "description": "Type text into the focused element." },
     { "name": "press_key", "description": "Press a keyboard key (Enter, Tab, Escape, ...)." },
     { "name": "scroll", "description": "Scroll the page vertically." },
-    { "name": "screenshot", "description": "Capture the visible viewport as an image." }
+    { "name": "read_console", "description": "Read captured console output and page errors." },
+    { "name": "read_network", "description": "List captured network requests." },
+    { "name": "get_network_body", "description": "Fetch a captured response body by requestId." },
+    { "name": "evaluate_js", "description": "Run JavaScript in the page (opt-in + per-call approval)." },
+    { "name": "open_tab", "description": "Open a new tab in this session's tab group." },
+    { "name": "list_tabs", "description": "List this session's tabs." },
+    { "name": "use_tab", "description": "Set this session's current tab." },
+    { "name": "close_tab", "description": "Close a tab this session opened." }
   ],
   "user_config": {
     "gate_enabled": {
