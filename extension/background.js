@@ -271,6 +271,26 @@ async function collectEls(tabId, scrollToIndex) {
   return res.result || [];
 }
 
+// Topmost interactive element at (x, y): its text + tag, or null if nothing is
+// there. Shared by the hit_test action and the click gate's identity check.
+async function hitTestAt(tabId, x, y) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [x, y],
+    func: (x, y) => {
+      const hit = document.elementFromPoint(x, y);
+      if (!hit) return null;
+      const el = hit.closest(
+        "a, button, input, textarea, select, [role='button'], [onclick]"
+      ) || hit;
+      const text = (el.innerText || el.value || el.getAttribute("aria-label") ||
+        el.placeholder || el.title || "").trim().slice(0, 120);
+      return { text, tag: el.tagName.toLowerCase() };
+    },
+  });
+  return res.result;
+}
+
 // ===== Cursor visibility gating =====
 // The animated cursor is only shown while the agent is active. We stamp the
 // time of each real command; the post-navigation cursor restore only fires
@@ -385,21 +405,7 @@ async function handle(action, p) {
       // Return the text/tag of the topmost interactive element at (x, y),
       // so the server can run its destructive-action check on ANY click
       // regardless of how the coordinates were obtained.
-      const [res] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        args: [p.x, p.y],
-        func: (x, y) => {
-          const hit = document.elementFromPoint(x, y);
-          if (!hit) return { text: "", tag: "" };
-          const el = hit.closest(
-            "a, button, input, textarea, select, [role='button'], [onclick]"
-          ) || hit;
-          const text = (el.innerText || el.value || el.getAttribute("aria-label") ||
-            el.placeholder || el.title || "").trim().slice(0, 120);
-          return { text, tag: el.tagName.toLowerCase() };
-        },
-      });
-      return res.result;
+      return (await hitTestAt(tab.id, p.x, p.y)) || { text: "", tag: "" };
     }
 
     case "locate_element": {
@@ -411,9 +417,18 @@ async function handle(action, p) {
     }
 
     case "click": {
-      // p: { x, y, index? } in CSS viewport coordinates.
+      // p: { x, y, index?, expectText? } in CSS viewport coordinates.
+      // expectText, when present, is the text the SERVER ran the destructive-
+      // action gate against. We re-resolve the live target one last time right
+      // before pressing and REFUSE to press if it no longer matches, returning
+      // { changed } so the server can re-gate. Without this, a reflow between
+      // the server's gate and this press (a collapsing menu, lazy content, an
+      // async re-render) would let an approved-safe element be swapped for an
+      // ungated destructive one. See test/gate-bypass.mjs.
       let { x, y, index } = p;
       const hasIndex = index !== undefined && index !== null;
+      const guard = p.expectText !== undefined && p.expectText !== null;
+      const expectText = p.expectText || "";
       // The first CDP attach shows the "being debugged" banner, which reflows
       // the page. Attach up-front and let it settle before measuring/clicking.
       const firstAttach = !attached.has(tab.id);
@@ -442,6 +457,28 @@ async function handle(action, p) {
         }
       }
       await chrome.tabs.sendMessage(tab.id, { type: "clickPulse" });
+
+      // FINAL authoritative identity check, as late as possible before the
+      // press: confirm the target is still the element the gate saw. Nothing is
+      // awaited between this resolve and the CDP press below, so the residual
+      // reflow window is a few ms of dispatch latency (inherent to coordinate-
+      // based trusted clicks), not the ~1s cursor animation.
+      if (guard) {
+        const cur = hasIndex
+          ? (await collectEls(tab.id))[index]
+          : await hitTestAt(tab.id, x, y);
+        const curText = (cur && (cur.text ?? "")) || "";
+        if (!cur || curText !== expectText) {
+          return {
+            changed: true,
+            actualText: cur ? curText : null,
+            x: cur && hasIndex ? cur.x : x,
+            y: cur && hasIndex ? cur.y : y,
+          };
+        }
+        if (hasIndex) { x = cur.x; y = cur.y; }
+      }
+
       await cdp(tab.id, "Input.dispatchMouseEvent", {
         type: "mousePressed", x, y, button: "left", clickCount: 1,
       });

@@ -259,6 +259,49 @@ function buildServer(): McpServer {
       ),
   };
 
+  // Gate + press a click atomically with respect to the destructive-action
+  // check. The danger check runs on `expectText`; the click is dispatched with
+  // that same text so the extension REFUSES to press if the live element no
+  // longer matches (returning { changed }). If it changed, we re-gate the
+  // element that is actually there now — the gate can never approve one element
+  // while a reflow swaps in another. Fail-safe: a target that keeps changing is
+  // aborted rather than pressed. Used by both click and click_element.
+  const gatedClick = async (
+    tab: number | undefined,
+    target: { index?: number; x?: number; y?: number },
+    initialText: string,
+  ): Promise<string> => {
+    let expectText = initialText ?? "";
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (DANGER_RE.test(expectText)) {
+        const label =
+          expectText.trim().slice(0, 60) ||
+          (target.index != null ? `element ${target.index}` : `(${target.x}, ${target.y})`);
+        if (!(await approved(server, `Approve clicking the '${label}' element? This looks destructive.`))) {
+          return `Action denied by user: click on '${label}'.`;
+        }
+      }
+      const res = await sendCmd("click", withTab(tab, { ...target, expectText }));
+      if (res && typeof res === "object" && res.changed) {
+        // The element under the pointer changed after the gate decision. Never
+        // press an ungated target — re-gate whatever is actually there now.
+        const actual = (res.actualText as string) ?? "";
+        await audit(
+          "click",
+          target as Record<string, unknown>,
+          `target changed from '${expectText}' to '${actual}' before press; re-gating`,
+        );
+        if (actual === expectText) {
+          return "Click aborted: could not confirm the target element. Re-read elements and retry.";
+        }
+        expectText = actual;
+        continue;
+      }
+      return typeof res === "string" ? res : `Clicked at (${res.x}, ${res.y})`;
+    }
+    return "Click aborted: the target element kept changing under the pointer. Re-read elements and retry.";
+  };
+
   server.registerTool(
     "navigate",
     {
@@ -359,13 +402,7 @@ function buildServer(): McpServer {
       } catch (e) {
         await audit("hit_test", { x, y }, `failed (${(e as Error).message}); proceeding`);
       }
-      if (DANGER_RE.test(targetText)) {
-        const label = targetText.trim().slice(0, 60) || `(${x}, ${y})`;
-        if (!(await approved(server, `Approve clicking the '${label}' element? This looks destructive.`))) {
-          return text(`Action denied by user: click on '${label}'.`);
-        }
-      }
-      return text(await sendCmd("click", withTab(tab, { x, y })));
+      return text(await gatedClick(tab, { x, y }, targetText));
     },
   );
 
@@ -387,16 +424,10 @@ function buildServer(): McpServer {
             `Call read_elements to refresh the list first.`,
         );
       }
-      const targetText: string = info.text ?? "";
-      if (DANGER_RE.test(targetText)) {
-        const label = targetText.trim().slice(0, 60) || `element ${index}`;
-        if (!(await approved(server, `Approve clicking the '${label}' element? This looks destructive.`))) {
-          return text(`Action denied by user: click on '${label}'.`);
-        }
-      }
-      // Pass index so the extension re-resolves the live position right before
-      // pressing (immune to reflow during the cursor animation).
-      return text(await sendCmd("click", withTab(tab, { x: info.x, y: info.y, index })));
+      // gatedClick passes the index through to the extension, which re-resolves
+      // the live position right before pressing (immune to reflow during the
+      // cursor animation) and re-gates via `expectText` if it changed.
+      return text(await gatedClick(tab, { index }, info.text ?? ""));
     },
   );
 

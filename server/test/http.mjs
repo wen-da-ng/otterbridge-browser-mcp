@@ -38,7 +38,13 @@ function handleExtension(action, p) {
       const el = ELEMENTS[p.index];
       return el ? { found: true, text: el.text, x: el.x, y: el.y } : { found: false };
     }
-    case "click": return `Clicked at (${p.x}, ${p.y})`;
+    case "click": {
+      // Mirror the real extension: an index click re-resolves its own live
+      // coords from the element list (the server no longer passes x/y for
+      // index clicks). Raw clicks fall back to the given coordinates.
+      const el = p.index != null ? ELEMENTS[p.index] : null;
+      return `Clicked at (${el ? el.x : p.x}, ${el ? el.y : p.y})`;
+    }
     case "type_text": return `Typed ${(p.text || "").length} chars`;
     case "press_key": return `Pressed ${p.key}`;
     case "scroll": return "Scrolled";

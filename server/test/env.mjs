@@ -19,7 +19,7 @@ function ext(ws) {
     const els = [{ index: 0, tag: "a", text: "Home", x: 10, y: 10 }, { index: 1, tag: "button", text: "Submit order", x: 20, y: 20 }];
     let result;
     if (action === "locate_element") { const e = els[params.index]; result = e ? { found: true, ...e } : { found: false }; }
-    else if (action === "click") result = `Clicked at (${params.x}, ${params.y})`;
+    else if (action === "click") { const e = params.index != null ? els[params.index] : null; result = `Clicked at (${e ? e.x : params.x}, ${e ? e.y : params.y})`; }
     else result = "ok";
     ws.send(JSON.stringify({ id, result }));
   });
