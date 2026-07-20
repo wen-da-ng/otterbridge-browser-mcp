@@ -206,20 +206,45 @@ bridge and only one process can own it.
 <details>
 <summary><b>Claude Code</b></summary>
 
+Build once (both options need `dist/index.js`), and load the extension from
+your clone's `extension/` folder:
+
 ```bash
 git clone https://github.com/wen-da-ng/otterbridge-browser-mcp.git
 cd otterbridge-browser-mcp/server
 npm ci --ignore-scripts   # reproducible install, no dependency install scripts
 npm run build
+```
+
+**Option A — stdio (recommended, start-free).** Claude Code launches the server
+itself on connect — just like the `.mcpb` in Claude Desktop — so there's no
+`npm start` to remember. Register it once with the **absolute** path to your
+built `dist/index.js`:
+
+```
+claude mcp add otterbridge-browser-mcp -- node /absolute/path/to/otterbridge-browser-mcp/server/dist/index.js --stdio
+```
+
+Single-session only, and it can't run while the Claude Desktop `.mcpb` is
+loaded — both would fight over the `ws://localhost:8765` bridge.
+
+**Option B — streamable HTTP (multi-agent).** Run one long-lived server that
+many sessions share, each getting its own colored tab group. You start it
+manually and keep it running:
+
+```bash
 npm start                 # streamable HTTP at http://localhost:8000/mcp
 ```
 
-Load the extension from your clone's `extension/` folder, wait for
-`[bridge] extension connected`, then register the server once:
+Then register it once (a reconnect fails with `-32000` if the server isn't
+running):
 
 ```
 claude mcp add --transport http otterbridge-browser-mcp http://localhost:8000/mcp
 ```
+
+Either way, wait for `[bridge] extension connected` (the extension
+auto-reconnects), then run `/mcp` in Claude Code to attach.
 </details>
 
 <details>
