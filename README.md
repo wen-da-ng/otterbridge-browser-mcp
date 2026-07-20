@@ -218,7 +218,7 @@ Load the extension from your clone's `extension/` folder, wait for
 `[bridge] extension connected`, then register the server once:
 
 ```
-claude mcp add --transport http otterbridge http://localhost:8000/mcp
+claude mcp add --transport http otterbridge-browser-mcp http://localhost:8000/mcp
 ```
 </details>
 

@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/dist/mcpb-manifest-v0.4.schema.json",
   "manifest_version": "0.4",
-  "name": "otterbridge",
-  "display_name": "OtterBridge",
-  "version": "0.2.1",
+  "name": "otterbridge-browser-mcp",
+  "display_name": "OtterBridge Browser MCP",
+  "version": "0.2.2",
   "description": "Drive your real Chrome browser from any AI agent through the Otter extension.",
   "long_description": "OtterBridge lets AI agents observe and act in your real Chrome browser: read pages, find text, list interactive elements, click, fill forms, pick dropdown options, hover, drag, scroll, navigate, wait for dynamic content, and take viewport or full-page screenshots. It also captures the console and network traffic for web-app debugging. It talks to the companion Otter Chrome extension over a localhost-only WebSocket. Clicks on destructive controls (buy, pay, delete, send, submit, ...) require your approval first, and evaluate_js stays off unless you enable it in the extension options. Everything runs on your machine; no browsing data leaves it.",
   "author": {

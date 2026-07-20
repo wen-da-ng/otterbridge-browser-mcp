@@ -224,7 +224,7 @@ let agentSeq = 0;
 // (elicitation routes back to that session's client), while stdio uses one.
 function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "OtterBridge", version: "0.2.0" },
+    { name: "otterbridge-browser-mcp", version: "0.2.2" },
     {
       instructions:
         "OtterBridge controls the user's real Chrome browser through the Otter " +
