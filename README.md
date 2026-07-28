@@ -47,6 +47,13 @@ stop and ask **you** first.
 All you need is **Google Chrome** and **Claude Desktop** — no Node.js, no git,
 no terminal.
 
+> **Supported clients:** Claude Desktop **chat sessions**, Claude Code, and any
+> other MCP client. **Claude Desktop CoWork is not supported yet** — CoWork runs
+> its agent in a sandboxed VM that currently fails to connect to locally
+> installed MCP extensions
+> ([known issue](https://github.com/anthropics/claude-code/issues/27492)).
+> Use a regular chat session instead.
+
 **1 — Download two files** from the
 [latest release](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases/latest):
 `otterbridge.mcpb` and `otter-extension.zip`.
@@ -76,6 +83,8 @@ and for the extension click the green **Code** button on the repo page →
 
 - **Nothing happens?** Make sure Chrome is open and the Otter extension is
   loaded (`chrome://extensions`). The extension reconnects automatically.
+- **Not showing up in CoWork?** CoWork isn't supported yet (see the note
+  above) — use a regular Claude Desktop chat session.
 - A **"Chrome is being debugged" banner** appears at the top — normal and
   harmless; websites can't see it.
 - `chrome://` pages, the Chrome Web Store, and PDFs can't be read or clicked —

@@ -12,6 +12,11 @@ transports, byte-compatible with the same unchanged Otter Chrome extension:
 Both modes host the `ws://localhost:8765` bridge the extension connects to.
 Only one process may bind `:8765` at a time.
 
+> **Claude Desktop CoWork is not supported yet.** CoWork runs its agent in a
+> sandboxed VM that currently fails to connect to locally installed MCP
+> extensions ([known issue](https://github.com/anthropics/claude-code/issues/27492)).
+> Regular Claude Desktop chat sessions work as documented above.
+
 ## The 9 tools
 
 `navigate`, `read_page`, `read_elements`, **`click_element(index)`** (preferred —
