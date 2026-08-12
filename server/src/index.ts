@@ -224,14 +224,17 @@ let agentSeq = 0;
 // (elicitation routes back to that session's client), while stdio uses one.
 function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "otterbridge-browser-mcp", version: "0.2.2" },
+    { name: "otterbridge-browser-mcp", version: "0.3.0" },
     {
       instructions:
         "OtterBridge controls the user's real Chrome browser through the Otter " +
         "extension. Observe with read_page / read_elements / screenshot / " +
         "find_text; act with click_element (preferred) / fill_element / " +
         "select_option / press_key / navigate / scroll. Use wait_for for " +
-        "dynamic content instead of polling screenshots. Debug web apps with " +
+        "dynamic content instead of polling screenshots. Replay a previously " +
+        "completed flow at full speed with run_script (durable selector/text " +
+        "targets + {{placeholder}} vars — record after finishing a flow " +
+        "interactively). Debug web apps with " +
         "read_console / read_network / get_network_body. Open extra tabs with " +
         "open_tab (each joins this session's tab group); every tool takes an " +
         "optional 'tab' id, defaulting to this session's current tab. Built by " +
@@ -270,6 +273,8 @@ function buildServer(): McpServer {
     tab: number | undefined,
     target: { index?: number; x?: number; y?: number },
     initialText: string,
+    fast = false,
+    background = false,
   ): Promise<string> => {
     let expectText = initialText ?? "";
     for (let attempt = 0; attempt < 4; attempt++) {
@@ -281,7 +286,7 @@ function buildServer(): McpServer {
           return `Action denied by user: click on '${label}'.`;
         }
       }
-      const res = await sendCmd("click", withTab(tab, { ...target, expectText }));
+      const res = await sendCmd("click", withTab(tab, { ...target, expectText, fast, background }));
       if (res && typeof res === "object" && res.changed) {
         // The element under the pointer changed after the gate decision. Never
         // press an ungated target — re-gate whatever is actually there now.
@@ -748,6 +753,292 @@ function buildServer(): McpServer {
         return text("Action denied by user: evaluate_js.");
       }
       return text(JSON.stringify(await sendCmd("evaluate_js", withTab(tab, { code }))));
+    },
+  );
+
+  // ===== Script replay =====
+  // One MCP call executes a whole recorded action sequence at native speed —
+  // no model round-trip between steps. Elements are addressed by durable
+  // descriptors (CSS selector / visible text), never by session-specific
+  // indices, so a script recorded today replays tomorrow. String fields may
+  // carry {{placeholders}} substituted from `vars` at call time, which is how
+  // one recorded flow serves ever-changing inputs. The destructive-action
+  // gate applies to every click step exactly as in interactive mode.
+  const StepTarget = z.object({
+    selector: z.string().optional().describe("CSS selector for the element (most durable)."),
+    text: z.string().optional().describe("Visible text / label / placeholder / aria-label. Exact match wins over prefix over substring."),
+    tag: z.string().optional().describe("Restrict to a tag, e.g. 'button', 'input', 'a'."),
+    nth: z.number().int().min(0).optional().describe("Which match to use when several remain (default 0)."),
+  });
+  const Step = z.object({
+    action: z.enum(["navigate", "click", "fill", "select", "type_text", "press_key", "scroll", "wait_for", "drag"]),
+    url: z.string().optional().describe("navigate: URL to load."),
+    target: StepTarget.optional().describe("click / fill / select: which element."),
+    x: z.number().int().optional().describe("click: viewport x when no durable target exists (LAST resort — coordinates break on layout changes)."),
+    y: z.number().int().optional().describe("click: viewport y when no durable target exists."),
+    from_x: z.number().int().optional().describe("drag: start x."),
+    from_y: z.number().int().optional().describe("drag: start y."),
+    to_x: z.number().int().optional().describe("drag: end x."),
+    to_y: z.number().int().optional().describe("drag: end y."),
+    text: z.string().optional().describe("fill / type_text: text to type. wait_for: page text to wait for."),
+    key: z.string().optional().describe("press_key: key name, e.g. 'Enter', 'Tab', 'Escape'."),
+    value: z.string().optional().describe("select: option value attribute."),
+    label: z.string().optional().describe("select: option visible label."),
+    delta_y: z.number().int().optional().describe("scroll: pixels (positive = down)."),
+    selector: z.string().optional().describe("wait_for: CSS selector to wait for."),
+    timeout_ms: z.number().int().min(100).max(60000).optional().describe("wait_for: max wait (default 10000). click/fill/select: how long to wait for the target element to appear (default 8000)."),
+    pause_ms: z.number().int().min(0).max(30000).optional().describe("Fixed pause AFTER this step (animations, debounced saves)."),
+    optional: z.boolean().optional().describe("Continue with the next step even if this one fails."),
+  });
+
+  server.registerTool(
+    "run_script",
+    {
+      description:
+        "Replay a recorded browser flow in ONE call at full speed — no " +
+        "per-step round-trips. Use this when repeating a flow you (or a saved " +
+        "skill) already completed interactively.\n\n" +
+        "Recording: after finishing a flow with the interactive tools, save " +
+        "the equivalent steps with DURABLE targets — CSS selectors and/or " +
+        "visible text, never read_elements indices — and insert wait_for " +
+        "steps wherever the page loads content dynamically. Put every " +
+        "run-specific value (dates, descriptions, amounts, ...) behind a " +
+        "{{placeholder}} and supply fresh values via 'vars' on each replay.\n\n" +
+        "Failure handling: the script stops at the first failed non-optional " +
+        "step and returns per-step results. Take over with the interactive " +
+        "tools from where it stopped, finish the task, then update the saved " +
+        "script. Destructive clicks (buy, pay, send, delete, submit, ...) " +
+        "still require human approval, exactly as in interactive mode.",
+      inputSchema: {
+        steps: z.array(Step).min(1).describe("Action sequence to execute in order."),
+        vars: z
+          .record(z.string())
+          .optional()
+          .describe("Values substituted into {{placeholders}} in url / text / value / label / key / selector fields."),
+        fast: z
+          .boolean()
+          .optional()
+          .describe("Skip cursor animation and typing delays (default true)."),
+        background: z
+          .boolean()
+          .optional()
+          .describe(
+            "Run silently: never bring the target tab to the front, so the user " +
+              "can keep working in other tabs, windows, or apps (default false).",
+          ),
+        ...TAB,
+      },
+    },
+    async ({ steps, vars, fast, background, tab }) => {
+      const v = vars ?? {};
+      const speed = fast !== false;
+      const bg = background === true;
+      const missing = new Set<string>();
+      const sub = (s: string | undefined): string | undefined =>
+        s == null
+          ? undefined
+          : s.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (m, name: string) => {
+              if (v[name] === undefined) {
+                missing.add(name);
+                return m;
+              }
+              return v[name];
+            });
+      const resolved = steps.map((st) => ({
+        ...st,
+        url: sub(st.url),
+        text: sub(st.text),
+        key: sub(st.key),
+        value: sub(st.value),
+        label: sub(st.label),
+        selector: sub(st.selector),
+        target: st.target
+          ? { ...st.target, selector: sub(st.target.selector), text: sub(st.target.text) }
+          : undefined,
+      }));
+      if (missing.size) {
+        return text(
+          JSON.stringify({
+            ok: false,
+            error: `Unresolved placeholders: ${[...missing].join(", ")}. Pass values for them in 'vars'.`,
+          }),
+        );
+      }
+
+      await audit("run_script", {
+        steps: resolved.length,
+        vars: Object.keys(v),
+        fast: speed,
+        background: bg,
+      });
+      // Every dispatched command carries the background flag so the extension
+      // never activates the tab mid-script.
+      const wp = (params: Record<string, unknown>) => withTab(tab, { ...params, background: bg });
+
+      // Implicit wait on element resolution (Selenium's implicit-wait
+      // semantics). Single-page apps routinely satisfy a wait_for on a
+      // heading one frame before the controls below it mount, so a target
+      // that resolves on the very first try is the exception, not the rule.
+      // Poll until the element appears rather than failing on a race.
+      const resolveTarget = async (
+        t: { selector?: string; text?: string; tag?: string; nth?: number },
+        timeoutMs: number,
+      ): Promise<any> => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const el = await sendCmd(
+            "resolve_element",
+            wp({ selector: t.selector, text: t.text, tag: t.tag, nth: t.nth }),
+          );
+          if (el && el.found) return el;
+          if (Date.now() >= deadline) return el;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      };
+      type StepResult = {
+        step: number;
+        action: string;
+        ok: boolean;
+        ms: number;
+        result?: unknown;
+        error?: string;
+      };
+      const results: StepResult[] = [];
+      const t0 = Date.now();
+      let failed: number | null = null;
+
+      for (let i = 0; i < resolved.length; i++) {
+        const st = resolved[i];
+        const s0 = Date.now();
+        try {
+          let out: unknown;
+          switch (st.action) {
+            case "navigate": {
+              if (!st.url) throw new Error("navigate needs 'url'.");
+              out = await sendCmd("navigate", wp({ url: st.url }));
+              break;
+            }
+            case "wait_for": {
+              if (st.text == null && st.selector == null) {
+                throw new Error("wait_for needs 'text' and/or 'selector'.");
+              }
+              const r = await sendCmd(
+                "wait_for",
+                wp({ text: st.text, selector: st.selector, timeoutMs: st.timeout_ms }),
+                (st.timeout_ms ?? 10000) + 15000,
+              );
+              if (!r.found) throw new Error(`wait_for timed out after ${r.elapsed_ms}ms.`);
+              out = `found after ${r.elapsed_ms}ms`;
+              break;
+            }
+            case "drag": {
+              if (st.from_x == null || st.from_y == null || st.to_x == null || st.to_y == null) {
+                throw new Error("drag needs from_x, from_y, to_x, to_y.");
+              }
+              out = await sendCmd(
+                "drag",
+                wp({ fromX: st.from_x, fromY: st.from_y, toX: st.to_x, toY: st.to_y, fast: speed }),
+              );
+              break;
+            }
+            case "click":
+            case "fill":
+            case "select": {
+              if (st.action === "click" && !st.target && st.x != null && st.y != null) {
+                // Coordinate click for elements with no durable descriptor
+                // (icon-only buttons). Same gate as interactive click: hit-test
+                // the live element so the danger check still applies.
+                let targetText = "";
+                try {
+                  const hit = await sendCmd("hit_test", wp({ x: st.x, y: st.y }));
+                  targetText = (hit?.text as string) ?? "";
+                } catch (_) { /* proceed ungated-texted; gatedClick re-checks */ }
+                const r = await gatedClick(tab, { x: st.x, y: st.y }, targetText, speed, bg);
+                if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
+                out = r;
+                break;
+              }
+              if (!st.target || (st.target.selector == null && st.target.text == null)) {
+                throw new Error(`${st.action} needs a 'target' with selector and/or text (or x/y for click).`);
+              }
+              const el = await resolveTarget(st.target, st.timeout_ms ?? 8000);
+              if (!el || !el.found) {
+                throw new Error(
+                  `No element matches target ${JSON.stringify(st.target)} ` +
+                    `after waiting ${st.timeout_ms ?? 8000}ms.`,
+                );
+              }
+              if (st.action === "click") {
+                const r = await gatedClick(tab, { index: el.index }, el.text ?? "", speed, bg);
+                if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
+                out = r;
+              } else if (st.action === "fill") {
+                if (st.text == null) throw new Error("fill needs 'text'.");
+                out = await sendCmd(
+                  "fill_element",
+                  wp({ index: el.index, text: st.text, fast: speed }),
+                );
+              } else {
+                if (st.value == null && st.label == null) {
+                  throw new Error("select needs 'value' or 'label'.");
+                }
+                out = await sendCmd(
+                  "select_option",
+                  wp({ index: el.index, value: st.value, label: st.label }),
+                );
+              }
+              break;
+            }
+            case "type_text": {
+              if (st.text == null) throw new Error("type_text needs 'text'.");
+              out = await sendCmd("type_text", wp({ text: st.text, fast: speed }));
+              break;
+            }
+            case "press_key": {
+              if (!st.key) throw new Error("press_key needs 'key'.");
+              out = await sendCmd("press_key", wp({ key: st.key }));
+              break;
+            }
+            case "scroll": {
+              out = await sendCmd("scroll", wp({ deltaY: st.delta_y }));
+              break;
+            }
+          }
+          if (st.pause_ms) await new Promise((r) => setTimeout(r, st.pause_ms));
+          results.push({ step: i, action: st.action, ok: true, ms: Date.now() - s0, result: out });
+        } catch (e) {
+          results.push({
+            step: i,
+            action: st.action,
+            ok: false,
+            ms: Date.now() - s0,
+            error: (e as Error).message,
+          });
+          if (!st.optional) {
+            failed = i;
+            break;
+          }
+        }
+      }
+
+      return text(
+        JSON.stringify({
+          ok: failed == null,
+          steps_run: results.length,
+          total_steps: resolved.length,
+          elapsed_ms: Date.now() - t0,
+          ...(failed != null
+            ? {
+                failed_step: failed,
+                hint:
+                  "Script stopped at the failed step. Take over with the interactive tools " +
+                  "(screenshot / read_elements) from the current page state, finish the task, " +
+                  "then update the saved script so the next replay succeeds.",
+              }
+            : {}),
+          results,
+        }),
+      );
     },
   );
 

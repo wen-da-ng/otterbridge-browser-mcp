@@ -1,0 +1,41 @@
+{
+  "name": "shan-farm-order",
+  "description": "Shan Farm ordering flow: pick a pickup location, add two products, stop at Order Summary for human review. Recorded and verified 2026-08-10 against dev2-shan-farm-ordering.netlify.app.",
+  "notes": [
+    "Replay with run_script, passing 'vars' below. There is deliberately NO Place Order step - the script ends at Order Summary so a human decides.",
+    "LOGIN is not scripted: the Google OAuth session must already exist in the browser. Sign in interactively once; afterwards the site shows a 'Welcome back / Continue to Order' interstitial, which step 2 handles.",
+    "GATE: 'Continue to Order' and 'Add & Checkout' match the destructive-action regex (order/checkout), so each replay asks for approval twice. Approve them, or run the server with BROWSER_AGENT_GATE=off for a flow that provably never places an order.",
+    "WAITS: the product catalog is detected via the search input's SELECTOR, not its text - placeholder text never appears in document.body.innerText, so a text wait_for can never match it.",
+    "DRAG is coordinate-based: the slide-to-confirm handle has no label. Values assume a ~2000px-wide viewport with the modal centred. Both slide steps are optional so the script works for public locations that skip the private-premises modal.",
+    "QUANTITIES stay at 1 per product: the +/- buttons have no text or aria-label to target. Adding aria-labels on the site would make quantities scriptable (and improve accessibility).",
+    "SITE BUG FOUND 2026-08-10: pickup location 'Test Event' has no products. Selecting its card directly shows 'No Products Available', but entering via the card's arrow -> Private Premises -> slide-to-confirm silently proceeds and the order ends up assigned to 'ViTrox AgriTech Experience Centre'. Two entry points to the same card give different outcomes."
+  ],
+  "vars": {
+    "pickup_location": "ViTrox AgriTech Experience Centre",
+    "product_1": "Leaf Celery (Daun Sup)",
+    "product_2": "Curly Kale",
+    "pickup_day": "Monday"
+  },
+  "background": false,
+  "steps": [
+    { "action": "navigate", "url": "https://dev2-shan-farm-ordering.netlify.app/" },
+    { "action": "wait_for", "text": "Continue to Order", "timeout_ms": 15000 },
+    { "action": "click", "target": { "text": "Continue to Order", "tag": "button" }, "pause_ms": 300 },
+    { "action": "wait_for", "text": "Delivery Method", "timeout_ms": 20000 },
+    { "action": "click", "target": { "text": "Self Pickup", "tag": "button" }, "pause_ms": 300 },
+    { "action": "click", "target": { "text": "{{pickup_location}}" }, "pause_ms": 800 },
+    { "action": "wait_for", "text": "Slide to confirm", "timeout_ms": 4000, "optional": true },
+    { "action": "drag", "from_x": 865, "from_y": 540, "to_x": 1140, "to_y": 540, "pause_ms": 500, "optional": true },
+    { "action": "wait_for", "selector": "input[placeholder*='Search products']", "timeout_ms": 15000 },
+    { "action": "click", "target": { "text": "{{product_1}}" } },
+    { "action": "wait_for", "text": "Add & Checkout", "timeout_ms": 10000 },
+    { "action": "click", "target": { "text": "Add More", "tag": "button" } },
+    { "action": "wait_for", "selector": "input[placeholder*='Search products']", "timeout_ms": 10000 },
+    { "action": "click", "target": { "text": "{{product_2}}" } },
+    { "action": "wait_for", "text": "Add & Checkout", "timeout_ms": 10000 },
+    { "action": "click", "target": { "text": "Add & Checkout", "tag": "button" } },
+    { "action": "wait_for", "text": "Select Pickup Day", "timeout_ms": 15000 },
+    { "action": "click", "target": { "text": "{{pickup_day}}" }, "pause_ms": 500 },
+    { "action": "wait_for", "text": "Order Summary", "timeout_ms": 15000 }
+  ]
+}

@@ -201,12 +201,13 @@ async function moveWithHoverTrail(tabId, x, y) {
 
 // ===== Human-like typing (shared by type_text and fill_element) =====
 // Per-character key events with jittered timing. Speed and the occasional
-// "thinking" pause are settings-driven.
-async function typeChars(tabId, text) {
+// "thinking" pause are settings-driven. fast=true (script replay) drops the
+// inter-key delay entirely — still real trusted key events, just back-to-back.
+async function typeChars(tabId, text, fast) {
   for (const ch of text) {
     await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", text: ch });
     await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", text: ch });
-    await sleep(OtterConfig.typeDelay(S, Math.random));
+    if (!fast) await sleep(OtterConfig.typeDelay(S, Math.random));
   }
 }
 
@@ -340,8 +341,10 @@ async function handle(action, p) {
     "click", "fill_element", "select_option", "hover", "drag",
     "type_text", "press_key", "scroll",
   ]);
+  // p.background suppresses the activation: script replays meant to run
+  // silently while the user works elsewhere must never steal the tab focus.
   const parallel = Object.keys(agentGroups).length > 1;
-  if (p.tabId != null && VISIBLE.has(action) && !parallel && !tab.active) {
+  if (p.tabId != null && VISIBLE.has(action) && !parallel && !p.background && !tab.active) {
     await chrome.tabs.update(tab.id, { active: true });
   }
 
@@ -416,6 +419,66 @@ async function handle(action, p) {
                 : { found: false };
     }
 
+    case "resolve_element": {
+      // Resolve a DURABLE element descriptor — CSS selector and/or visible
+      // text (+ optional tag filter, nth pick) — to a live index in the
+      // current collectInteractiveEls ordering. This is what makes recorded
+      // scripts replayable across sessions: indices shift between visits,
+      // selectors and labels don't. The returned index feeds straight into
+      // the existing click / fill_element / select_option paths (same cache).
+      await collectEls(tab.id); // refresh window.__otterEls
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [p.selector ?? null, p.text ?? null, p.tag ?? null, p.nth || 0],
+        func: (selector, text, tag, nth) => {
+          const els = window.__otterEls || [];
+          const labelOf = (el) => (el.innerText || el.value || el.placeholder ||
+            el.getAttribute("aria-label") || el.title || "").trim();
+          let candidates;
+          if (selector) {
+            let matched;
+            try { matched = [...document.querySelectorAll(selector)]; }
+            catch (_) { return { found: false, error: `Invalid CSS selector: ${selector}` }; }
+            candidates = [];
+            for (const m of matched) {
+              // The selector may hit the interactive element itself, a wrapper
+              // around it, or a node inside it — accept all three.
+              let ix = els.indexOf(m);
+              if (ix === -1) ix = els.findIndex((el) => el.contains(m) || m.contains(el));
+              if (ix !== -1 && !candidates.includes(ix)) candidates.push(ix);
+            }
+          } else {
+            candidates = els.map((_, i) => i);
+          }
+          if (tag) {
+            const t = tag.toLowerCase();
+            candidates = candidates.filter((i) => els[i].tagName.toLowerCase() === t);
+          }
+          if (text != null && text !== "") {
+            const q = text.trim().toLowerCase();
+            const labels = new Map(candidates.map((i) => [i, labelOf(els[i]).toLowerCase()]));
+            // Exact match beats prefix beats substring — never mix tiers, so
+            // 'Log' resolves to the 'Log' button, not 'Log out'.
+            let hits = candidates.filter((i) => labels.get(i) === q);
+            if (!hits.length) hits = candidates.filter((i) => labels.get(i).startsWith(q));
+            if (!hits.length) hits = candidates.filter((i) => labels.get(i).includes(q));
+            candidates = hits;
+          }
+          if (!candidates.length) return { found: false };
+          const pick = candidates[Math.min(nth, candidates.length - 1)];
+          const el = els[pick];
+          const r = el.getBoundingClientRect();
+          return {
+            found: true, index: pick, matches: candidates.length,
+            text: labelOf(el).slice(0, 80), tag: el.tagName.toLowerCase(),
+            x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2),
+          };
+        },
+      });
+      if (res.result && res.result.error) throw new Error(res.result.error);
+      return res.result || { found: false };
+    }
+
     case "click": {
       // p: { x, y, index?, expectText? } in CSS viewport coordinates.
       // expectText, when present, is the text the SERVER ran the destructive-
@@ -438,11 +501,18 @@ async function handle(action, p) {
       // only register inside the visible viewport), then take fresh coords.
       if (hasIndex) {
         await collectEls(tab.id, index);   // scrolls element `index` if off-screen
-        await sleep(180);                  // let the scroll settle
+        await sleep(p.fast ? 60 : 180);    // let the scroll settle
         const els = await collectEls(tab.id);
         if (els[index]) { x = els[index].x; y = els[index].y; }
       }
-      await moveWithHoverTrail(tab.id, x, y);
+      if (p.fast) {
+        // Script replay: no glide animation. Cursor jumps to the target and a
+        // single real mouseMoved lands there so hover handlers still fire.
+        try { await chrome.tabs.sendMessage(tab.id, { type: "placeCursor", x, y }); } catch (_) {}
+        await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      } else {
+        await moveWithHoverTrail(tab.id, x, y);
+      }
       // Re-resolve the LIVE position after the cursor animation — immune to
       // reflow during the move (banner, lazy content, animations). This is
       // what makes the first click reliable.
@@ -491,7 +561,7 @@ async function handle(action, p) {
 
     case "type_text": {
       const text = p.text || "";
-      await typeChars(tab.id, text);
+      await typeChars(tab.id, text, !!p.fast);
       return `Typed ${text.length} chars`;
     }
 
@@ -500,42 +570,95 @@ async function handle(action, p) {
       // real key events (so frameworks see genuine, trusted input).
       await ensureDebugger(tab.id);
       await collectEls(tab.id, p.index); // refresh cache + scroll into view
-      await sleep(120);
-      const [res] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        args: [p.index],
-        func: (index) => {
-          const el = (window.__otterEls || [])[index];
-          if (!el) {
-            return { ok: false, error: `No element with index ${index}. Call read_elements first.` };
-          }
-          el.focus();
-          if (typeof el.select === "function") el.select();
-          else if (el.isContentEditable) {
-            const r = document.createRange();
-            r.selectNodeContents(el);
-            const sel = getSelection();
-            sel.removeAllRanges();
-            sel.addRange(r);
-          }
-          return { ok: true, tag: el.tagName.toLowerCase() };
-        },
-      });
-      const info = res.result;
-      if (!info.ok) throw new Error(info.error);
+      await sleep(p.fast ? 40 : 120);
+      // TRANSACTIONAL fill. Apps that manage focus themselves (Google Sheets
+      // and friends) can asynchronously steal it back at ANY point — even
+      // between a passing focus check and the first keystroke — so no
+      // pre-check is sufficient. Instead: focus + type, then VERIFY the text
+      // actually arrived in the element (focus still there, or its value
+      // changed). If the keystrokes were diverted, press Escape to cancel
+      // whatever stray edit they may have opened elsewhere, and retry.
+      const readState = (index) => {
+        const el = (window.__otterEls || [])[index];
+        if (!el) return { gone: true };
+        const active = document.activeElement;
+        return {
+          focused: active === el || (active != null && el.contains(active)),
+          value: el.value !== undefined ? el.value : (el.isContentEditable ? el.innerText : ""),
+        };
+      };
+      const escapeKey = {
+        key: "Escape", code: "Escape",
+        windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+      };
       const text = p.text || "";
-      if (text) {
-        await typeChars(tab.id, text);
-        return `Filled element ${p.index} (${info.tag}) with ${text.length} chars`;
+      let lastProblem = "";
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          args: [p.index],
+          func: (index) => {
+            const el = (window.__otterEls || [])[index];
+            if (!el) {
+              return { fatal: true, error: `No element with index ${index}. Call read_elements first.` };
+            }
+            el.focus();
+            if (typeof el.select === "function") el.select();
+            else if (el.isContentEditable) {
+              const r = document.createRange();
+              r.selectNodeContents(el);
+              const sel = getSelection();
+              sel.removeAllRanges();
+              sel.addRange(r);
+            }
+            return {
+              tag: el.tagName.toLowerCase(),
+              value: el.value !== undefined ? el.value : (el.isContentEditable ? el.innerText : ""),
+            };
+          },
+        });
+        const info = res.result;
+        if (info.fatal) throw new Error(info.error);
+
+        if (!text) {
+          // Empty text = clear: delete the selected content, verify it emptied.
+          await cdp(tab.id, "Input.dispatchKeyEvent", {
+            type: "keyDown", key: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+          });
+          await cdp(tab.id, "Input.dispatchKeyEvent", {
+            type: "keyUp", key: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+          });
+          const [chk] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, args: [p.index], func: readState,
+          });
+          const st = chk.result;
+          if (st.gone || st.focused || st.value !== info.value || info.value === "") {
+            return `Cleared element ${p.index} (${info.tag})`;
+          }
+          lastProblem = "the clear keystroke was diverted by the page";
+        } else {
+          await typeChars(tab.id, text, !!p.fast);
+          const [chk] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, args: [p.index], func: readState,
+          });
+          const st = chk.result;
+          // Accept when focus survived the typing, or the element's content
+          // demonstrably changed (covers apps that advance focus when done).
+          if (st.gone || st.focused || st.value !== info.value) {
+            return `Filled element ${p.index} (${info.tag}) with ${text.length} chars`;
+          }
+          lastProblem = "the keystrokes were diverted by the page";
+        }
+        // Diverted keystrokes may have opened an edit somewhere else (e.g. a
+        // spreadsheet cell). Escape cancels it before we try again.
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...escapeKey });
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", ...escapeKey });
+        await sleep(200);
       }
-      // Empty text = clear: delete the selected content.
-      await cdp(tab.id, "Input.dispatchKeyEvent", {
-        type: "keyDown", key: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
-      });
-      await cdp(tab.id, "Input.dispatchKeyEvent", {
-        type: "keyUp", key: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
-      });
-      return `Cleared element ${p.index} (${info.tag})`;
+      throw new Error(
+        `fill_element ${p.index} failed after 3 attempts: ${lastProblem}. ` +
+        `Any stray input was cancelled with Escape. Verify the page state and retry.`,
+      );
     }
 
     case "select_option": {
@@ -608,18 +731,37 @@ async function handle(action, p) {
       const firstAttach = !attached.has(tab.id);
       await ensureDebugger(tab.id);
       if (firstAttach) await sleep(200);
-      await moveWithHoverTrail(tab.id, fromX, fromY);
-      await chrome.tabs.sendMessage(tab.id, { type: "clickPulse" });
-      await cdp(tab.id, "Input.dispatchMouseEvent", {
-        type: "mousePressed", x: fromX, y: fromY, button: "left", clickCount: 1,
-      });
-      const pts = await chrome.tabs.sendMessage(tab.id, {
-        type: "moveCursor", x: toX, y: toY, samples: S.trailSamples,
-      });
-      for (const pt of pts.path) {
+      if (p.fast) {
+        // Script replay: no animation, but still a REAL move sequence — drag
+        // handlers (sliders, sortables) need intermediate mousemove events,
+        // so interpolate a short linear path instead of teleporting.
+        try { await chrome.tabs.sendMessage(tab.id, { type: "placeCursor", x: fromX, y: fromY }); } catch (_) {}
+        await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseMoved", x: fromX, y: fromY });
         await cdp(tab.id, "Input.dispatchMouseEvent", {
-          type: "mouseMoved", x: pt.x, y: pt.y, button: "left", buttons: 1,
+          type: "mousePressed", x: fromX, y: fromY, button: "left", clickCount: 1,
         });
+        const STEPS = 8;
+        for (let i = 1; i <= STEPS; i++) {
+          const x = Math.round(fromX + ((toX - fromX) * i) / STEPS);
+          const y = Math.round(fromY + ((toY - fromY) * i) / STEPS);
+          await cdp(tab.id, "Input.dispatchMouseEvent", {
+            type: "mouseMoved", x, y, button: "left", buttons: 1,
+          });
+        }
+      } else {
+        await moveWithHoverTrail(tab.id, fromX, fromY);
+        await chrome.tabs.sendMessage(tab.id, { type: "clickPulse" });
+        await cdp(tab.id, "Input.dispatchMouseEvent", {
+          type: "mousePressed", x: fromX, y: fromY, button: "left", clickCount: 1,
+        });
+        const pts = await chrome.tabs.sendMessage(tab.id, {
+          type: "moveCursor", x: toX, y: toY, samples: S.trailSamples,
+        });
+        for (const pt of pts.path) {
+          await cdp(tab.id, "Input.dispatchMouseEvent", {
+            type: "mouseMoved", x: pt.x, y: pt.y, button: "left", buttons: 1,
+          });
+        }
       }
       await cdp(tab.id, "Input.dispatchMouseEvent", {
         type: "mouseReleased", x: toX, y: toY, button: "left", clickCount: 1,
@@ -717,10 +859,44 @@ async function handle(action, p) {
     }
 
     case "press_key": {
-      // e.g. Enter, Tab, Escape
+      // e.g. Enter, Tab, Escape. Named keys need code + windowsVirtualKeyCode:
+      // frameworks that check event.keyCode (Google apps among them) ignore a
+      // dispatch that carries only the key name.
       const key = p.key;
-      await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key });
-      await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key });
+      const NAMED = {
+        Enter:      { code: "Enter",      vk: 13, text: "\r" },
+        Tab:        { code: "Tab",        vk: 9 },
+        Escape:     { code: "Escape",     vk: 27 },
+        Backspace:  { code: "Backspace",  vk: 8 },
+        Delete:     { code: "Delete",     vk: 46 },
+        ArrowUp:    { code: "ArrowUp",    vk: 38 },
+        ArrowDown:  { code: "ArrowDown",  vk: 40 },
+        ArrowLeft:  { code: "ArrowLeft",  vk: 37 },
+        ArrowRight: { code: "ArrowRight", vk: 39 },
+        Home:       { code: "Home",       vk: 36 },
+        End:        { code: "End",        vk: 35 },
+        PageUp:     { code: "PageUp",     vk: 33 },
+        PageDown:   { code: "PageDown",   vk: 34 },
+        Space:      { key: " ", code: "Space", vk: 32, text: " " },
+      };
+      const m = NAMED[key];
+      if (m) {
+        const base = {
+          key: m.key || key, code: m.code,
+          windowsVirtualKeyCode: m.vk, nativeVirtualKeyCode: m.vk,
+        };
+        await cdp(tab.id, "Input.dispatchKeyEvent",
+          m.text ? { type: "keyDown", ...base, text: m.text }
+                 : { type: "rawKeyDown", ...base });
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+      } else if (key.length === 1) {
+        // Printable character: text-based dispatch types it.
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", text: key });
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", text: key });
+      } else {
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key });
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key });
+      }
       return `Pressed ${key}`;
     }
 
