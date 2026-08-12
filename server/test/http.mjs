@@ -96,10 +96,10 @@ async function main() {
       "click", "click_element", "close_tab", "drag", "evaluate_js", "fill_element",
       "find_text", "get_network_body", "go_back", "go_forward", "hover", "list_tabs",
       "navigate", "open_tab", "press_key", "read_console", "read_elements",
-      "read_network", "read_page", "reload", "screenshot", "scroll", "select_option",
-      "type_text", "use_tab", "wait_for",
+      "read_network", "read_page", "reload", "run_script", "screenshot", "scroll",
+      "select_option", "type_text", "use_tab", "wait_for",
     ];
-    ok("tools/list has all 22 core + 4 tab tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
+    ok("tools/list has all 23 core + 4 tab tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
 
     const rp = await client.callTool({ name: "read_page", arguments: {} });
     ok("read_page returns JSON text", firstText(rp).includes("example.com"));
