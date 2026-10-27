@@ -97,8 +97,12 @@ and for the extension click the green **Code** button on the repo page →
   error page just means no AI client was running at that moment. It's
   harmless and stops once one connects.
 - **Old "Otter · …" windows** are left open when a session ends, so you can see
-  what it did; close them whenever you like. The same Claude session reuses its
-  window, even after `/mcp` reconnects or an extension reload.
+  what it did. The same Claude session reuses its window, even after `/mcp`
+  reconnects or an extension reload.
+- **"Otter · …" groups piling up on the bookmarks bar?** Chrome saves every tab
+  group and keeps it when the window closes. Click **Close agent windows** in
+  the extension popup (it ungroups first, so Chrome deletes them), or enable
+  auto-close in the options; delete old entries once by right-clicking them.
 </details>
 
 ## What your AI can do
@@ -216,6 +220,13 @@ opens (e.g. "Sign in with Google") belong to that agent too, and grouping is
 verified: if Chrome dropped the group (its last tab closed), it's recreated.
 A client that reconnects (`/mcp`) — or an extension reload — finds the same
 window again and carries on in its current tab.
+
+**Cleaning up:** Chrome saves every tab group to the bookmarks bar and keeps
+it even after its window closes. Use **Close agent windows** in the extension
+popup — it ungroups first, so nothing is left behind — or turn on *Close agent
+windows 5 min after their AI client disconnects* in the options. Closing an
+agent window yourself? Right-click its group → **Delete group** instead of
+closing the window, or Chrome keeps the group.
 
 **Subagents** of one Claude session share that session's window. To work in
 parallel, each opens its own tab (`open_tab`) and passes that `tab` id on every

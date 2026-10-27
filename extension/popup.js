@@ -60,6 +60,17 @@ async function init() {
     reflect();
   });
 
+  document.getElementById("cleanup").addEventListener("click", async () => {
+    const msg = document.getElementById("cleanupMsg");
+    msg.textContent = "Closing…";
+    const res = await chrome.runtime.sendMessage({ type: "closeAgentWindows" });
+    msg.textContent = res && res.error
+      ? `Couldn't close: ${res.error}`
+      : res && res.closed
+        ? `Closed ${res.closed} agent window${res.closed === 1 ? "" : "s"}.`
+        : "No agent windows open.";
+  });
+
   document.getElementById("adv").addEventListener("click", () => {
     if (chrome.runtime.openOptionsPage) chrome.runtime.openOptionsPage();
     else window.open(chrome.runtime.getURL("options.html"));

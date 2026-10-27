@@ -21,6 +21,7 @@ const SCHEMA = [
   { group: "behavior", key: "idleDrift", label: "Idle drift", type: "toggle" },
   { group: "behavior", key: "driftIntensity", label: "Drift intensity", type: "range", min: 0, max: 2, step: 0.1, fmt: (v) => v.toFixed(1) + "×", dependsOn: "idleDrift" },
 
+  { group: "behavior", key: "autoCloseWindows", label: "Close agent windows 5 min after their AI client disconnects", type: "toggle" },
   { group: "behavior", key: "agentSpeed", label: "Agent speed", type: "select", options: [["watch", "Watchable (animated)"], ["fast", "Fast (no animation/delays)"]] },
   { group: "advanced", key: "approvalMode", label: "Approvals", type: "select", options: [["ask", "Ask before destructive actions"], ["auto", "Full Auto (no prompts)"]] },
   { group: "advanced", key: "allowJsEval", label: "Allow evaluate_js (run JS in pages)", type: "toggle" },

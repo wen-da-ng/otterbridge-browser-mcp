@@ -42,6 +42,12 @@
     // just without the waiting. (Script replays are always fast.)
     agentSpeed: "watch",
 
+    // --- Agent windows ---
+    // Close (ungroup first, so Chrome doesn't keep the tab group on the
+    // bookmarks bar) an agent's window once its AI client has been gone for
+    // 5 minutes. Off by default: you may want to look at what it left.
+    autoCloseWindows: false,
+
     // --- Approvals ---
     // "ask": destructive clicks and evaluate_js prompt for approval in the AI
     // client. "auto": Full Auto — no prompts (evaluate_js still needs

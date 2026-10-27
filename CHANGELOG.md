@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0 — 2026-10-28
+
+### Added
+
+- **Close agent windows** button in the extension popup, and an optional
+  setting to close an agent's window 5 minutes after its AI client
+  disconnects. Both ungroup the tabs first: Chrome saves every tab group to
+  the bookmarks bar and keeps that copy when a window is merely closed, so
+  agent groups used to pile up there.
+
+### Fixed
+
+- An agent closing its own last tab left its group saved on the bookmarks
+  bar; the tab is now ungrouped first.
+
 ## 0.5.1 — 2026-10-28
 
 ### Changed

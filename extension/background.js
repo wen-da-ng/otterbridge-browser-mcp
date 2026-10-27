@@ -93,6 +93,7 @@ function connectPort(port) {
       return;
     }
     const { id, action, params } = msg;
+    if (params && params.agentId) noteAgentActive(params.agentId, sock);
     let result = null, error = null;
     try {
       result = await handle(action, params || {});
@@ -103,7 +104,10 @@ function connectPort(port) {
   };
   // Registered servers that go away stay gone; the registry lists them again
   // if they come back.
-  sock.onclose = () => { if (sockets.get(port) === sock) sockets.delete(port); };
+  sock.onclose = () => {
+    if (sockets.get(port) === sock) sockets.delete(port);
+    onBridgeClosed(sock);
+  };
   sock.onerror = () => sock.close();
 }
 
@@ -116,7 +120,7 @@ setInterval(scanBridges, 3000);
 
 // MV3 service workers can be suspended; a periodic alarm keeps reconnection alive.
 chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener(scanBridges);
+chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === "keepalive") scanBridges(); });
 
 // ===== Small helpers =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -466,6 +470,82 @@ chrome.tabs.onCreated.addListener((tab) => {
   trackOpenedTab(tab);
 });
 chrome.tabs.onAttached.addListener((tabId, info) => adoptIntoAgentGroup(tabId, info.newWindowId));
+
+// ===== Cleanup =====
+// Chrome auto-saves every tab group (bookmarks bar) and KEEPS the saved copy
+// when its window is closed — so agent groups pile up. Ungrouping the tabs
+// first deletes the group outright; then the window can close. Used by the
+// popup's "Close agent windows" button.
+// Ungroup + close one agent's window and popups; true if a window closed.
+async function closeAgent(agentId) {
+  const ag = agents[agentId];
+  let closed = false;
+  if (ag && (await windowAlive(ag.windowId))) {
+    try {
+      const tabs = await chrome.tabs.query({ windowId: ag.windowId });
+      const grouped = tabs.filter((t) => t.groupId !== -1).map((t) => t.id);
+      if (grouped.length) await chrome.tabs.ungroup(grouped);
+      await chrome.windows.remove(ag.windowId);
+      closed = true;
+    } catch (_) {}
+  }
+  delete agents[agentId];
+  for (const [tabId, owner] of Object.entries(adoptedTabs)) {
+    if (owner !== agentId) continue;
+    try { await chrome.tabs.remove(Number(tabId)); } catch (_) {}
+    delete adoptedTabs[tabId];
+  }
+  return closed;
+}
+
+async function closeAgentWindows() {
+  await agentsReady;
+  let closed = 0;
+  for (const id of Object.keys(agents)) if (await closeAgent(id)) closed++;
+  agentSeq = 0;
+  await saveAgents();
+  return closed;
+}
+
+// Optional auto-cleanup (setting "autoCloseWindows"): when the AI client
+// behind an agent has been gone for 5 minutes, close its window the clean
+// way. Any command from that agent cancels it, so a /mcp reconnect is safe.
+// chrome.alarms survive the worker being suspended in the meantime.
+const AUTO_CLOSE_MINUTES = 5;
+const agentSocket = new Map(); // agentId -> the socket its commands come on
+const cleanupAlarm = (agentId) => `close-agent:${agentId}`;
+
+function noteAgentActive(agentId, sock) {
+  agentSocket.set(agentId, sock);
+  chrome.alarms.clear(cleanupAlarm(agentId)).catch(() => {});
+}
+
+function onBridgeClosed(sock) {
+  for (const [agentId, s] of agentSocket) {
+    if (s !== sock) continue;
+    agentSocket.delete(agentId);
+    if (S.autoCloseWindows) {
+      chrome.alarms.create(cleanupAlarm(agentId), { delayInMinutes: AUTO_CLOSE_MINUTES });
+    }
+  }
+}
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (!alarm.name.startsWith("close-agent:")) return;
+  await agentsReady;
+  await settingsReady;
+  const agentId = alarm.name.slice("close-agent:".length);
+  if (!S.autoCloseWindows || agentSocket.has(agentId) || !agents[agentId]) return;
+  await closeAgent(agentId);
+  await saveAgents();
+});
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.type === "closeAgentWindows") {
+    closeAgentWindows().then((closed) => sendResponse({ closed }), (e) => sendResponse({ error: e.message }));
+    return true; // async response
+  }
+});
 
 // The window the user last focused that ISN'T an agent's — get_user_tab's answer.
 let lastUserWindowId = null;
@@ -986,6 +1066,12 @@ async function handle(action, p) {
     try { t = await chrome.tabs.get(p.tabId); } catch (_) { return { closed: p.tabId }; }
     if (p.agentId && ownerOf(t) !== p.agentId) {
       throw new Error(`Tab ${p.tabId} isn't in this session's window; only the session's own tabs can be closed.`);
+    }
+    // Last tab of the agent's group? Ungroup it first: closing a group's last
+    // tab would leave Chrome's saved copy on the bookmarks bar.
+    if (t.groupId !== -1) {
+      const inGroup = await chrome.tabs.query({ groupId: t.groupId });
+      if (inGroup.length === 1) { try { await chrome.tabs.ungroup(p.tabId); } catch (_) {} }
     }
     await chrome.tabs.remove(p.tabId);
     return { closed: p.tabId };

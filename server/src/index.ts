@@ -390,7 +390,7 @@ const CLIENT_NAMES: Record<string, string> = {
 // (elicitation routes back to that session's client), while stdio uses one.
 function buildServer(stdio = false): McpServer {
   const server = new McpServer(
-    { name: "otterbridge-browser-mcp", version: "0.5.1" },
+    { name: "otterbridge-browser-mcp", version: "0.6.0" },
     {
       // Surfaced in the client's system prompt — often the ONLY thing the model
       // reads about this server before deciding whether to use it (clients may
