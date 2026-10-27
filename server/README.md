@@ -74,23 +74,23 @@ env-string parsing the `.mcpb` relies on, and the origin/host security guards.
 ## Get the `.mcpb`
 
 **Most users should not build anything** — download the prebuilt
-`otterbridge.mcpb` from the
+`otterbridge-browser.mcpb` from the
 [Releases page](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases)
 (built and attached automatically by CI on every version tag), or grab the
-copy committed right here as `server/otterbridge.mcpb`.
+copy committed right here as `server/otterbridge-browser.mcpb`.
 
 To build it from source instead:
 
 ```bash
 npm ci --ignore-scripts
-npm run pack     # build (esbuild) + copy LICENSE in + mcpb pack -> otterbridge.mcpb
+npm run pack     # build (esbuild) + copy LICENSE in + mcpb pack -> otterbridge-browser.mcpb
 ```
 
 The server is bundled by `build.mjs` (esbuild) into one self-contained
 `dist/index.js`, so the `.mcpb` ships a single reviewed file — no `node_modules`
 tree — and `mcpb pack` needs no prune step.
 
-Then double-click `otterbridge.mcpb` in Claude Desktop (or Settings →
+Then double-click `otterbridge-browser.mcpb` in Claude Desktop (or Settings →
 Extensions → Advanced → Install Extension). See `manifest.json` for the bundle
 metadata and `user_config` settings UI.
 

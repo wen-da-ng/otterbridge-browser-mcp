@@ -34,13 +34,13 @@ jobs:
       - name: Zip the Chrome extension
         working-directory: .
         # zip -r UPDATES an existing archive in place; start fresh so a stale
-        # committed otter-extension.zip can't leak old files into the release.
-        run: rm -f otter-extension.zip && zip -r otter-extension.zip extension
+        # leftover archive can't leak old files into the release.
+        run: rm -f otterbridge-browser-extension.zip && zip -r otterbridge-browser-extension.zip extension
 
       - name: Create GitHub release with the .mcpb and extension zip attached
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "$GITHUB_REF_NAME" otterbridge.mcpb ../otter-extension.zip
+          gh release create "$GITHUB_REF_NAME" otterbridge-browser.mcpb ../otterbridge-browser-extension.zip
           --title "OtterBridge $GITHUB_REF_NAME"
           --generate-notes

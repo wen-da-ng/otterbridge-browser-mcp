@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — 2026-10-28
+
+### Changed
+
+- Release files renamed to say which OtterBridge product they are:
+  `otterbridge-browser.mcpb` (was `otterbridge.mcpb`) and
+  `otterbridge-browser-extension.zip` (was `otter-extension.zip`). Releases
+  up to 0.5.0 keep their old file names.
+
 ## 0.5.0 — 2026-10-28
 
 ### Added

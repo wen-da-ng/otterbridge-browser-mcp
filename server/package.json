@@ -1,6 +1,6 @@
 {
   "name": "otterbridge-browser-mcp",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "OtterBridge - Node/TypeScript MCP server bridging browser actions to the Otter Chrome extension. Supports stdio (desktop MCP hosts / .mcpb) and streamable HTTP (CLI agents / MCP Inspector).",
   "author": "wen-da-ng (OtterBridge)",
   "license": "SEE LICENSE IN ../LICENSE",
@@ -15,7 +15,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "node build.mjs",
-    "pack": "npm run build && node -e \"require('fs').copyFileSync('../LICENSE','LICENSE')\" && npx @anthropic-ai/mcpb pack . otterbridge.mcpb",
+    "pack": "npm run build && node -e \"require('fs').copyFileSync('../LICENSE','LICENSE')\" && npx @anthropic-ai/mcpb pack . otterbridge-browser.mcpb",
     "start": "node dist/index.js",
     "start:stdio": "node dist/index.js --stdio",
     "pretest": "npm run typecheck && npm run build",

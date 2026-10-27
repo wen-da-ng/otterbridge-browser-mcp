@@ -56,14 +56,14 @@ no terminal.
 
 **1 — Download two files** from the
 [latest release](https://github.com/wen-da-ng/otterbridge-browser-mcp/releases/latest):
-`otterbridge.mcpb` and `otter-extension.zip`.
+`otterbridge-browser.mcpb` and `otterbridge-browser-extension.zip`.
 
-**2 — Add the extension to Chrome:** unzip `otter-extension.zip` to a permanent
+**2 — Add the extension to Chrome:** unzip `otterbridge-browser-extension.zip` to a permanent
 spot (e.g. `Documents\Otter` — Chrome keeps loading it from there, so don't
 delete it later). Then open `chrome://extensions`, switch on **Developer mode**
 (top-right), click **Load unpacked**, and pick the unzipped `extension` folder.
 
-**3 — Add the bridge to Claude Desktop:** double-click `otterbridge.mcpb` and
+**3 — Add the bridge to Claude Desktop:** double-click `otterbridge-browser.mcpb` and
 confirm the install. Two safety checkboxes appear — **keep the defaults**.
 
 **4 — Try it:** with Chrome open, ask Claude:
@@ -73,7 +73,7 @@ confirm the install. Two safety checkboxes appear — **keep the defaults**.
 <summary><b>No release download available?</b></summary>
 
 Use the direct copy of
-[`otterbridge.mcpb`](https://github.com/wen-da-ng/otterbridge-browser-mcp/raw/main/server/otterbridge.mcpb),
+[`otterbridge-browser.mcpb`](https://github.com/wen-da-ng/otterbridge-browser-mcp/raw/main/server/otterbridge-browser.mcpb),
 and for the extension click the green **Code** button on the repo page →
 **Download ZIP** (the extension is the `extension` folder inside).
 </details>
@@ -384,11 +384,11 @@ Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
 ```bash
 cd server
 npm ci --ignore-scripts
-npm run pack              # esbuild bundle + LICENSE + mcpb pack → otterbridge.mcpb
+npm run pack              # esbuild bundle + LICENSE + mcpb pack → otterbridge-browser.mcpb
 ```
 
 Releases are automated: pushing a `v*` tag makes CI run the test suite, pack
-`otterbridge.mcpb`, zip the extension, and attach both to a GitHub release.
+`otterbridge-browser.mcpb`, zip the extension, and attach both to a GitHub release.
 </details>
 
 <details>
