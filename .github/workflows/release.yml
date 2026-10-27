@@ -33,7 +33,9 @@ jobs:
 
       - name: Zip the Chrome extension
         working-directory: .
-        run: zip -r otter-extension.zip extension
+        # zip -r UPDATES an existing archive in place; start fresh so a stale
+        # committed otter-extension.zip can't leak old files into the release.
+        run: rm -f otter-extension.zip && zip -r otter-extension.zip extension
 
       - name: Create GitHub release with the .mcpb and extension zip attached
         env:

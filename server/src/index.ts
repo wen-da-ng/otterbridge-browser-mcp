@@ -294,7 +294,7 @@ const CLIENT_NAMES: Record<string, string> = {
 // (elicitation routes back to that session's client), while stdio uses one.
 function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "otterbridge-browser-mcp", version: "0.3.0" },
+    { name: "otterbridge-browser-mcp", version: "0.4.0" },
     {
       instructions:
         "OtterBridge controls the user's real Chrome browser through the Otter " +
