@@ -9,11 +9,14 @@ transports, byte-compatible with the same unchanged Otter Chrome extension:
 - **streamable HTTP** (default, `http://localhost:8000/mcp`) — for Claude Code,
   MCP Inspector, or any HTTP MCP client you start the server for.
 
-Both modes host a bridge the extension connects to, on the first free port in
-`ws://localhost:8765–8774` — so several clients (Claude Code, Claude Desktop,
-background sessions) can each run their own server at once. The extension
-connects to every port in the range. `OTTERBRIDGE_WS_PORT` moves the base of
-the range (the tests use 18765 so a live Chrome never attaches to them).
+Both modes host a bridge the extension connects to, so several clients (Claude
+Code, Claude Desktop, background sessions) can each run their own server at
+once. The first server owns `ws://localhost:8765` and doubles as a registry;
+the others bind their own port in `8766–8774` and register it there, and the
+registry tells the extension which ports to connect to (so it never dials
+empty ports). If the registry's server exits, another takes `8765` over.
+`OTTERBRIDGE_WS_PORT` moves the base port (the tests use 18765 so a live
+Chrome never attaches to them).
 
 > **Claude Desktop CoWork is not supported yet.** CoWork runs its agent in a
 > sandboxed VM that currently fails to connect to locally installed MCP
@@ -62,10 +65,11 @@ npm run start:stdio       # stdio mode
 ```
 
 Tests (`test/`) spawn the built server, stand in for the Chrome extension over
-the WebSocket with canned responses, and drive the real MCP tools — covering all
-9 tools, image content, both gate branches, session isolation, the stdio
-transport, the single-instance `:8765` guard, the env-string parsing the
-`.mcpb` relies on, and the origin/host security guards.
+the WebSocket with canned responses, and drive the real MCP tools — covering
+the tool list and annotations, image content, every approval-gate branch
+(clicks, dialogs, uploads, Full Auto), audit-log redaction, session isolation
+and concurrency, the stdio transport, the port registry and its takeover, the
+env-string parsing the `.mcpb` relies on, and the origin/host security guards.
 
 ## Get the `.mcpb`
 

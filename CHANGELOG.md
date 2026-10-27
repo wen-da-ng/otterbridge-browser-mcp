@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.5.0 — 2026-10-28
+
+### Added
+
+- **Iframes and shadow DOM.** Every tool that reads or acts on a page now sees
+  inside iframes (cross-origin included — payment forms, embedded editors,
+  nested framesets) and shadow DOM (web components). A new in-page library
+  (`extension/page.js`) works out each frame's position on screen, so indices
+  and coordinates stay consistent across frames.
+- **`page_snapshot`**: a compact outline of the page — headings, sections,
+  dialogs, short text and every interactive element with its index, role,
+  state and link target. Far cheaper than a screenshot.
+- **JavaScript dialogs**: `handle_dialog(accept, text?)` answers alert /
+  confirm / prompt / "Leave site?". Chrome doesn't report dialogs to an
+  extension's debugger, so a frozen page is detected instead: an action that
+  opens a dialog returns within ~2 s saying so (it used to hang 30 s), and
+  later calls on that tab fail fast until it's answered. OK on a confirm that
+  reads destructive — or one whose text can't be read — needs approval.
+- **Actions report what changed**: navigation (including a form posted to
+  the same URL), new tabs and popups, dialogs, downloads, or "no visible
+  change" — so the model rarely needs a second call just to check.
+- **`upload_file`** (always asks approval — it sends local files to a site),
+  **`wait_for_download`**, **`save_pdf`**, **`set_viewport`** (e.g. phone
+  emulation).
+- **Input**: `press_key` takes combinations (`Control+A`, `Shift+Tab`,
+  `Control+Shift+P`, F1–F12); `click` / `click_element` take `double: true`;
+  `scroll` can target an element or point (inner panels); `screenshot` can
+  capture one element; `wait_for` can wait for a network response (`url`).
+- **`read_elements`** reports state (disabled, checked, expanded, href,
+  offscreen), lists ARIA menu items and options, and takes `scope`, `query`
+  and `max` (default 300) so big pages don't flood the context.
+- **Fast mode** switch in the extension popup: no cursor glide or typing
+  delays (still real, trusted input).
+- `run_script` steps: `dialog` (accept / dismiss), `double` clicks, and
+  `wait_for` on a network `url`.
+
+### Changed
+
+- **Multi-client discovery**: the first server owns `8765` as a registry;
+  other servers register their own port (`8766–8774`) with it and the
+  extension connects to the ports it's told about — instead of probing all
+  ten ports every 3 s, which filled the extension's error page with refused
+  connections. A surviving server takes `8765` over when the registry exits.
+- **One window per client session, across reconnects**: a stdio server's
+  agent identity comes from its parent process, so `/mcp` reconnects (and
+  extension reloads, now that the registry persists) continue in the same
+  window and tab instead of opening a new window each time.
+- **Clicks never land on an overlay**: an index click first confirms its
+  target is the topmost element at that point; if a cookie banner or modal
+  covers it, the click is aborted with the covering element named.
+- **Subagents**: actions on one tab now run one at a time (parallel calls
+  can't interleave keystrokes or mouse moves), tabs aren't brought to the
+  front while another action runs in the same window, and the instructions
+  tell parallel agents sharing a session to each use their own tab.
+- Popups opened by an agent's page belong to that agent (they used to count
+  as the user's tabs, so they were read-only).
+- The element list is cached per page, so a click no longer re-scans the
+  page four or five times.
+- Full Auto is now shown as a small orange fast-forward mark (▶▶) on the
+  toolbar icon (the "AUTO" text badge was clipped); hovering the icon says
+  "Full Auto is ON".
+
+### Fixed
+
+- Buttons inside web components (e.g. Shoelace) were reported as "covered"
+  by their own component.
+- A tab briefly "loading" because of iframes or ads was reported as a page
+  navigation.
+- Clicks failed outright on tabs where the cursor content script wasn't
+  running (tabs opened before an extension reload, `data:` URLs); the
+  cursor is now cosmetic and the input still happens.
+
+### Security
+
+- The audit log no longer records typed text (`fill_element`, `type_text`,
+  prompt answers) or `evaluate_js` code — only their length.
+- Password fields never report their value (`read_elements`,
+  `page_snapshot`, approval prompts).
+
 ## 0.4.0 — 2026-10-27
 
 ### Added

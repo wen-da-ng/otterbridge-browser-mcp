@@ -3,7 +3,7 @@
   "manifest_version": "0.4",
   "name": "otterbridge-browser-mcp",
   "display_name": "OtterBridge Browser MCP",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Drive your real Chrome browser from any AI agent through the Otter extension.",
   "long_description": "OtterBridge lets AI agents observe and act in your real Chrome browser: read pages, find text, list interactive elements, click, fill forms, pick dropdown options, hover, drag, scroll, navigate, wait for dynamic content, and take viewport or full-page screenshots. It also captures the console and network traffic for web-app debugging. It talks to the companion Otter Chrome extension over a localhost-only WebSocket. Clicks on destructive controls (buy, pay, delete, send, submit, ...) require your approval first, and evaluate_js stays off unless you enable it in the extension options. Everything runs on your machine; no browsing data leaves it.",
   "author": {
@@ -57,7 +57,13 @@
     { "name": "list_tabs", "description": "List this session's tabs." },
     { "name": "get_user_tab", "description": "Get the user's current tab, for read-only tools." },
     { "name": "use_tab", "description": "Set this session's current tab." },
-    { "name": "close_tab", "description": "Close a tab this session opened." }
+    { "name": "close_tab", "description": "Close a tab this session opened." },
+    { "name": "page_snapshot", "description": "Compact outline of the page with element indices (cheaper than a screenshot)." },
+    { "name": "handle_dialog", "description": "Answer a JavaScript alert / confirm / prompt dialog." },
+    { "name": "upload_file", "description": "Attach local files to an upload control (asks for approval)." },
+    { "name": "wait_for_download", "description": "Wait for a download to finish and get its file path." },
+    { "name": "set_viewport", "description": "Emulate another screen size, e.g. a phone." },
+    { "name": "save_pdf", "description": "Save the page as a PDF file." }
   ],
   "user_config": {
     "gate_enabled": {

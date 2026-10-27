@@ -20,8 +20,9 @@
  * Part of the Otter browser-agent project. Author: wen-da-ng (OtterBridge).
  */
 import { randomUUID } from "node:crypto";
-import { appendFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { appendFile, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -65,6 +66,18 @@ const GATE_OFF = ["off", "false", "0", "no"].includes(gateRaw);
 const fallbackRaw = (process.env.BROWSER_AGENT_GATE_FALLBACK ?? "deny").toLowerCase();
 const FALLBACK_ALLOW = ["allow", "true", "1", "yes"].includes(fallbackRaw);
 
+// What gets typed or run is never written to the log or stderr — passwords,
+// card numbers and private messages go through fill_element / type_text, and
+// evaluate_js code can embed secrets. The log keeps the action and its size.
+function redact(params?: Record<string, unknown>): Record<string, unknown> {
+  if (!params) return {};
+  const out = { ...params };
+  for (const k of ["text", "code"]) {
+    if (typeof out[k] === "string") out[k] = `[${(out[k] as string).length} chars]`;
+  }
+  return out;
+}
+
 async function audit(
   action: string,
   params?: Record<string, unknown>,
@@ -73,7 +86,7 @@ async function audit(
   const line = JSON.stringify({
     ts: new Date().toISOString(),
     action,
-    params: params ?? {},
+    params: redact(params),
     note,
   });
   log(`[audit] ${line}`);
@@ -86,17 +99,27 @@ async function audit(
 
 // ===== WebSocket bridge =====
 // Several MCP clients (Claude Code + Claude Desktop, background sessions in
-// other projects, ...) each launch their own server process. Each process binds
-// the first free port in this range; the extension keeps one socket per port,
-// so every server reaches the same browser and none of them fails to start.
-// The extension scans the same range (extension/background.js BRIDGE_PORTS).
-// OTTERBRIDGE_WS_PORT moves the base of the range — tests use one far OUTSIDE
-// it so the user's real extension never attaches to a test server.
+// other projects, ...) each launch their own server process, and all of them
+// must reach the one extension.
+//
+// Discovery: whoever owns the BASE port (8765) is the REGISTRY. Every other
+// server binds its own port in BASE+1..BASE+9 and registers it with the
+// registry (ws://localhost:8765/register?port=N); the registry tells the
+// extension which ports exist ({type:"bridges"}), so the extension only ever
+// dials 8765 plus ports it was told about — never empty ports, whose refused
+// connections Chrome logs as extension errors. If the registry server exits,
+// the others race to take 8765 over and re-register with the winner.
+//
+// OTTERBRIDGE_WS_PORT moves the base — tests use one far OUTSIDE the real
+// range so the user's live extension never attaches to a test server.
 const BASE_PORT = Number(process.env.OTTERBRIDGE_WS_PORT) || 8765;
 const BRIDGE_PORTS = Array.from({ length: 10 }, (_, i) => BASE_PORT + i);
-let bridgePort: number | null = null;
+let bridgePort: number | null = null; // this server's own command port
+let isRegistry = false;
 
 let extSocket: WebSocket | null = null; // the connected extension, if any
+const extSockets = new Set<WebSocket>(); // every extension connection (registry fan-out)
+const registrants = new Map<WebSocket, number>(); // registry: other servers' ports
 interface Pending {
   resolve: (data: WsResponse) => void;
   reject: (err: Error) => void;
@@ -114,8 +137,9 @@ const pending = new Map<string, Pending>();
 // bridge. A web page the user visits can otherwise open ws://localhost:8765 and
 // displace the extension — intercepting agent commands (incl. typed secrets)
 // and feeding back fabricated page data. The extension connects with a
-// `chrome-extension://` Origin; native clients (tests, echo harness) send none.
-// Any http(s) page Origin is rejected.
+// `chrome-extension://` Origin; native clients (tests, echo harness, other
+// OtterBridge servers registering) send none. Any http(s) page Origin is
+// rejected.
 function originAllowed(origin: string | undefined): boolean {
   if (!origin) return true; // non-browser client (no Origin header)
   return origin.startsWith("chrome-extension://");
@@ -145,62 +169,127 @@ function bindBridge(port: number): Promise<WebSocketServer> {
   });
 }
 
+function sendBridges(ws: WebSocket): void {
+  if (!isRegistry || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "bridges", ports: [...new Set(registrants.values())] }));
+}
+const broadcastBridges = () => extSockets.forEach(sendBridges);
+
+// One handler for every listener this server owns (its own port, plus 8765
+// while it is the registry).
+function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): void {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  if (url.pathname === "/register") {
+    // Another OtterBridge server announcing its port. Only ports inside our
+    // range — the registry never points the extension anywhere else.
+    const port = Number(url.searchParams.get("port"));
+    if (!isRegistry || !BRIDGE_PORTS.includes(port) || port === BASE_PORT) {
+      ws.close();
+      return;
+    }
+    registrants.set(ws, port);
+    log(`[bridge] registry: server on :${port} registered`);
+    broadcastBridges();
+    ws.on("close", () => {
+      registrants.delete(ws);
+      broadcastBridges();
+    });
+    ws.on("error", () => {});
+    return;
+  }
+
+  extSocket = ws;
+  extSockets.add(ws);
+  log("[bridge] extension connected");
+  sendBridges(ws);
+  ws.on("message", (raw) => {
+    let data: WsResponse;
+    try {
+      data = JSON.parse(raw.toString());
+    } catch {
+      return; // ignore non-JSON frames
+    }
+    const entry = pending.get(data.id);
+    if (entry) {
+      clearTimeout(entry.timer);
+      pending.delete(data.id);
+      entry.resolve(data);
+    }
+  });
+  ws.on("close", () => {
+    extSockets.delete(ws);
+    if (extSocket === ws) extSocket = [...extSockets].pop() ?? null;
+    // Fail in-flight commands now instead of letting each sit out its timeout.
+    for (const [id, entry] of pending) {
+      if (entry.socket !== ws) continue;
+      clearTimeout(entry.timer);
+      pending.delete(id);
+      entry.reject(new Error("Chrome extension disconnected mid-command."));
+    }
+    log("[bridge] extension disconnected");
+  });
+  ws.on("error", (err) => log(`[bridge] socket error: ${err.message}`));
+}
+
+async function becomeRegistry(): Promise<boolean> {
+  try {
+    const wss = await bindBridge(BASE_PORT);
+    wss.on("connection", onConnection);
+    isRegistry = true;
+    log(`[bridge] registry on ws://localhost:${BASE_PORT}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Non-registry servers: stay registered; when the registry goes away, try to
+// take 8765 over (random delay so survivors don't all collide), else
+// re-register with whoever won.
+function registerWithRegistry(): void {
+  const ws = new WebSocket(`ws://localhost:${BASE_PORT}/register?port=${bridgePort}`);
+  let retried = false;
+  const retry = () => {
+    if (retried) return;
+    retried = true;
+    setTimeout(async () => {
+      if (!(await becomeRegistry())) registerWithRegistry();
+    }, 500 + Math.floor(Math.random() * 1500));
+  };
+  ws.on("close", retry);
+  ws.on("error", retry);
+}
+
 async function startBridge(): Promise<void> {
-  let wss: WebSocketServer | null = null;
   let lastErr: Error | null = null;
   for (const port of BRIDGE_PORTS) {
     try {
-      wss = await bindBridge(port);
+      const wss = await bindBridge(port);
+      wss.on("connection", onConnection);
       bridgePort = port;
       break;
     } catch (e) {
       lastErr = e as Error; // EADDRINUSE: another OtterBridge client owns it
     }
   }
-  if (!wss) {
-    const range = BRIDGE_PORTS.length > 1
-      ? `${BRIDGE_PORTS[0]}-${BRIDGE_PORTS[BRIDGE_PORTS.length - 1]}`
-      : String(BRIDGE_PORTS[0]);
+  if (bridgePort == null) {
+    const range = `${BRIDGE_PORTS[0]}-${BRIDGE_PORTS[BRIDGE_PORTS.length - 1]}`;
     log(`[bridge] FATAL could not bind any ws://localhost:${range}: ${lastErr?.message}`);
     throw lastErr ?? new Error("no bridge port available");
   }
   log(`[bridge] WebSocket listening on ws://localhost:${bridgePort}`);
-
-  wss.on("connection", (ws) => {
-    extSocket = ws;
-    log("[bridge] extension connected");
-    ws.on("message", (raw) => {
-      let data: WsResponse;
-      try {
-        data = JSON.parse(raw.toString());
-      } catch {
-        return; // ignore non-JSON frames
-      }
-      const entry = pending.get(data.id);
-      if (entry) {
-        clearTimeout(entry.timer);
-        pending.delete(data.id);
-        entry.resolve(data);
-      }
-    });
-    ws.on("close", () => {
-      if (extSocket === ws) extSocket = null;
-      // Fail in-flight commands now instead of letting each sit out its timeout.
-      for (const [id, entry] of pending) {
-        if (entry.socket !== ws) continue;
-        clearTimeout(entry.timer);
-        pending.delete(id);
-        entry.reject(new Error("Chrome extension disconnected mid-command."));
-      }
-      log("[bridge] extension disconnected");
-    });
-    ws.on("error", (err) => log(`[bridge] socket error: ${err.message}`));
-  });
+  if (bridgePort === BASE_PORT) {
+    isRegistry = true; // first server: its own port IS the registry
+    log(`[bridge] registry on ws://localhost:${BASE_PORT}`);
+  } else {
+    registerWithRegistry();
+  }
 }
 
-// The extension rescans the port range every few seconds, so a freshly started
-// server can see its first tool call before the extension has attached. Give it
-// a short grace period rather than failing that call outright.
+// A freshly started server is announced to the extension by the registry (or,
+// as the registry itself, waits for the extension's next 3 s reconnect), so its
+// first tool call can arrive before the extension has attached. Give it a
+// short grace period rather than failing that call outright.
 async function waitForExtension(ms = 6000): Promise<WebSocket> {
   const deadline = Date.now() + ms;
   while (!extSocket || extSocket.readyState !== WebSocket.OPEN) {
@@ -279,6 +368,13 @@ async function approved(server: McpServer, message: string): Promise<boolean> {
 }
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
+const hostOf = (url: string) => {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
+};
 
 // One MCP session == one agent == one Chrome window holding one tab group. Each
 // buildServer() call (per HTTP session, or the single stdio session) gets its
@@ -292,32 +388,121 @@ const CLIENT_NAMES: Record<string, string> = {
 // ===== MCP server + tools =====
 // A factory so each streamable-HTTP session gets its own McpServer instance
 // (elicitation routes back to that session's client), while stdio uses one.
-function buildServer(): McpServer {
+function buildServer(stdio = false): McpServer {
   const server = new McpServer(
-    { name: "otterbridge-browser-mcp", version: "0.4.0" },
+    { name: "otterbridge-browser-mcp", version: "0.5.0" },
     {
+      // Surfaced in the client's system prompt — often the ONLY thing the model
+      // reads about this server before deciding whether to use it (clients may
+      // defer tool schemas until searched). So: capability and when-to-use
+      // first, in plain words, then the working method. OtterBridge is a family
+      // of servers for different apps, so say WHICH one this is — "OtterBridge"
+      // alone would be ambiguous when a sibling server is also connected.
       instructions:
-        "OtterBridge controls the user's real Chrome browser through the Otter " +
-        "extension. Observe with read_page / read_elements / screenshot / " +
-        "find_text; act with click_element (preferred) / fill_element / " +
-        "select_option / press_key / navigate / scroll. Use wait_for for " +
-        "dynamic content instead of polling screenshots. Replay a previously " +
-        "completed flow at full speed with run_script (durable selector/text " +
-        "targets + {{placeholder}} vars — record after finishing a flow " +
-        "interactively). Debug web apps with " +
-        "read_console / read_network / get_network_body. This session works " +
-        "in its OWN Chrome window and tab group, created automatically on the " +
-        "first tool call; open_tab adds more tabs to it. Every tool takes an " +
-        "optional 'tab' id, defaulting to this session's current tab. The " +
+        "This is OtterBridge's BROWSER server: it gives you full control of " +
+        "the user's real Google Chrome browser — their own profile, cookies " +
+        "and signed-in sessions. (Other OtterBridge servers, if connected, " +
+        "control other apps; this one is only for Chrome.) You CAN " +
+        "browse the web: open any website, click, type, fill in and submit " +
+        "forms, read pages, take screenshots, and debug web apps. Use these " +
+        "tools whenever a task involves a website or web app, including pages " +
+        "behind a login that a plain web fetch can't reach.\n\n" +
+        "This session gets its own Chrome window and tab group, opened " +
+        "automatically on the first tool call (open_tab adds more tabs). The " +
         "user's own tabs are read-only: get_user_tab returns the tab they are " +
-        "looking at, for read_page / read_elements / find_text / screenshot. " +
-        "Built by wen-da-ng.",
+        "looking at, for read_page / read_elements / find_text / wait_for / " +
+        "screenshot. If several agents share this session (e.g. subagents " +
+        "working in parallel), each must open_tab its OWN tab and pass that " +
+        "tab id on every call — otherwise they all act on one shared tab.\n\n" +
+        "Method: observe with page_snapshot (a compact outline of the page " +
+        "with element indices — cheaper than a screenshot), read_page or " +
+        "screenshot; act by element index with click_element / fill_element / " +
+        "select_option (more reliable than click(x, y)). Actions report what " +
+        "changed (navigation, new tab, dialog), so you rarely need to re-read " +
+        "just to check. Call wait_for after anything that loads content. If a " +
+        "result mentions a JavaScript dialog, answer it with handle_dialog. " +
+        "To repeat a flow already done once, replay it in one " +
+        "call with run_script. Debug web apps with read_console, read_network, " +
+        "get_network_body and evaluate_js.\n\n" +
+        "Clicks on controls like buy, pay, delete, send or submit, and " +
+        "evaluate_js, ask the user for approval unless they switched on Full " +
+        "Auto in the extension. If the user denies one, stop and ask them — " +
+        "don't look for another way to do it.",
     },
   );
 
+  // Tool titles + MCP annotations, kept in one table so the risk profile of
+  // all 28 tools reads at a glance. These change client BEHAVIOUR, not just
+  // display: Claude Code runs readOnlyHint tools in parallel and retries
+  // idempotentHint tools after a dropped connection — so anything that moves
+  // the page or session state must not claim either.
+  //   ro = readOnlyHint, destructive = destructiveHint (may do something hard
+  //   to undo: submit, buy, delete...), world = openWorldHint (touches the web).
+  type Meta = { title: string; ro?: boolean; destructive?: boolean; idem?: boolean; world?: boolean };
+  const META: Record<string, Meta> = {
+    navigate: { title: "Open URL", idem: true, world: true },
+    go_back: { title: "Go back", world: true },
+    go_forward: { title: "Go forward", world: true },
+    reload: { title: "Reload page", world: true },
+    read_page: { title: "Read page text", ro: true, idem: true, world: true },
+    read_elements: { title: "List page elements", ro: true, idem: true, world: true },
+    click: { title: "Click at coordinates", destructive: true, world: true },
+    click_element: { title: "Click element", destructive: true, world: true },
+    fill_element: { title: "Fill form field", destructive: true, world: true },
+    select_option: { title: "Choose dropdown option", destructive: true, world: true },
+    hover: { title: "Hover", world: true },
+    drag: { title: "Drag", destructive: true, world: true },
+    find_text: { title: "Find text on page", world: true }, // scrolls by default
+    wait_for: { title: "Wait for content", ro: true, idem: true, world: true },
+    type_text: { title: "Type text", destructive: true, world: true },
+    press_key: { title: "Press key", destructive: true, world: true },
+    scroll: { title: "Scroll page", world: true },
+    screenshot: { title: "Screenshot", ro: true, idem: true, world: true },
+    read_console: { title: "Read console", ro: true, world: true },
+    read_network: { title: "Read network requests", ro: true, world: true },
+    get_network_body: { title: "Get response body", ro: true, idem: true, world: true },
+    evaluate_js: { title: "Run JavaScript", destructive: true, world: true },
+    run_script: { title: "Replay browser flow", destructive: true, world: true },
+    open_tab: { title: "Open tab", world: true },
+    list_tabs: { title: "List session tabs", ro: true, idem: true },
+    get_user_tab: { title: "Get user's tab", ro: true, idem: true },
+    use_tab: { title: "Switch session tab", idem: true }, // not ro: would race parallel calls
+    close_tab: { title: "Close tab", destructive: true, idem: true },
+    page_snapshot: { title: "Page outline", ro: true, idem: true, world: true },
+    handle_dialog: { title: "Answer dialog", destructive: true, world: true },
+    upload_file: { title: "Upload file", destructive: true, world: true },
+    wait_for_download: { title: "Wait for download", ro: true },
+    set_viewport: { title: "Set viewport size", idem: true },
+    save_pdf: { title: "Save page as PDF", world: true },
+  };
+  // registerTool, with each tool's title + annotations filled in from META.
+  const tool = ((name: string, config: Record<string, unknown>, cb: unknown) => {
+    const m = META[name];
+    return server.registerTool(
+      name,
+      {
+        ...config,
+        title: m.title,
+        annotations: {
+          title: m.title,
+          readOnlyHint: m.ro ?? false,
+          destructiveHint: m.destructive ?? false,
+          idempotentHint: m.idem ?? false,
+          openWorldHint: m.world ?? false,
+        },
+      },
+      cb as never,
+    );
+  }) as typeof server.registerTool;
+
   // Per-session identity + owned-tab state. Every command carries agentId so
   // the extension can confine actions to this session's own window/group.
-  const agentId = randomUUID().slice(0, 8);
+  // stdio: one server process per client session, launched by that client —
+  // so the PARENT process (the Claude Code / Claude Desktop instance) is the
+  // identity. A /mcp reconnect starts a new server under the same parent and
+  // must find the same window again, not open another. HTTP: many sessions
+  // share this process, so each gets a random id.
+  const agentId = stdio ? `p${process.ppid}` : randomUUID().slice(0, 8);
   const clientName = () => {
     const n = server.server.getClientVersion()?.name;
     return n ? (CLIENT_NAMES[n] ?? n) : undefined;
@@ -328,15 +513,17 @@ function buildServer(): McpServer {
   // places it in the session's own window + group. With no current tab, the
   // first tool call opens one rather than falling back to whatever tab the
   // user happens to have active.
-  const openSessionTab = async (url?: string) => {
-    const info = await sendCmd("open_tab", { agentId, clientName: clientName(), url });
+  // reuse: pick up the window's current tab if the session already has a
+  // window (e.g. after a reconnect) instead of opening yet another tab.
+  const openSessionTab = async (url?: string, reuse = false) => {
+    const info = await sendCmd("open_tab", { agentId, clientName: clientName(), url, reuse });
     sess.currentTab = info.tabId;
     return info;
   };
   let opening: Promise<number> | null = null; // dedupes concurrent first calls
   const ensureTab = async (): Promise<number> => {
     if (sess.currentTab != null) return sess.currentTab;
-    opening ??= openSessionTab()
+    opening ??= openSessionTab(undefined, true)
       .then((i) => i.tabId as number)
       .finally(() => {
         opening = null;
@@ -378,6 +565,16 @@ function buildServer(): McpServer {
         "Target tab id (from open_tab/list_tabs). Omit to use this session's current tab (opened automatically in the session's own window).",
       ),
   };
+  const BUTTON = {
+    button: z
+      .enum(["left", "right"])
+      .optional()
+      .describe("Mouse button: 'left' (default) or 'right' for a right-click / context menu."),
+    double: z
+      .boolean()
+      .optional()
+      .describe("Double-click (left button) — e.g. to edit a spreadsheet cell or open a file."),
+  };
   // Read-only tools may also target the user's own tab via get_user_tab.
   const READ_TAB = {
     tab: z
@@ -396,16 +593,28 @@ function buildServer(): McpServer {
   // element that is actually there now — the gate can never approve one element
   // while a reflow swaps in another. Fail-safe: a target that keeps changing is
   // aborted rather than pressed. Used by both click and click_element.
+  //
+  // Right-clicks skip the danger check: they only OPEN a context menu, and the
+  // committing step — picking "Delete" from that menu — is a left click that
+  // gets gated as usual. (Gating them would prompt on every right-click of a
+  // file named "Order 123".) The identity guard still applies.
+  type ClickOpts = {
+    fast?: boolean;
+    background?: boolean;
+    button?: "left" | "right";
+    double?: boolean;
+    noReport?: boolean; // run_script: no "what changed" settle per step
+  };
   const gatedClick = async (
     tab: number | undefined,
     target: { index?: number; x?: number; y?: number },
     initialText: string,
-    fast = false,
-    background = false,
+    opts: ClickOpts = {},
   ): Promise<string> => {
+    const button = opts.button ?? "left";
     let expectText = initialText ?? "";
     for (let attempt = 0; attempt < 4; attempt++) {
-      if (DANGER_RE.test(expectText)) {
+      if (button === "left" && DANGER_RE.test(expectText)) {
         const label =
           expectText.trim().slice(0, 60) ||
           (target.index != null ? `element ${target.index}` : `(${target.x}, ${target.y})`);
@@ -413,7 +622,24 @@ function buildServer(): McpServer {
           return `Action denied by user: click on '${label}'.`;
         }
       }
-      const res = await act("click", tab, { ...target, expectText, fast, background });
+      const res = await act("click", tab, {
+        ...target,
+        expectText,
+        fast: opts.fast ?? false,
+        background: opts.background ?? false,
+        button,
+        double: opts.double ?? false,
+        noReport: opts.noReport ?? false,
+      });
+      if (res && typeof res === "object" && res.covered) {
+        // Something sits on top of the target (cookie banner, modal, overlay):
+        // a click would hit THAT instead. Never press it; say what's in the way.
+        await audit("click", target as Record<string, unknown>, `target covered by '${res.actualText}'`);
+        return (
+          `Click aborted: the target is covered by '${res.actualText || "another element"}' ` +
+          `(an overlay, banner or dialog?). Close that first, then re-read the page.`
+        );
+      }
       if (res && typeof res === "object" && res.changed) {
         // The element under the pointer changed after the gate decision. Never
         // press an ungated target — re-gate whatever is actually there now.
@@ -434,37 +660,67 @@ function buildServer(): McpServer {
     return "Click aborted: the target element kept changing under the pointer. Re-read elements and retry.";
   };
 
-  server.registerTool(
+  // Answer a JS dialog. Saying OK to a confirm that reads destructive ("Delete
+  // 3 files?", "Send payment?") is the same commitment as clicking a "Delete"
+  // button, so it goes through the same gate.
+  const answerDialog = async (
+    tab: number | undefined,
+    accept: boolean,
+    promptText?: string,
+  ): Promise<string> => {
+    const info = await act("dialog_info", tab);
+    // No record of a dialog doesn't prove there's none (Chrome may not have
+    // reported it). Answer anyway; Chrome says if nothing is showing. An
+    // unread dialog can't be checked for danger words, so OK needs approval.
+    if (!info || !info.open) {
+      if (accept && !(await approved(server, "Approve answering OK to a JavaScript dialog whose text couldn't be read?"))) {
+        return "Action denied by user: accepting an unread dialog.";
+      }
+      return act("handle_dialog", tab, { accept, text: promptText });
+    }
+    if (accept && info.type !== "alert" && DANGER_RE.test(info.message ?? "")) {
+      const msg = String(info.message).slice(0, 200);
+      if (!(await approved(server, `Approve answering OK to this ${info.type} dialog?\n\n"${msg}"`))) {
+        return `Action denied by user: accepting the ${info.type} dialog.`;
+      }
+    }
+    return act("handle_dialog", tab, { accept, text: promptText });
+  };
+
+  tool(
     "navigate",
     {
-      description: "Navigate a browser tab to a URL and wait for load.",
+      description:
+        "Open a URL in a Chrome browser tab (this session's tab by default) and " +
+        "wait for the page to load. Works for any website, including ones the " +
+        "user is signed in to.",
       inputSchema: { url: z.string(), ...TAB },
     },
     async ({ url, tab }) => text(await act("navigate", tab, { url })),
   );
 
-  server.registerTool(
+  tool(
     "go_back",
     {
-      description: "Go back one step in the tab's history (like the Back button).",
+      description: "Go back one page in a Chrome tab's history, like the browser's Back button.",
       inputSchema: { ...TAB },
     },
     async ({ tab }) => text(await act("go_back", tab)),
   );
 
-  server.registerTool(
+  tool(
     "go_forward",
     {
-      description: "Go forward one step in the tab's history.",
+      description: "Go forward one page in a Chrome tab's history, like the browser's Forward button.",
       inputSchema: { ...TAB },
     },
     async ({ tab }) => text(await act("go_forward", tab)),
   );
 
-  server.registerTool(
+  tool(
     "reload",
     {
-      description: "Reload the tab. Set hard=true to bypass the HTTP cache.",
+      description: "Reload the web page in a Chrome tab. Set hard=true to bypass the HTTP cache.",
       inputSchema: {
         hard: z.boolean().optional().describe("Bypass the cache (like Ctrl+Shift+R)."),
         ...TAB,
@@ -473,11 +729,12 @@ function buildServer(): McpServer {
     async ({ hard, tab }) => text(await act("reload", tab, { hard })),
   );
 
-  server.registerTool(
+  tool(
     "read_page",
     {
       description:
-        "Read a tab: URL, title, and visible text. Long pages paginate: the " +
+        "Read the web page in a Chrome tab: URL, title and visible text. Long " +
+        "pages paginate: the " +
         "result carries total_chars; pass offset to read the next chunk.",
       inputSchema: {
         offset: z
@@ -500,27 +757,45 @@ function buildServer(): McpServer {
       text(JSON.stringify(await act("read_page", tab, { offset, maxChars: max_chars }))),
   );
 
-  server.registerTool(
+  tool(
     "read_elements",
     {
       description:
-        "List interactive elements on the page as numbered entries with center " +
-        "coordinates. Use the coordinates with the click tool.",
-      inputSchema: { ...READ_TAB },
+        "List the interactive elements of the web page in a Chrome tab — links, " +
+        "buttons, inputs, dropdowns, clickable divs — as numbered entries with " +
+        "their text and center coordinates. Pass an entry's index to " +
+        "click_element, fill_element or select_option. Covers iframes and " +
+        "shadow DOM. Entries carry state when relevant (disabled, checked, " +
+        "expanded, href, offscreen). For a readable overview with headings " +
+        "and text, page_snapshot is usually better.",
+      inputSchema: {
+        scope: z
+          .enum(["page", "viewport"])
+          .optional()
+          .describe("'page' (default) lists everything; 'viewport' only what's on screen."),
+        query: z.string().optional().describe("Only elements whose text or link contains this."),
+        max: z.number().int().min(1).max(2000).optional().describe("Max entries (default 300)."),
+        ...READ_TAB,
+      },
     },
-    async ({ tab }) => text(JSON.stringify(await act("read_elements", tab))),
+    async ({ scope, query, max, tab }) =>
+      text(JSON.stringify(await act("read_elements", tab, { scope, query, max }))),
   );
 
-  server.registerTool(
+  tool(
     "click",
     {
       description:
-        "Move the cursor with a human-like animation to viewport coordinates " +
-        "(x, y) and click there. Destructive targets (buy, pay, delete, send, " +
-        "submit, ...) require human approval before dispatch.",
-      inputSchema: { x: z.number().int(), y: z.number().int(), ...TAB },
+        "Click on the web page in a Chrome tab at viewport coordinates (x, y), " +
+        "gliding the visible cursor there first. Prefer click_element; use " +
+        "this for targets read_elements doesn't list (canvas, maps). Set " +
+        "button='right' to right-click (opens the page's context menu), " +
+        "double=true to double-click. " +
+        "Destructive targets (buy, pay, delete, send, submit, ...) require " +
+        "human approval before a left click.",
+      inputSchema: { x: z.number().int(), y: z.number().int(), ...BUTTON, ...TAB },
     },
-    async ({ x, y, tab }) => {
+    async ({ x, y, button, double, tab }) => {
       // Hit-test the actual element at (x, y) so the gate works for every
       // click - vision-mode, read_elements, or raw coordinates alike.
       let targetText = "";
@@ -530,21 +805,27 @@ function buildServer(): McpServer {
       } catch (e) {
         await audit("hit_test", { x, y }, `failed (${(e as Error).message}); proceeding`);
       }
-      return text(await gatedClick(tab, { x, y }, targetText));
+      return text(await gatedClick(tab, { x, y }, targetText, { button, double }));
     },
   );
 
-  server.registerTool(
+  tool(
     "click_element",
     {
       description:
-        "Click the interactive element with the given index from read_elements.\n\n" +
+        "Click an element on the web page (link, button, ...) by its index from " +
+        "read_elements.\n\n" +
         "PREFERRED over click(x, y): the coordinate is resolved inside the page, " +
         "so it can't drift through screenshot scaling. Call read_elements first " +
-        "to get indices, then click_element(index).",
-      inputSchema: { index: z.number().int(), ...TAB },
+        "to get indices, then click_element(index). Set button='right' to " +
+        "right-click the element (opens the page's context menu, e.g. file or " +
+        "row actions in web apps). Then find the menu items with read_elements " +
+        "(lists standard ARIA menus) or find_text / screenshot (custom menus " +
+        "built from plain list items), and click the one you need. " +
+        "double=true double-clicks.",
+      inputSchema: { index: z.number().int(), ...BUTTON, ...TAB },
     },
-    async ({ index, tab }) => {
+    async ({ index, button, double, tab }) => {
       const info = await act("locate_element", tab, { index });
       if (!info || !info.found) {
         return text(
@@ -555,17 +836,18 @@ function buildServer(): McpServer {
       // gatedClick passes the index through to the extension, which re-resolves
       // the live position right before pressing (immune to reflow during the
       // cursor animation) and re-gates via `expectText` if it changed.
-      return text(await gatedClick(tab, { index }, info.text ?? ""));
+      return text(await gatedClick(tab, { index }, info.text ?? "", { button, double }));
     },
   );
 
-  server.registerTool(
+  tool(
     "fill_element",
     {
       description:
-        "Focus the interactive element with the given read_elements index, " +
-        "select its current content, and type the text over it with human-like " +
-        "keystrokes. Empty text clears the field.\n\n" +
+        "Fill a form field on the web page (input, textarea, editable area): " +
+        "focus the field with the given read_elements index, select its current " +
+        "content, and type the text over it with real keystrokes. Empty text " +
+        "clears the field.\n\n" +
         "PREFERRED over click + type_text for form inputs: focusing and " +
         "clearing are atomic, so the text can't land in the wrong field.",
       inputSchema: {
@@ -578,11 +860,11 @@ function buildServer(): McpServer {
       text(await act("fill_element", tab, { index, text: t })),
   );
 
-  server.registerTool(
+  tool(
     "select_option",
     {
       description:
-        "Pick an option in a native <select> dropdown by value or visible " +
+        "Pick an option in a native <select> dropdown on the web page by value or visible " +
         "label (native dropdowns can't be driven by clicks). On no match, the " +
         "error lists the available options.",
       inputSchema: {
@@ -600,11 +882,11 @@ function buildServer(): McpServer {
     },
   );
 
-  server.registerTool(
+  tool(
     "hover",
     {
       description:
-        "Move the cursor to an element (by read_elements index) or to viewport " +
+        "Hover the mouse over an element of the web page (by read_elements index) or viewport " +
         "coordinates and hover there — triggers :hover styles, tooltips, and " +
         "hover-opened menus. Prefer index over raw coordinates.",
       inputSchema: {
@@ -622,11 +904,11 @@ function buildServer(): McpServer {
     },
   );
 
-  server.registerTool(
+  tool(
     "drag",
     {
       description:
-        "Press the mouse at (from_x, from_y), glide to (to_x, to_y) with the " +
+        "Drag on the web page: press the mouse at (from_x, from_y), glide to (to_x, to_y) with the " +
         "button held, and release — for sliders, sortable lists, canvas tools. " +
         "(HTML5 draggable=\"true\" native drag-and-drop may not respond to " +
         "synthetic events.)",
@@ -642,11 +924,11 @@ function buildServer(): McpServer {
       text(await act("drag", tab, { fromX: from_x, fromY: from_y, toX: to_x, toY: to_y })),
   );
 
-  server.registerTool(
+  tool(
     "find_text",
     {
       description:
-        "Search the page's visible text (case-insensitive) and return up to 50 " +
+        "Search the visible text of the web page in a Chrome tab (case-insensitive) and return up to 50 " +
         "matches with center coordinates and surrounding context. By default " +
         "scrolls the first match into view — coordinates are post-scroll, so " +
         "they can be clicked directly.",
@@ -669,16 +951,20 @@ function buildServer(): McpServer {
       text(JSON.stringify(await act("find_text", tab, { query, nth, scroll }))),
   );
 
-  server.registerTool(
+  tool(
     "wait_for",
     {
       description:
-        "Wait until the page contains the given text (case-insensitive) and/or " +
-        "an element matching the CSS selector appears. Use after actions that " +
-        "load content dynamically instead of polling with screenshots.",
+        "Wait until the web page in a Chrome tab contains the given text (case-insensitive) and/or " +
+        "an element matching the CSS selector appears (iframes and shadow DOM " +
+        "included), and/or a network response whose URL contains 'url' " +
+        "arrives (counted from the last action in the tab, e.g. 'wait for the " +
+        "save request'). Use after actions that load content dynamically " +
+        "instead of polling with screenshots.",
       inputSchema: {
         text: z.string().optional().describe("Visible text to wait for."),
         selector: z.string().optional().describe("CSS selector to wait for."),
+        url: z.string().optional().describe("Substring of a network request URL whose response to wait for."),
         timeout_ms: z
           .number()
           .int()
@@ -689,52 +975,71 @@ function buildServer(): McpServer {
         ...READ_TAB,
       },
     },
-    async ({ text: t, selector, timeout_ms, tab }) => {
-      if (t == null && selector == null) {
-        return text("Provide 'text' and/or 'selector' to wait for.");
+    async ({ text: t, selector, url, timeout_ms, tab }) => {
+      if (t == null && selector == null && url == null) {
+        return text("Provide 'text', 'selector' and/or 'url' to wait for.");
       }
       const result = await act(
         "wait_for",
         tab,
-        { text: t, selector, timeoutMs: timeout_ms },
+        { text: t, selector, url, timeoutMs: timeout_ms },
         (timeout_ms ?? 10000) + 15000, // bridge timeout must outlast the poll
       );
       return text(JSON.stringify(result));
     },
   );
 
-  server.registerTool(
+  tool(
     "type_text",
     {
-      description: "Type text into the currently focused element.",
+      description:
+        "Type text into whatever is focused on the web page, with real " +
+        "keystrokes. For form fields prefer fill_element, which focuses the " +
+        "right field first.",
       inputSchema: { text: z.string(), ...TAB },
     },
     async ({ text: t, tab }) => text(await act("type_text", tab, { text: t })),
   );
 
-  server.registerTool(
+  tool(
     "press_key",
     {
-      description: "Press a keyboard key, e.g. 'Enter', 'Tab', 'Escape'.",
+      description:
+        "Press a key or shortcut in a Chrome tab: 'Enter' (submit), 'Tab', " +
+        "'Escape', 'ArrowDown', 'PageDown', 'Backspace', 'F5', a character like " +
+        "'a', or a combination joined with '+': 'Control+A', 'Shift+Tab', " +
+        "'Control+Enter', 'Control+Shift+P', 'Meta+K'.",
       inputSchema: { key: z.string(), ...TAB },
     },
     async ({ key, tab }) => text(await act("press_key", tab, { key })),
   );
 
-  server.registerTool(
+  tool(
     "scroll",
     {
-      description: "Scroll the page vertically. Positive = down, negative = up.",
-      inputSchema: { delta_y: z.number().int().default(600), ...TAB },
+      description:
+        "Scroll the web page in a Chrome tab vertically. Positive = down, " +
+        "negative = up. To scroll an inner panel (sidebar, modal, list), pass " +
+        "the index of an element inside it, or x/y over it; otherwise the " +
+        "wheel turns in the middle of the viewport.",
+      inputSchema: {
+        delta_y: z.number().int().default(600),
+        index: z.number().int().optional().describe("read_elements index of an element inside the panel to scroll."),
+        x: z.number().int().optional().describe("Viewport x to scroll at."),
+        y: z.number().int().optional().describe("Viewport y to scroll at."),
+        ...TAB,
+      },
     },
-    async ({ delta_y, tab }) => text(await act("scroll", tab, { deltaY: delta_y })),
+    async ({ delta_y, index, x, y, tab }) =>
+      text(await act("scroll", tab, { deltaY: delta_y, index, x, y })),
   );
 
-  server.registerTool(
+  tool(
     "screenshot",
     {
       description:
-        "Capture the visible viewport as an image you can see.\n\n" +
+        "Take a screenshot of the web page in a Chrome tab (visible area, or the " +
+        "full page) as an image you can see.\n\n" +
         "Use screenshots to understand the page and decide WHAT to act on, then " +
         "click via read_elements + click_element(index) for pixel-accurate " +
         "clicks. (Coordinates eyeballed off an image can drift; index-based " +
@@ -746,11 +1051,16 @@ function buildServer(): McpServer {
           .describe(
             "Capture the whole page height (capped at 8000px), not just the viewport. Not available on the user's tab.",
           ),
+        index: z
+          .number()
+          .int()
+          .optional()
+          .describe("Capture just this element (read_elements index), scrolled into view."),
         ...READ_TAB,
       },
     },
-    async ({ full_page, tab }) => {
-      const result = await act("screenshot", tab, { fullPage: full_page });
+    async ({ full_page, index, tab }) => {
+      const result = await act("screenshot", tab, { fullPage: full_page, index });
       await audit(
         "screenshot",
         undefined,
@@ -771,11 +1081,11 @@ function buildServer(): McpServer {
   );
 
   // ===== Web-dev debugging (CDP capture) =====
-  server.registerTool(
+  tool(
     "read_console",
     {
       description:
-        "Read the tab's captured console output: console.* calls, uncaught " +
+        "Read the browser console of a Chrome tab: console.* calls, uncaught " +
         "exceptions, and browser log entries (newest last, 500-entry ring " +
         "buffer). Capture starts when the tab first gets CDP attention " +
         "(open_tab attaches immediately); reload the tab to capture a full " +
@@ -800,11 +1110,11 @@ function buildServer(): McpServer {
       text(JSON.stringify(await act("read_console", tab, { level, limit, clear }))),
   );
 
-  server.registerTool(
+  tool(
     "read_network",
     {
       description:
-        "List the tab's captured network requests (URL, method, status, type, " +
+        "List the network requests a Chrome tab has made (URL, method, status, type, " +
         "size; newest last, 300-entry ring buffer). Use get_network_body with " +
         "a requestId to fetch a response body. Capture starts when the tab " +
         "first gets CDP attention; reload the tab to capture a full page load.",
@@ -828,7 +1138,7 @@ function buildServer(): McpServer {
       text(JSON.stringify(await act("read_network", tab, { filter, limit, clear }))),
   );
 
-  server.registerTool(
+  tool(
     "get_network_body",
     {
       description:
@@ -845,11 +1155,11 @@ function buildServer(): McpServer {
       text(JSON.stringify(await act("get_network_body", tab, { requestId: request_id }))),
   );
 
-  server.registerTool(
+  tool(
     "evaluate_js",
     {
       description:
-        "Run a JavaScript expression in the page and return its result " +
+        "Run a JavaScript expression in the web page in a Chrome tab and return its result " +
         "(promises are awaited, result JSON-serialized). Doubly gated: the " +
         "Otter extension options must enable it, AND every call asks the user " +
         "for approval (unless the user switched the extension to Full Auto).",
@@ -882,17 +1192,20 @@ function buildServer(): McpServer {
     nth: z.number().int().min(0).optional().describe("Which match to use when several remain (default 0)."),
   });
   const Step = z.object({
-    action: z.enum(["navigate", "click", "fill", "select", "type_text", "press_key", "scroll", "wait_for", "drag"]),
-    url: z.string().optional().describe("navigate: URL to load."),
+    action: z.enum(["navigate", "click", "fill", "select", "type_text", "press_key", "scroll", "wait_for", "drag", "dialog"]),
+    url: z.string().optional().describe("navigate: URL to load. wait_for: substring of a network request URL whose response to wait for."),
     target: StepTarget.optional().describe("click / fill / select: which element."),
     x: z.number().int().optional().describe("click: viewport x when no durable target exists (LAST resort — coordinates break on layout changes)."),
     y: z.number().int().optional().describe("click: viewport y when no durable target exists."),
+    button: z.enum(["left", "right"]).optional().describe("click: 'right' for a right-click (context menu). Default 'left'."),
+    double: z.boolean().optional().describe("click: double-click."),
+    accept: z.boolean().optional().describe("dialog: true = OK / Leave, false = Cancel."),
     from_x: z.number().int().optional().describe("drag: start x."),
     from_y: z.number().int().optional().describe("drag: start y."),
     to_x: z.number().int().optional().describe("drag: end x."),
     to_y: z.number().int().optional().describe("drag: end y."),
-    text: z.string().optional().describe("fill / type_text: text to type. wait_for: page text to wait for."),
-    key: z.string().optional().describe("press_key: key name, e.g. 'Enter', 'Tab', 'Escape'."),
+    text: z.string().optional().describe("fill / type_text: text to type. wait_for: page text to wait for. dialog: answer for a prompt()."),
+    key: z.string().optional().describe("press_key: key or combination, e.g. 'Enter', 'Tab', 'Control+A'."),
     value: z.string().optional().describe("select: option value attribute."),
     label: z.string().optional().describe("select: option visible label."),
     delta_y: z.number().int().optional().describe("scroll: pixels (positive = down)."),
@@ -902,7 +1215,7 @@ function buildServer(): McpServer {
     optional: z.boolean().optional().describe("Continue with the next step even if this one fails."),
   });
 
-  server.registerTool(
+  tool(
     "run_script",
     {
       description:
@@ -985,7 +1298,7 @@ function buildServer(): McpServer {
       // Every dispatched command carries the background flag so the extension
       // never activates the tab mid-script.
       const ap = (action: string, params: Record<string, unknown>, timeoutMs?: number) =>
-        act(action, tab, { ...params, background: bg }, timeoutMs);
+        act(action, tab, { ...params, background: bg, noReport: true }, timeoutMs);
 
       // Implicit wait on element resolution (Selenium's implicit-wait
       // semantics). Single-page apps routinely satisfy a wait_for on a
@@ -1031,12 +1344,12 @@ function buildServer(): McpServer {
               break;
             }
             case "wait_for": {
-              if (st.text == null && st.selector == null) {
-                throw new Error("wait_for needs 'text' and/or 'selector'.");
+              if (st.text == null && st.selector == null && st.url == null) {
+                throw new Error("wait_for needs 'text', 'selector' and/or 'url'.");
               }
               const r = await ap(
                 "wait_for",
-                { text: st.text, selector: st.selector, timeoutMs: st.timeout_ms },
+                { text: st.text, selector: st.selector, url: st.url, timeoutMs: st.timeout_ms },
                 (st.timeout_ms ?? 10000) + 15000,
               );
               if (!r.found) throw new Error(`wait_for timed out after ${r.elapsed_ms}ms.`);
@@ -1065,7 +1378,9 @@ function buildServer(): McpServer {
                   const hit = await ap("hit_test", { x: st.x, y: st.y });
                   targetText = (hit?.text as string) ?? "";
                 } catch (_) { /* proceed ungated-texted; gatedClick re-checks */ }
-                const r = await gatedClick(tab, { x: st.x, y: st.y }, targetText, speed, bg);
+                const r = await gatedClick(tab, { x: st.x, y: st.y }, targetText, {
+                  fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
+                });
                 if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
                 out = r;
                 break;
@@ -1081,7 +1396,9 @@ function buildServer(): McpServer {
                 );
               }
               if (st.action === "click") {
-                const r = await gatedClick(tab, { index: el.index }, el.text ?? "", speed, bg);
+                const r = await gatedClick(tab, { index: el.index }, el.text ?? "", {
+                  fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
+                });
                 if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
                 out = r;
               } else if (st.action === "fill") {
@@ -1113,6 +1430,12 @@ function buildServer(): McpServer {
             }
             case "scroll": {
               out = await ap("scroll", { deltaY: st.delta_y });
+              break;
+            }
+            case "dialog": {
+              if (st.accept == null) throw new Error("dialog needs 'accept' (true = OK, false = Cancel).");
+              out = await answerDialog(tab, st.accept, st.text);
+              if (/^(Action denied|No JavaScript dialog)/.test(out as string)) throw new Error(out as string);
               break;
             }
           }
@@ -1154,14 +1477,185 @@ function buildServer(): McpServer {
     },
   );
 
+  // ===== Page outline, dialogs, files, emulation =====
+  tool(
+    "page_snapshot",
+    {
+      description:
+        "Get a compact, structured outline of the web page in a Chrome tab: " +
+        "headings, sections and dialogs, short text blocks, and every " +
+        "interactive element with its index [n], role, state (checked, " +
+        "disabled, value) and link target. Covers iframes and shadow DOM. " +
+        "Usually the best way to look at a page — far cheaper than a " +
+        "screenshot, and the [n] indices work directly with click_element / " +
+        "fill_element / select_option. Shows what's on screen by default; " +
+        "scope='page' covers the whole page.",
+      inputSchema: {
+        scope: z
+          .enum(["viewport", "page"])
+          .optional()
+          .describe("'viewport' (default): what's on screen. 'page': everything."),
+        max_lines: z.number().int().min(20).max(2000).optional().describe("Max lines (default 250)."),
+        ...READ_TAB,
+      },
+    },
+    async ({ scope, max_lines, tab }) =>
+      text(await act("page_snapshot", tab, { scope, maxLines: max_lines })),
+  );
+
+  tool(
+    "handle_dialog",
+    {
+      description:
+        "Answer the JavaScript dialog (alert, confirm, prompt, or 'Leave " +
+        "site?') that is blocking a Chrome tab — the page is frozen until " +
+        "it's answered. accept=true presses OK / Leave, false presses Cancel; " +
+        "text answers a prompt(). Saying OK to a confirm that looks " +
+        "destructive ('Delete 3 files?') needs the user's approval, like a " +
+        "destructive click.",
+      inputSchema: {
+        accept: z.boolean().describe("true = OK / Leave, false = Cancel."),
+        text: z.string().optional().describe("Answer for a prompt() dialog."),
+        ...TAB,
+      },
+    },
+    async ({ accept, text: t, tab }) => text(await answerDialog(tab, accept, t)),
+  );
+
+  tool(
+    "upload_file",
+    {
+      description:
+        "Attach local files to a file-upload control on the web page in a " +
+        "Chrome tab — no file dialog involved. Pass the read_elements index " +
+        "of the upload button/area (or the file input itself), or a CSS " +
+        "selector; with neither, the page's only file input is used. Paths " +
+        "must be absolute paths on this computer. Always asks the user for " +
+        "approval first, since it sends their files to the website (unless " +
+        "they switched on Full Auto).",
+      inputSchema: {
+        files: z.array(z.string()).min(1).describe("Absolute paths of the files to upload."),
+        index: z.number().int().optional().describe("read_elements index of the upload control."),
+        selector: z.string().optional().describe("CSS selector of the file input."),
+        ...TAB,
+      },
+    },
+    async ({ files, index, selector, tab }) => {
+      for (const f of files) {
+        if (!isAbsolute(f)) return text(`'${f}' isn't an absolute path.`);
+        try {
+          if (!(await stat(f)).isFile()) return text(`'${f}' isn't a file.`);
+        } catch {
+          return text(`File not found: ${f}`);
+        }
+      }
+      // Locate the input first, so the approval names the actual website.
+      const probe = await act("upload_file", tab, { files, index, selector, dryRun: true });
+      const names = files.map((f) => basename(f)).join(", ");
+      if (!(await approved(server, `Approve uploading ${names} to ${hostOf(probe.url)}?`))) {
+        return text(`Action denied by user: upload of ${names}.`);
+      }
+      return text(await act("upload_file", tab, { files, index, selector }));
+    },
+  );
+
+  tool(
+    "wait_for_download",
+    {
+      description:
+        "Wait for a file download in Chrome to finish and return where it was " +
+        "saved (full path), its size and type. A download that started in " +
+        "the last 15 seconds counts, so call it right after the click that " +
+        "starts the download.",
+      inputSchema: {
+        timeout_ms: z
+          .number()
+          .int()
+          .min(1000)
+          .max(300000)
+          .optional()
+          .describe("Max wait in milliseconds (default 30000)."),
+      },
+    },
+    async ({ timeout_ms }) =>
+      text(
+        JSON.stringify(
+          await sendCmd("wait_for_download", { agentId, timeoutMs: timeout_ms }, (timeout_ms ?? 30000) + 15000),
+        ),
+      ),
+  );
+
+  tool(
+    "set_viewport",
+    {
+      description:
+        "Emulate a different screen size in this session's Chrome tab — e.g. " +
+        "a phone (width 390, height 844, mobile=true) to test a responsive " +
+        "layout. reset=true returns to the window's real size.",
+      inputSchema: {
+        width: z.number().int().min(200).max(4000).optional(),
+        height: z.number().int().min(200).max(4000).optional(),
+        mobile: z.boolean().optional().describe("Mobile mode: touch events, mobile viewport behavior."),
+        scale: z.number().min(0.5).max(4).optional().describe("Device pixel ratio (default: the screen's)."),
+        reset: z.boolean().optional().describe("Undo the emulation."),
+        ...TAB,
+      },
+    },
+    async ({ width, height, mobile, scale, reset, tab }) => {
+      if (!reset && (width == null || height == null)) {
+        return text("Provide width and height, or reset=true.");
+      }
+      return text(await act("set_viewport", tab, { width, height, mobile, scale, reset }));
+    },
+  );
+
+  tool(
+    "save_pdf",
+    {
+      description:
+        "Save the web page in a Chrome tab as a PDF file on this computer " +
+        "(printed with backgrounds) and return its path. Defaults to the " +
+        "user's Downloads folder, named after the page title.",
+      inputSchema: {
+        path: z.string().optional().describe("Absolute path for the .pdf (default: Downloads/<page title>.pdf)."),
+        ...TAB,
+      },
+    },
+    async ({ path, tab }) => {
+      if (path && !isAbsolute(path)) return text("'path' must be an absolute path.");
+      const r = await act("save_pdf", tab, {}, 60000);
+      let out = path;
+      if (!out) {
+        const safe =
+          String(r.title || "page")
+            .replace(/[<>:"/\\|?*\x00-\x1f]+/g, " ")
+            .trim()
+            .slice(0, 80) || "page";
+        // Never overwrite a file the user already has: add " (n)".
+        for (let n = 0; ; n++) {
+          out = join(homedir(), "Downloads", `${safe}${n ? ` (${n})` : ""}.pdf`);
+          try {
+            await stat(out);
+          } catch {
+            break;
+          }
+        }
+      }
+      await writeFile(out!, Buffer.from(r.base64, "base64"));
+      return text(`Saved ${r.url} as a PDF: ${out}`);
+    },
+  );
+
   // ===== Multi-tab management =====
-  server.registerTool(
+  tool(
     "open_tab",
     {
       description:
         "Open a new browser tab in THIS session's own Chrome window and tab " +
         "group (the window is created on first use) and make it the session's " +
-        "current tab. Returns the tab id to pass as 'tab' to other tools.",
+        "current tab. Returns the tab id to pass as 'tab' to other tools. " +
+        "Parallel agents sharing this session (subagents) must each open " +
+        "their own tab here and pass its id as 'tab' on every call.",
       inputSchema: { url: z.string().optional().describe("URL to load; omit for a blank tab.") },
     },
     async ({ url }) => {
@@ -1174,13 +1668,13 @@ function buildServer(): McpServer {
     },
   );
 
-  server.registerTool(
+  tool(
     "list_tabs",
-    { description: "List the tabs in this session's window (id, title, url, active)." },
+    { description: "List the Chrome tabs in this session's window (id, title, url, active)." },
     async () => text(JSON.stringify(await sendCmd("list_tabs", { agentId }))),
   );
 
-  server.registerTool(
+  tool(
     "get_user_tab",
     {
       description:
@@ -1193,10 +1687,10 @@ function buildServer(): McpServer {
     async () => text(JSON.stringify(await sendCmd("user_tab", { agentId }))),
   );
 
-  server.registerTool(
+  tool(
     "use_tab",
     {
-      description: "Set this session's current tab (subsequent tools default to it).",
+      description: "Set this session's current Chrome tab (subsequent tools default to it).",
       inputSchema: { tab: z.number().int().describe("Tab id from open_tab/list_tabs.") },
     },
     async ({ tab }) => {
@@ -1205,10 +1699,10 @@ function buildServer(): McpServer {
     },
   );
 
-  server.registerTool(
+  tool(
     "close_tab",
     {
-      description: "Close a tab this session opened.",
+      description: "Close a Chrome tab in this session's window.",
       inputSchema: { tab: z.number().int().describe("Tab id to close.") },
     },
     async ({ tab }) => {
@@ -1231,7 +1725,7 @@ async function main(): Promise<void> {
 
   if (useStdio) {
     log("[bridge] MCP transport: stdio (Claude Desktop)");
-    const server = buildServer();
+    const server = buildServer(true);
     const transport = new StdioServerTransport();
     await server.connect(transport);
   } else {

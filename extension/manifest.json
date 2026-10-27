@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Otter — Browser Control for AI",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Lets your AI assistant drive this browser, via the OtterBridge MCP server. Personal use only.",
   "author": "wen-da-ng",
   "icons": {
@@ -24,7 +24,7 @@
     "page": "options.html",
     "open_in_tab": true
   },
-  "permissions": ["tabs", "activeTab", "scripting", "debugger", "storage", "alarms", "tabGroups"],
+  "permissions": ["tabs", "activeTab", "scripting", "debugger", "storage", "alarms", "tabGroups", "downloads"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [

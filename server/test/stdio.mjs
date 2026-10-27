@@ -30,8 +30,11 @@ async function main() {
 
   // Fake extension attaches to the bridge this stdio server hosts.
   const ext = new WebSocket(`ws://localhost:${WS_PORT}`);
+  const announced = new Set(); // ports the registry told us about
   ext.on("message", (raw) => {
-    const { id, action } = JSON.parse(raw.toString());
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === "bridges") { msg.ports.forEach((p) => announced.add(p)); return; }
+    const { id, action } = msg;
     const result =
       action === "read_page" ? { url: "https://ok.test", title: "T", text: "x" }
       : action === "open_tab" ? { tabId: 7, url: "about:blank", windowId: 1, label: "Otter · stdio-test 1" }
@@ -41,7 +44,7 @@ async function main() {
   await new Promise((res, rej) => { ext.on("open", res); ext.on("error", rej); });
 
   const tools = (await client.listTools()).tools;
-  ok("stdio: tools/list returns 28 tools", tools.length === 28, `got ${tools.length}`);
+  ok("stdio: tools/list returns 34 tools", tools.length === 34, `got ${tools.length}`);
   const rp = await client.callTool({ name: "read_page", arguments: {} });
   ok("stdio: read_page round-trips through bridge", rp.content[0].text.includes("ok.test"));
 
@@ -57,9 +60,15 @@ async function main() {
   const opened = await new Promise((res) => { ext2.on("open", () => res(true)); ext2.on("error", () => res(false)); });
   ok("extension can attach to the second instance too", opened);
   ext2.close();
+  for (let i = 0; i < 30 && !announced.has(WS_PORT + 1); i++) await sleep(100);
+  ok("registry announces the second instance's port to the extension", announced.has(WS_PORT + 1), JSON.stringify([...announced]));
+
+  // The registry's server exits: the survivor must take the registry port over.
+  await client.close();
+  for (let i = 0; i < 50 && !stderr.includes(`registry on ws://localhost:${WS_PORT}`); i++) await sleep(100);
+  ok("survivor takes over the registry port", stderr.includes(`registry on ws://localhost:${WS_PORT}`), stderr.slice(-300));
   second.kill();
 
-  await client.close();
   console.log(`\n[test] ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }

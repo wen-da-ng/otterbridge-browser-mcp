@@ -17,6 +17,11 @@ function reflect() {
     b.setAttribute("aria-pressed", String(b.dataset.preset === active));
   });
   document.getElementById("cursorEnabled").checked = !!state.cursorEnabled;
+  const fast = state.agentSpeed === "fast";
+  document.getElementById("fastMode").checked = fast;
+  document.getElementById("fastHint").textContent = fast
+    ? "No cursor animation or typing delays"
+    : "Animated cursor, human-paced typing";
   const auto = state.approvalMode === "auto";
   document.getElementById("fullAuto").checked = auto;
   const hint = document.getElementById("autoHint");
@@ -41,6 +46,12 @@ async function init() {
     state.cursorEnabled = e.target.checked;
     state.preset = matchPreset(state);
     await C.save(state);
+  });
+
+  document.getElementById("fastMode").addEventListener("change", async (e) => {
+    state.agentSpeed = e.target.checked ? "fast" : "watch";
+    await C.save(state);
+    reflect();
   });
 
   document.getElementById("fullAuto").addEventListener("change", async (e) => {

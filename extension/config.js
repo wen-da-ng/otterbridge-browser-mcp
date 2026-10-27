@@ -36,6 +36,12 @@
     cursorVisibility: "active", // "always" | "active" | "off"
     cursorEnabled: true, // master switch for the visible cursor
 
+    // --- Agent speed ---
+    // "watch": animated cursor glide + human-paced typing, nice to follow.
+    // "fast": no glide, no typing delay — still real, trusted input events,
+    // just without the waiting. (Script replays are always fast.)
+    agentSpeed: "watch",
+
     // --- Approvals ---
     // "ask": destructive clicks and evaluate_js prompt for approval in the AI
     // client. "auto": Full Auto — no prompts (evaluate_js still needs
