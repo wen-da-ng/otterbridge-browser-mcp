@@ -85,10 +85,23 @@ async function audit(
 }
 
 // ===== WebSocket bridge =====
+// Several MCP clients (Claude Code + Claude Desktop, background sessions in
+// other projects, ...) each launch their own server process. Each process binds
+// the first free port in this range; the extension keeps one socket per port,
+// so every server reaches the same browser and none of them fails to start.
+// The extension scans the same range (extension/background.js BRIDGE_PORTS).
+// OTTERBRIDGE_WS_PORT moves the base of the range — tests use one far OUTSIDE
+// it so the user's real extension never attaches to a test server.
+const BASE_PORT = Number(process.env.OTTERBRIDGE_WS_PORT) || 8765;
+const BRIDGE_PORTS = Array.from({ length: 10 }, (_, i) => BASE_PORT + i);
+let bridgePort: number | null = null;
+
 let extSocket: WebSocket | null = null; // the connected extension, if any
 interface Pending {
   resolve: (data: WsResponse) => void;
+  reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  socket: WebSocket;
 }
 interface WsResponse {
   id: string;
@@ -108,20 +121,50 @@ function originAllowed(origin: string | undefined): boolean {
   return origin.startsWith("chrome-extension://");
 }
 
-function startBridge(): Promise<void> {
-  // max payload raised well above the ~1 MiB default: screenshot JPEGs of large
-  // viewports easily exceed it, which otherwise closes the socket with a
-  // 1009 "message too big" error mid-capture.
-  const wss = new WebSocketServer({
-    host: "localhost",
-    port: 8765,
-    maxPayload: 32 * 1024 * 1024,
-    verifyClient: (info: { origin: string | undefined }) => {
-      const ok = originAllowed(info.origin);
-      if (!ok) log(`[bridge] rejected connection from origin: ${info.origin}`);
-      return ok;
-    },
+// Bind one port; resolves with the server, rejects (and cleans up) on error.
+function bindBridge(port: number): Promise<WebSocketServer> {
+  return new Promise((resolve, reject) => {
+    // max payload raised well above the ~1 MiB default: screenshot JPEGs of
+    // large viewports easily exceed it, which otherwise closes the socket with
+    // a 1009 "message too big" error mid-capture.
+    const wss = new WebSocketServer({
+      host: "localhost",
+      port,
+      maxPayload: 32 * 1024 * 1024,
+      verifyClient: (info: { origin: string | undefined }) => {
+        const ok = originAllowed(info.origin);
+        if (!ok) log(`[bridge] rejected connection from origin: ${info.origin}`);
+        return ok;
+      },
+    });
+    wss.once("listening", () => resolve(wss));
+    wss.once("error", (err) => {
+      wss.close();
+      reject(err);
+    });
   });
+}
+
+async function startBridge(): Promise<void> {
+  let wss: WebSocketServer | null = null;
+  let lastErr: Error | null = null;
+  for (const port of BRIDGE_PORTS) {
+    try {
+      wss = await bindBridge(port);
+      bridgePort = port;
+      break;
+    } catch (e) {
+      lastErr = e as Error; // EADDRINUSE: another OtterBridge client owns it
+    }
+  }
+  if (!wss) {
+    const range = BRIDGE_PORTS.length > 1
+      ? `${BRIDGE_PORTS[0]}-${BRIDGE_PORTS[BRIDGE_PORTS.length - 1]}`
+      : String(BRIDGE_PORTS[0]);
+    log(`[bridge] FATAL could not bind any ws://localhost:${range}: ${lastErr?.message}`);
+    throw lastErr ?? new Error("no bridge port available");
+  }
+  log(`[bridge] WebSocket listening on ws://localhost:${bridgePort}`);
 
   wss.on("connection", (ws) => {
     extSocket = ws;
@@ -142,45 +185,50 @@ function startBridge(): Promise<void> {
     });
     ws.on("close", () => {
       if (extSocket === ws) extSocket = null;
+      // Fail in-flight commands now instead of letting each sit out its timeout.
+      for (const [id, entry] of pending) {
+        if (entry.socket !== ws) continue;
+        clearTimeout(entry.timer);
+        pending.delete(id);
+        entry.reject(new Error("Chrome extension disconnected mid-command."));
+      }
       log("[bridge] extension disconnected");
     });
     ws.on("error", (err) => log(`[bridge] socket error: ${err.message}`));
   });
+}
 
-  return new Promise((resolve, reject) => {
-    wss.on("listening", () => {
-      log("[bridge] WebSocket listening on ws://localhost:8765");
-      resolve();
-    });
-    wss.on("error", (err: NodeJS.ErrnoException) => {
-      // Most commonly EADDRINUSE: another OtterBridge instance already owns
-      // :8765. Only one process can bridge the extension at a time (run EITHER
-      // the HTTP server OR let Claude Desktop launch the --stdio one, not both).
-      log(`[bridge] FATAL could not bind ws://localhost:8765: ${err.message}`);
-      reject(err);
-    });
-  });
+// The extension rescans the port range every few seconds, so a freshly started
+// server can see its first tool call before the extension has attached. Give it
+// a short grace period rather than failing that call outright.
+async function waitForExtension(ms = 6000): Promise<WebSocket> {
+  const deadline = Date.now() + ms;
+  while (!extSocket || extSocket.readyState !== WebSocket.OPEN) {
+    if (Date.now() >= deadline) {
+      throw new Error(
+        "Chrome extension is not connected. Is Chrome open with the extension loaded?",
+      );
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return extSocket;
 }
 
 async function sendCmd(
   action: string,
   params?: Record<string, unknown>,
   timeoutMs = 30000,
+  logged = true,
 ): Promise<any> {
-  if (!extSocket || extSocket.readyState !== WebSocket.OPEN) {
-    throw new Error(
-      "Chrome extension is not connected. Is Chrome open with the extension loaded?",
-    );
-  }
-  await audit(action, params);
+  const socket = await waitForExtension();
+  if (logged) await audit(action, params);
   const id = randomUUID();
-  const socket = extSocket;
   const data: WsResponse = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(new Error(`Timed out after ${timeoutMs}ms waiting for '${action}'.`));
     }, timeoutMs);
-    pending.set(id, { resolve, timer });
+    pending.set(id, { resolve, reject, timer, socket });
     socket.send(JSON.stringify({ id, action, params: params ?? {} }));
   });
   if (data.error) throw new Error(data.error);
@@ -188,10 +236,27 @@ async function sendCmd(
 }
 
 // ===== Destructive-action gate =====
+// Full Auto is a USER switch in the extension popup — deliberately not
+// reachable through any tool, so a prompt-injected agent can't turn off its
+// own approvals. Read fresh on every gate so flipping it applies immediately to
+// every connected client. Anything but an explicit "auto" means ask.
+async function fullAuto(): Promise<boolean> {
+  try {
+    const r = await sendCmd("get_approval_mode", undefined, 3000, false);
+    return r?.mode === "auto";
+  } catch {
+    return false;
+  }
+}
+
 // Ask the human to approve a destructive action via MCP elicitation. Returns
 // true only on explicit approval. Fail-safe on any error (client can't elicit).
 async function approved(server: McpServer, message: string): Promise<boolean> {
   if (GATE_OFF) return true;
+  if (await fullAuto()) {
+    await audit("gate", undefined, `auto-approved (Full Auto): ${message}`);
+    return true;
+  }
   try {
     const res = await server.server.elicitInput({
       message,
@@ -215,9 +280,14 @@ async function approved(server: McpServer, message: string): Promise<boolean> {
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
 
-// One MCP session == one agent == one Chrome tab group. Each buildServer() call
-// (per HTTP session, or the single stdio session) gets its own agent number.
-let agentSeq = 0;
+// One MCP session == one agent == one Chrome window holding one tab group. Each
+// buildServer() call (per HTTP session, or the single stdio session) gets its
+// own agent id. Ids are random, not sequential: several server processes share
+// one extension, and a restarted server must not inherit a stale "a1" window.
+const CLIENT_NAMES: Record<string, string> = {
+  "claude-code": "Claude Code",
+  "claude-ai": "Claude Desktop",
+};
 
 // ===== MCP server + tools =====
 // A factory so each streamable-HTTP session gets its own McpServer instance
@@ -235,30 +305,87 @@ function buildServer(): McpServer {
         "completed flow at full speed with run_script (durable selector/text " +
         "targets + {{placeholder}} vars — record after finishing a flow " +
         "interactively). Debug web apps with " +
-        "read_console / read_network / get_network_body. Open extra tabs with " +
-        "open_tab (each joins this session's tab group); every tool takes an " +
-        "optional 'tab' id, defaulting to this session's current tab. Built by " +
-        "wen-da-ng.",
+        "read_console / read_network / get_network_body. This session works " +
+        "in its OWN Chrome window and tab group, created automatically on the " +
+        "first tool call; open_tab adds more tabs to it. Every tool takes an " +
+        "optional 'tab' id, defaulting to this session's current tab. The " +
+        "user's own tabs are read-only: get_user_tab returns the tab they are " +
+        "looking at, for read_page / read_elements / find_text / screenshot. " +
+        "Built by wen-da-ng.",
     },
   );
 
-  // Per-session identity + owned-tab state. open_tab sets currentTab; tools
-  // target `tab` ?? currentTab ?? the browser's active tab.
-  const agentNum = ++agentSeq;
-  const agentId = "a" + agentNum;
-  const agentLabel = `Otter · agent ${agentNum}`;
-  const sess: { currentTab: number | null } = { currentTab: null };
-  const withTab = (tab: number | undefined, params: Record<string, unknown> = {}) => {
-    const t = tab != null ? tab : sess.currentTab;
-    return t != null ? { ...params, tabId: t } : params;
+  // Per-session identity + owned-tab state. Every command carries agentId so
+  // the extension can confine actions to this session's own window/group.
+  const agentId = randomUUID().slice(0, 8);
+  const clientName = () => {
+    const n = server.server.getClientVersion()?.name;
+    return n ? (CLIENT_NAMES[n] ?? n) : undefined;
   };
+  const sess: { currentTab: number | null } = { currentTab: null };
+
+  // open_tab is the ONLY way a session gets a tab, and the extension always
+  // places it in the session's own window + group. With no current tab, the
+  // first tool call opens one rather than falling back to whatever tab the
+  // user happens to have active.
+  const openSessionTab = async (url?: string) => {
+    const info = await sendCmd("open_tab", { agentId, clientName: clientName(), url });
+    sess.currentTab = info.tabId;
+    return info;
+  };
+  let opening: Promise<number> | null = null; // dedupes concurrent first calls
+  const ensureTab = async (): Promise<number> => {
+    if (sess.currentTab != null) return sess.currentTab;
+    opening ??= openSessionTab()
+      .then((i) => i.tabId as number)
+      .finally(() => {
+        opening = null;
+      });
+    return opening;
+  };
+
+  // Dispatch a tab-scoped command: explicit `tab`, else the session's tab.
+  const act = async (
+    action: string,
+    tab: number | undefined,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+  ): Promise<any> => {
+    const tabId = tab ?? (await ensureTab());
+    try {
+      return await sendCmd(action, { ...params, agentId, tabId }, timeoutMs);
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (tab == null && /^Tab \d+ not found/.test(msg)) {
+        // The user closed the session's tab (or its window). Forget it so the
+        // next call opens a fresh one — but say so: the page state is gone.
+        sess.currentTab = null;
+        throw new Error(
+          `${msg} The session's tab is gone; the next call opens a fresh one in ` +
+            `the session window (or call open_tab with a URL).`,
+        );
+      }
+      throw e;
+    }
+  };
+
   const TAB = {
     tab: z
       .number()
       .int()
       .optional()
       .describe(
-        "Target tab id (from open_tab/list_tabs). Omit to use this session's current tab, or the active tab if none.",
+        "Target tab id (from open_tab/list_tabs). Omit to use this session's current tab (opened automatically in the session's own window).",
+      ),
+  };
+  // Read-only tools may also target the user's own tab via get_user_tab.
+  const READ_TAB = {
+    tab: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Target tab id: one of this session's tabs (open_tab/list_tabs), or the user's tab from get_user_tab (read-only). Omit to use this session's current tab.",
       ),
   };
 
@@ -286,7 +413,7 @@ function buildServer(): McpServer {
           return `Action denied by user: click on '${label}'.`;
         }
       }
-      const res = await sendCmd("click", withTab(tab, { ...target, expectText, fast, background }));
+      const res = await act("click", tab, { ...target, expectText, fast, background });
       if (res && typeof res === "object" && res.changed) {
         // The element under the pointer changed after the gate decision. Never
         // press an ungated target — re-gate whatever is actually there now.
@@ -313,7 +440,7 @@ function buildServer(): McpServer {
       description: "Navigate a browser tab to a URL and wait for load.",
       inputSchema: { url: z.string(), ...TAB },
     },
-    async ({ url, tab }) => text(await sendCmd("navigate", withTab(tab, { url }))),
+    async ({ url, tab }) => text(await act("navigate", tab, { url })),
   );
 
   server.registerTool(
@@ -322,7 +449,7 @@ function buildServer(): McpServer {
       description: "Go back one step in the tab's history (like the Back button).",
       inputSchema: { ...TAB },
     },
-    async ({ tab }) => text(await sendCmd("go_back", withTab(tab))),
+    async ({ tab }) => text(await act("go_back", tab)),
   );
 
   server.registerTool(
@@ -331,7 +458,7 @@ function buildServer(): McpServer {
       description: "Go forward one step in the tab's history.",
       inputSchema: { ...TAB },
     },
-    async ({ tab }) => text(await sendCmd("go_forward", withTab(tab))),
+    async ({ tab }) => text(await act("go_forward", tab)),
   );
 
   server.registerTool(
@@ -343,7 +470,7 @@ function buildServer(): McpServer {
         ...TAB,
       },
     },
-    async ({ hard, tab }) => text(await sendCmd("reload", withTab(tab, { hard }))),
+    async ({ hard, tab }) => text(await act("reload", tab, { hard })),
   );
 
   server.registerTool(
@@ -366,15 +493,11 @@ function buildServer(): McpServer {
           .max(100000)
           .optional()
           .describe("Max characters to return (default 20000)."),
-        ...TAB,
+        ...READ_TAB,
       },
     },
     async ({ offset, max_chars, tab }) =>
-      text(
-        JSON.stringify(
-          await sendCmd("read_page", withTab(tab, { offset, maxChars: max_chars })),
-        ),
-      ),
+      text(JSON.stringify(await act("read_page", tab, { offset, maxChars: max_chars }))),
   );
 
   server.registerTool(
@@ -383,9 +506,9 @@ function buildServer(): McpServer {
       description:
         "List interactive elements on the page as numbered entries with center " +
         "coordinates. Use the coordinates with the click tool.",
-      inputSchema: { ...TAB },
+      inputSchema: { ...READ_TAB },
     },
-    async ({ tab }) => text(JSON.stringify(await sendCmd("read_elements", withTab(tab)))),
+    async ({ tab }) => text(JSON.stringify(await act("read_elements", tab))),
   );
 
   server.registerTool(
@@ -402,7 +525,7 @@ function buildServer(): McpServer {
       // click - vision-mode, read_elements, or raw coordinates alike.
       let targetText = "";
       try {
-        const info = await sendCmd("hit_test", withTab(tab, { x, y }));
+        const info = await act("hit_test", tab, { x, y });
         targetText = (info?.text as string) ?? "";
       } catch (e) {
         await audit("hit_test", { x, y }, `failed (${(e as Error).message}); proceeding`);
@@ -422,7 +545,7 @@ function buildServer(): McpServer {
       inputSchema: { index: z.number().int(), ...TAB },
     },
     async ({ index, tab }) => {
-      const info = await sendCmd("locate_element", withTab(tab, { index }));
+      const info = await act("locate_element", tab, { index });
       if (!info || !info.found) {
         return text(
           `No interactive element with index ${index}. ` +
@@ -452,7 +575,7 @@ function buildServer(): McpServer {
       },
     },
     async ({ index, text: t, tab }) =>
-      text(await sendCmd("fill_element", withTab(tab, { index, text: t }))),
+      text(await act("fill_element", tab, { index, text: t })),
   );
 
   server.registerTool(
@@ -473,7 +596,7 @@ function buildServer(): McpServer {
       if (value == null && label == null) {
         return text("Provide 'value' or 'label' to pick an option.");
       }
-      return text(await sendCmd("select_option", withTab(tab, { index, value, label })));
+      return text(await act("select_option", tab, { index, value, label }));
     },
   );
 
@@ -495,7 +618,7 @@ function buildServer(): McpServer {
       if (index == null && (x == null || y == null)) {
         return text("Provide 'index', or both 'x' and 'y'.");
       }
-      return text(await sendCmd("hover", withTab(tab, { index, x, y })));
+      return text(await act("hover", tab, { index, x, y }));
     },
   );
 
@@ -516,12 +639,7 @@ function buildServer(): McpServer {
       },
     },
     async ({ from_x, from_y, to_x, to_y, tab }) =>
-      text(
-        await sendCmd(
-          "drag",
-          withTab(tab, { fromX: from_x, fromY: from_y, toX: to_x, toY: to_y }),
-        ),
-      ),
+      text(await act("drag", tab, { fromX: from_x, fromY: from_y, toX: to_x, toY: to_y })),
   );
 
   server.registerTool(
@@ -543,12 +661,12 @@ function buildServer(): McpServer {
         scroll: z
           .boolean()
           .optional()
-          .describe("Scroll the nth match into view (default true)."),
-        ...TAB,
+          .describe("Scroll the nth match into view (default true; never on the user's tab)."),
+        ...READ_TAB,
       },
     },
     async ({ query, nth, scroll, tab }) =>
-      text(JSON.stringify(await sendCmd("find_text", withTab(tab, { query, nth, scroll })))),
+      text(JSON.stringify(await act("find_text", tab, { query, nth, scroll }))),
   );
 
   server.registerTool(
@@ -568,16 +686,17 @@ function buildServer(): McpServer {
           .max(60000)
           .optional()
           .describe("Max wait in milliseconds (default 10000)."),
-        ...TAB,
+        ...READ_TAB,
       },
     },
     async ({ text: t, selector, timeout_ms, tab }) => {
       if (t == null && selector == null) {
         return text("Provide 'text' and/or 'selector' to wait for.");
       }
-      const result = await sendCmd(
+      const result = await act(
         "wait_for",
-        withTab(tab, { text: t, selector, timeoutMs: timeout_ms }),
+        tab,
+        { text: t, selector, timeoutMs: timeout_ms },
         (timeout_ms ?? 10000) + 15000, // bridge timeout must outlast the poll
       );
       return text(JSON.stringify(result));
@@ -590,7 +709,7 @@ function buildServer(): McpServer {
       description: "Type text into the currently focused element.",
       inputSchema: { text: z.string(), ...TAB },
     },
-    async ({ text: t, tab }) => text(await sendCmd("type_text", withTab(tab, { text: t }))),
+    async ({ text: t, tab }) => text(await act("type_text", tab, { text: t })),
   );
 
   server.registerTool(
@@ -599,7 +718,7 @@ function buildServer(): McpServer {
       description: "Press a keyboard key, e.g. 'Enter', 'Tab', 'Escape'.",
       inputSchema: { key: z.string(), ...TAB },
     },
-    async ({ key, tab }) => text(await sendCmd("press_key", withTab(tab, { key }))),
+    async ({ key, tab }) => text(await act("press_key", tab, { key })),
   );
 
   server.registerTool(
@@ -608,7 +727,7 @@ function buildServer(): McpServer {
       description: "Scroll the page vertically. Positive = down, negative = up.",
       inputSchema: { delta_y: z.number().int().default(600), ...TAB },
     },
-    async ({ delta_y, tab }) => text(await sendCmd("scroll", withTab(tab, { deltaY: delta_y }))),
+    async ({ delta_y, tab }) => text(await act("scroll", tab, { deltaY: delta_y })),
   );
 
   server.registerTool(
@@ -625,13 +744,13 @@ function buildServer(): McpServer {
           .boolean()
           .optional()
           .describe(
-            "Capture the whole page height (capped at 8000px), not just the viewport.",
+            "Capture the whole page height (capped at 8000px), not just the viewport. Not available on the user's tab.",
           ),
-        ...TAB,
+        ...READ_TAB,
       },
     },
     async ({ full_page, tab }) => {
-      const result = await sendCmd("screenshot", withTab(tab, { fullPage: full_page }));
+      const result = await act("screenshot", tab, { fullPage: full_page });
       await audit(
         "screenshot",
         undefined,
@@ -678,9 +797,7 @@ function buildServer(): McpServer {
       },
     },
     async ({ level, limit, clear, tab }) =>
-      text(
-        JSON.stringify(await sendCmd("read_console", withTab(tab, { level, limit, clear }))),
-      ),
+      text(JSON.stringify(await act("read_console", tab, { level, limit, clear }))),
   );
 
   server.registerTool(
@@ -708,9 +825,7 @@ function buildServer(): McpServer {
       },
     },
     async ({ filter, limit, clear, tab }) =>
-      text(
-        JSON.stringify(await sendCmd("read_network", withTab(tab, { filter, limit, clear }))),
-      ),
+      text(JSON.stringify(await act("read_network", tab, { filter, limit, clear }))),
   );
 
   server.registerTool(
@@ -727,11 +842,7 @@ function buildServer(): McpServer {
       },
     },
     async ({ request_id, tab }) =>
-      text(
-        JSON.stringify(
-          await sendCmd("get_network_body", withTab(tab, { requestId: request_id })),
-        ),
-      ),
+      text(JSON.stringify(await act("get_network_body", tab, { requestId: request_id }))),
   );
 
   server.registerTool(
@@ -741,7 +852,7 @@ function buildServer(): McpServer {
         "Run a JavaScript expression in the page and return its result " +
         "(promises are awaited, result JSON-serialized). Doubly gated: the " +
         "Otter extension options must enable it, AND every call asks the user " +
-        "for approval.",
+        "for approval (unless the user switched the extension to Full Auto).",
       inputSchema: {
         code: z.string().describe("JavaScript expression to evaluate in the page."),
         ...TAB,
@@ -752,7 +863,7 @@ function buildServer(): McpServer {
       if (!(await approved(server, `Approve running JavaScript in the page?\n\n${preview}`))) {
         return text("Action denied by user: evaluate_js.");
       }
-      return text(JSON.stringify(await sendCmd("evaluate_js", withTab(tab, { code }))));
+      return text(JSON.stringify(await act("evaluate_js", tab, { code })));
     },
   );
 
@@ -812,7 +923,7 @@ function buildServer(): McpServer {
       inputSchema: {
         steps: z.array(Step).min(1).describe("Action sequence to execute in order."),
         vars: z
-          .record(z.string())
+          .record(z.string(), z.string())
           .optional()
           .describe("Values substituted into {{placeholders}} in url / text / value / label / key / selector fields."),
         fast: z
@@ -873,7 +984,8 @@ function buildServer(): McpServer {
       });
       // Every dispatched command carries the background flag so the extension
       // never activates the tab mid-script.
-      const wp = (params: Record<string, unknown>) => withTab(tab, { ...params, background: bg });
+      const ap = (action: string, params: Record<string, unknown>, timeoutMs?: number) =>
+        act(action, tab, { ...params, background: bg }, timeoutMs);
 
       // Implicit wait on element resolution (Selenium's implicit-wait
       // semantics). Single-page apps routinely satisfy a wait_for on a
@@ -886,9 +998,9 @@ function buildServer(): McpServer {
       ): Promise<any> => {
         const deadline = Date.now() + timeoutMs;
         for (;;) {
-          const el = await sendCmd(
+          const el = await ap(
             "resolve_element",
-            wp({ selector: t.selector, text: t.text, tag: t.tag, nth: t.nth }),
+            { selector: t.selector, text: t.text, tag: t.tag, nth: t.nth },
           );
           if (el && el.found) return el;
           if (Date.now() >= deadline) return el;
@@ -915,16 +1027,16 @@ function buildServer(): McpServer {
           switch (st.action) {
             case "navigate": {
               if (!st.url) throw new Error("navigate needs 'url'.");
-              out = await sendCmd("navigate", wp({ url: st.url }));
+              out = await ap("navigate", { url: st.url });
               break;
             }
             case "wait_for": {
               if (st.text == null && st.selector == null) {
                 throw new Error("wait_for needs 'text' and/or 'selector'.");
               }
-              const r = await sendCmd(
+              const r = await ap(
                 "wait_for",
-                wp({ text: st.text, selector: st.selector, timeoutMs: st.timeout_ms }),
+                { text: st.text, selector: st.selector, timeoutMs: st.timeout_ms },
                 (st.timeout_ms ?? 10000) + 15000,
               );
               if (!r.found) throw new Error(`wait_for timed out after ${r.elapsed_ms}ms.`);
@@ -935,9 +1047,9 @@ function buildServer(): McpServer {
               if (st.from_x == null || st.from_y == null || st.to_x == null || st.to_y == null) {
                 throw new Error("drag needs from_x, from_y, to_x, to_y.");
               }
-              out = await sendCmd(
+              out = await ap(
                 "drag",
-                wp({ fromX: st.from_x, fromY: st.from_y, toX: st.to_x, toY: st.to_y, fast: speed }),
+                { fromX: st.from_x, fromY: st.from_y, toX: st.to_x, toY: st.to_y, fast: speed },
               );
               break;
             }
@@ -950,7 +1062,7 @@ function buildServer(): McpServer {
                 // the live element so the danger check still applies.
                 let targetText = "";
                 try {
-                  const hit = await sendCmd("hit_test", wp({ x: st.x, y: st.y }));
+                  const hit = await ap("hit_test", { x: st.x, y: st.y });
                   targetText = (hit?.text as string) ?? "";
                 } catch (_) { /* proceed ungated-texted; gatedClick re-checks */ }
                 const r = await gatedClick(tab, { x: st.x, y: st.y }, targetText, speed, bg);
@@ -974,33 +1086,33 @@ function buildServer(): McpServer {
                 out = r;
               } else if (st.action === "fill") {
                 if (st.text == null) throw new Error("fill needs 'text'.");
-                out = await sendCmd(
+                out = await ap(
                   "fill_element",
-                  wp({ index: el.index, text: st.text, fast: speed }),
+                  { index: el.index, text: st.text, fast: speed },
                 );
               } else {
                 if (st.value == null && st.label == null) {
                   throw new Error("select needs 'value' or 'label'.");
                 }
-                out = await sendCmd(
+                out = await ap(
                   "select_option",
-                  wp({ index: el.index, value: st.value, label: st.label }),
+                  { index: el.index, value: st.value, label: st.label },
                 );
               }
               break;
             }
             case "type_text": {
               if (st.text == null) throw new Error("type_text needs 'text'.");
-              out = await sendCmd("type_text", wp({ text: st.text, fast: speed }));
+              out = await ap("type_text", { text: st.text, fast: speed });
               break;
             }
             case "press_key": {
               if (!st.key) throw new Error("press_key needs 'key'.");
-              out = await sendCmd("press_key", wp({ key: st.key }));
+              out = await ap("press_key", { key: st.key });
               break;
             }
             case "scroll": {
-              out = await sendCmd("scroll", wp({ deltaY: st.delta_y }));
+              out = await ap("scroll", { deltaY: st.delta_y });
               break;
             }
           }
@@ -1047,15 +1159,15 @@ function buildServer(): McpServer {
     "open_tab",
     {
       description:
-        "Open a new browser tab in THIS session's tab group and make it the " +
-        "session's current tab. Returns the tab id to pass as 'tab' to other tools.",
+        "Open a new browser tab in THIS session's own Chrome window and tab " +
+        "group (the window is created on first use) and make it the session's " +
+        "current tab. Returns the tab id to pass as 'tab' to other tools.",
       inputSchema: { url: z.string().optional().describe("URL to load; omit for a blank tab.") },
     },
     async ({ url }) => {
-      const info = await sendCmd("open_tab", { agentId, agentLabel, url });
-      sess.currentTab = info.tabId;
+      const info = await openSessionTab(url);
       return text(
-        `Opened tab ${info.tabId} in group "${agentLabel}"` +
+        `Opened tab ${info.tabId} in group "${info.label}" (window ${info.windowId})` +
           (info.url ? ` → ${info.url}` : "") +
           `. It is now this session's current tab.`,
       );
@@ -1064,8 +1176,21 @@ function buildServer(): McpServer {
 
   server.registerTool(
     "list_tabs",
-    { description: "List the tabs this session has opened (id, title, url, active)." },
+    { description: "List the tabs in this session's window (id, title, url, active)." },
     async () => text(JSON.stringify(await sendCmd("list_tabs", { agentId }))),
+  );
+
+  server.registerTool(
+    "get_user_tab",
+    {
+      description:
+        "Get the tab the USER is currently looking at (outside this session's " +
+        "window). Use only when the user asks about what they have open. The " +
+        "returned id works with read-only tools: read_page, read_elements, " +
+        "find_text, wait_for, screenshot. Acting on it (click, type, navigate, " +
+        "...) is refused — open_tab the URL to work with it.",
+    },
+    async () => text(JSON.stringify(await sendCmd("user_tab", { agentId }))),
   );
 
   server.registerTool(
@@ -1087,7 +1212,7 @@ function buildServer(): McpServer {
       inputSchema: { tab: z.number().int().describe("Tab id to close.") },
     },
     async ({ tab }) => {
-      await sendCmd("close_tab", { tabId: tab });
+      await sendCmd("close_tab", { agentId, tabId: tab });
       if (sess.currentTab === tab) sess.currentTab = null;
       return text(`Closed tab ${tab}.`);
     },
@@ -1206,7 +1331,18 @@ async function startHttp(): Promise<void> {
     }
   });
 
-  await new Promise<void>((resolve) => http.listen(8000, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    // One HTTP server already serves any number of sessions, so a second one
+    // has no reason to exist: point the client at the running one instead.
+    http.once("error", (err) => {
+      log(
+        `[http] FATAL could not bind http://localhost:8000/mcp: ${err.message} ` +
+          `(another OtterBridge HTTP server is probably running — connect to it instead)`,
+      );
+      reject(err);
+    });
+    http.listen(8000, "127.0.0.1", resolve);
+  });
 }
 
 main().catch((e) => {

@@ -9,19 +9,22 @@ transports, byte-compatible with the same unchanged Otter Chrome extension:
 - **streamable HTTP** (default, `http://localhost:8000/mcp`) — for Claude Code,
   MCP Inspector, or any HTTP MCP client you start the server for.
 
-Both modes host the `ws://localhost:8765` bridge the extension connects to.
-Only one process may bind `:8765` at a time.
+Both modes host a bridge the extension connects to, on the first free port in
+`ws://localhost:8765–8774` — so several clients (Claude Code, Claude Desktop,
+background sessions) can each run their own server at once. The extension
+connects to every port in the range. `OTTERBRIDGE_WS_PORT` moves the base of
+the range (the tests use 18765 so a live Chrome never attaches to them).
 
 > **Claude Desktop CoWork is not supported yet.** CoWork runs its agent in a
 > sandboxed VM that currently fails to connect to locally installed MCP
 > extensions ([known issue](https://github.com/anthropics/claude-code/issues/27492)).
 > Regular Claude Desktop chat sessions work as documented above.
 
-## The 9 tools
+## Tools
 
-`navigate`, `read_page`, `read_elements`, **`click_element(index)`** (preferred —
-drift-free, coordinate resolved in-page), `click(x,y)`, `type_text`,
-`press_key`, `scroll`, `screenshot`.
+28 tools — see the [root README](../README.md#what-your-ai-can-do). Each MCP
+session works in its own Chrome window + tab group, opened on its first tool
+call; the user's own tabs are read-only (`get_user_tab`).
 
 ## Safety (identical to the Python server)
 
@@ -31,6 +34,8 @@ drift-free, coordinate resolved in-page), `click(x,y)`, `type_text`,
 - **Audit log**: every dispatched action is appended to `agent_actions.log`.
 - **Fail-safe**: if the client can't show an approval prompt, the gate denies by
   default.
+- **Full Auto**: the extension popup's Full Auto switch skips approvals for all
+  connected servers (read live on every gate; no tool can change it).
 - All logging goes to **stderr** (stdout is the stdio protocol channel).
 
 ### Configuration (env)

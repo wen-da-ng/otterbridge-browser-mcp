@@ -17,6 +17,11 @@ function reflect() {
     b.setAttribute("aria-pressed", String(b.dataset.preset === active));
   });
   document.getElementById("cursorEnabled").checked = !!state.cursorEnabled;
+  const auto = state.approvalMode === "auto";
+  document.getElementById("fullAuto").checked = auto;
+  const hint = document.getElementById("autoHint");
+  hint.textContent = auto ? "No approval prompts" : "Ask before destructive clicks";
+  hint.classList.toggle("on", auto);
 }
 
 async function init() {
@@ -36,6 +41,12 @@ async function init() {
     state.cursorEnabled = e.target.checked;
     state.preset = matchPreset(state);
     await C.save(state);
+  });
+
+  document.getElementById("fullAuto").addEventListener("change", async (e) => {
+    state.approvalMode = e.target.checked ? "auto" : "ask";
+    await C.save(state);
+    reflect();
   });
 
   document.getElementById("adv").addEventListener("click", () => {

@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Multiple clients at once.** Each server binds the first free bridge port in
+  `8765–8774` (base movable via `OTTERBRIDGE_WS_PORT`), and the extension keeps
+  a socket to every one — Claude Code, Claude Desktop and background sessions
+  no longer knock each other out. A freshly started server waits briefly for
+  the extension instead of failing its first call; in-flight commands fail
+  immediately if the extension disconnects.
+- **One Chrome window per session.** Every session works in its own window
+  (opened unfocused on its first tool call) holding its own labelled, colored
+  tab group — agents never act in the tabs the user is using.
+- **`get_user_tab`**: the user's current tab, usable read-only with
+  `read_page` / `read_elements` / `find_text` / `wait_for` / `screenshot`
+  (captured without attaching the debugger). Acting on it is refused.
+- **Full Auto** switch in the extension popup (and Options → Advanced): skips
+  approval prompts for every connected client, live. AUTO badge on the toolbar
+  icon while on. No tool can change it.
+
+### Security
+
+- Clears all open Dependabot alerts: `@modelcontextprotocol/sdk` 1.29.0 →
+  1.32.2 (memory-exhaustion, session-binding and redirect advisories), plus
+  its transitive `hono`, `@hono/node-server`, `fast-uri`, `ip-address`, `qs`
+  and `proxy-addr` via a lockfile refresh. `npm audit`: 0 vulnerabilities.
+- `zod` 3 → 4.6.7 (GHSA-mrhx-c7xc-m3w5, memory exhaustion on oversized
+  collections; no zod 3 fix exists).
+- Legacy Python server: `mcp` 1.28.1 → 1.30.0 (unbounded StreamableHTTP
+  session accumulation).
+
+### Fixed
+
+- **Tabs reliably land in their group.** Grouping is verified and retried
+  (Chrome's transient "tabs cannot be edited right now" refusal), a group
+  Chrome dropped is recreated, tabs a page opens in an agent window are
+  adopted, and the agent registry survives MV3 service-worker suspension.
+  Previously a tool call without `open_tab` silently used the user's active
+  tab, and grouping errors were swallowed.
+- Agent ids are random per session, so a restarted server can't inherit a
+  stale window from a previous run.
+- `close_tab` only closes the session's own tabs.
+- The fake cursor no longer reappears on the user's own tabs after navigation.
+
 ## 0.3.0 — 2026-08-10
 
 Final release of this codebase in this repository.

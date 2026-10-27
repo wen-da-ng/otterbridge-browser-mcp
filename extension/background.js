@@ -4,20 +4,36 @@ importScripts("config.js");
 
 // Live settings from chrome.storage.sync, refreshed whenever they change.
 let S = OtterConfig.DEFAULTS;
-OtterConfig.load().then((s) => { S = s; });
+const settingsReady = OtterConfig.load().then((s) => { S = s; reflectApprovalMode(); });
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "sync" && changes[OtterConfig.KEY]) {
     S = OtterConfig.normalize(changes[OtterConfig.KEY].newValue);
+    reflectApprovalMode();
   }
 });
 
-// ===== WebSocket bridge =====
-let ws;
+// Full Auto is visible at a glance on the toolbar icon, so it's never left on
+// by accident.
+function reflectApprovalMode() {
+  const auto = S.approvalMode === "auto";
+  chrome.action.setBadgeText({ text: auto ? "AUTO" : "" });
+  if (auto) chrome.action.setBadgeBackgroundColor({ color: "#F24E07" });
+}
 
-function connect() {
-  ws = new WebSocket("ws://localhost:8765");
-  ws.onopen = () => console.log("[agent] connected to MCP bridge");
-  ws.onmessage = async (e) => {
+// ===== WebSocket bridge =====
+// Every MCP client (Claude Code, Claude Desktop, background sessions...) runs
+// its own server process, each on the first free port of this range (must
+// match BRIDGE_PORTS in server/src/index.ts). We hold one socket per port, so
+// all of them drive this browser at once; each reply goes back on the socket
+// its command arrived on.
+const BRIDGE_PORTS = Array.from({ length: 10 }, (_, i) => 8765 + i);
+const sockets = new Map(); // port -> WebSocket
+
+function connectPort(port) {
+  const sock = new WebSocket(`ws://localhost:${port}`);
+  sockets.set(port, sock);
+  sock.onopen = () => console.log(`[agent] connected to MCP bridge on :${port}`);
+  sock.onmessage = async (e) => {
     const { id, action, params } = JSON.parse(e.data);
     let result = null, error = null;
     try {
@@ -25,18 +41,25 @@ function connect() {
     } catch (err) {
       error = err.message || String(err);
     }
-    ws.send(JSON.stringify({ id, result, error }));
+    if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ id, result, error }));
   };
-  ws.onclose = () => setTimeout(connect, 2000); // auto-reconnect
-  ws.onerror = () => ws.close();
+  sock.onclose = () => { if (sockets.get(port) === sock) sockets.delete(port); };
+  sock.onerror = () => sock.close();
 }
-connect();
+
+// Ports with no server just refuse the connection; they're retried each scan.
+function scanBridges() {
+  for (const port of BRIDGE_PORTS) {
+    const s = sockets.get(port);
+    if (!s || s.readyState === WebSocket.CLOSED) connectPort(port);
+  }
+}
+scanBridges();
+setInterval(scanBridges, 3000);
 
 // MV3 service workers can be suspended; a periodic alarm keeps reconnection alive.
-chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
-chrome.alarms.onAlarm.addListener(() => {
-  if (!ws || ws.readyState === WebSocket.CLOSED) connect();
-});
+chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(scanBridges);
 
 // ===== Small helpers =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -149,31 +172,174 @@ async function activeTab() {
   return tab;
 }
 
-// ===== Multi-tab: per-agent tab groups =====
-// Each MCP session (agent) owns a colored, titled Chrome tab group. Tabs it
-// opens are added to that group so parallel agents stay visually separated.
-const agentGroups = {}; // agentId -> chrome tab group id
+// ===== Multi-agent: one window + one tab group per agent =====
+// Each MCP session (agent) works in its OWN Chrome window holding one colored,
+// titled tab group, so it never mixes with the tabs the user is using. Every
+// tab an agent gets goes through openAgentTab, and grouping is VERIFIED — a
+// failed group is an error, never silently skipped.
+//
+// The registry lives in chrome.storage.session: MV3 suspends this worker when
+// idle and wipes its globals, and agents must find their window again after.
 const GROUP_COLORS = ["orange", "blue", "green", "purple", "cyan", "pink", "yellow", "red", "grey"];
-let groupColorIx = 0;
+let agents = {};   // agentId -> { windowId, groupId, label, color }
+let agentSeq = 0;  // numbers agent labels across ALL connected servers
+const agentsReady = chrome.storage.session.get(["agents", "agentSeq"]).then((r) => {
+  agents = r.agents || {};
+  agentSeq = r.agentSeq || 0;
+});
+const saveAgents = () => chrome.storage.session.set({ agents, agentSeq }).catch(() => {});
 
-async function ensureAgentGroup(agentId, agentLabel, tabId) {
-  if (!agentId) return undefined; // ungrouped (legacy / no session id)
-  let groupId = agentGroups[agentId];
-  try {
-    if (groupId != null) {
-      await chrome.tabs.group({ groupId, tabIds: [tabId] });
-    } else {
-      groupId = await chrome.tabs.group({ tabIds: [tabId] });
-      agentGroups[agentId] = groupId;
-      const color = GROUP_COLORS[groupColorIx++ % GROUP_COLORS.length];
-      await chrome.tabGroups.update(groupId, { title: agentLabel || "OtterBridge", color });
+// Serialize window/group work per agent: two concurrent open_tab calls must not
+// each create a window.
+const agentLocks = new Map();
+function withAgentLock(agentId, fn) {
+  const run = (agentLocks.get(agentId) || Promise.resolve()).then(fn, fn);
+  agentLocks.set(agentId, run.catch(() => {}));
+  return run;
+}
+
+function agentRecord(agentId, clientName) {
+  let ag = agents[agentId];
+  if (!ag) {
+    const n = ++agentSeq;
+    ag = agents[agentId] = {
+      windowId: null,
+      groupId: null,
+      label: `Otter · ${clientName || "agent"} ${n}`,
+      color: GROUP_COLORS[(n - 1) % GROUP_COLORS.length],
+    };
+  }
+  return ag;
+}
+
+// Which agent (if any) owns a tab: anything in its window or its group.
+function ownerOf(tab) {
+  for (const [id, ag] of Object.entries(agents)) {
+    if (tab.windowId === ag.windowId) return id;
+    if (ag.groupId != null && tab.groupId === ag.groupId) return id;
+  }
+  return null;
+}
+
+// Put tabId into the agent's group, recreating the group if Chrome dropped it
+// (a group vanishes when its last tab closes). Retries cover Chrome's transient
+// "Tabs cannot be edited right now (user may be dragging a tab)" refusal.
+async function groupIntoAgent(ag, tabId) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      if (ag.groupId != null) {
+        try { await chrome.tabGroups.get(ag.groupId); } catch (_) { ag.groupId = null; }
+      }
+      if (ag.groupId != null) {
+        await chrome.tabs.group({ groupId: ag.groupId, tabIds: [tabId] });
+      } else {
+        ag.groupId = await chrome.tabs.group({
+          tabIds: [tabId], createProperties: { windowId: ag.windowId },
+        });
+      }
+      await chrome.tabGroups.update(ag.groupId, { title: ag.label, color: ag.color });
+      const t = await chrome.tabs.get(tabId);
+      if (t.groupId === ag.groupId) return;
+      lastErr = new Error("tab did not land in the group");
+    } catch (e) {
+      lastErr = e;
     }
-  } catch (_) { /* grouping is best-effort; never block the action */ }
-  return groupId;
+    await sleep(150 * (attempt + 1));
+  }
+  throw new Error(`Could not put tab ${tabId} into the agent's tab group: ${lastErr && lastErr.message}`);
+}
+
+async function windowAlive(windowId) {
+  if (windowId == null) return false;
+  try { await chrome.windows.get(windowId); return true; } catch (_) { return false; }
+}
+
+// Open a tab for an agent: in its window (created unfocused on first use, so it
+// doesn't grab the user's keyboard) and in its group.
+async function openAgentTab(agentId, clientName, url) {
+  await agentsReady;
+  return withAgentLock(agentId, async () => {
+    const ag = agentRecord(agentId, clientName);
+    let tab;
+    if (await windowAlive(ag.windowId)) {
+      tab = await chrome.tabs.create({ windowId: ag.windowId, url: url || "about:blank", active: true });
+    } else {
+      const win = await chrome.windows.create({
+        url: url || "about:blank", focused: false, type: "normal",
+      });
+      ag.windowId = win.id;
+      ag.groupId = null;
+      tab = win.tabs[0];
+    }
+    await groupIntoAgent(ag, tab.id);
+    await saveAgents();
+    return { tab, ag };
+  });
+}
+
+// Keep the registry honest as the user closes windows / groups.
+chrome.windows.onRemoved.addListener(async (windowId) => {
+  await agentsReady;
+  let changed = false;
+  for (const ag of Object.values(agents)) {
+    if (ag.windowId === windowId) { ag.windowId = null; ag.groupId = null; changed = true; }
+  }
+  if (changed) saveAgents();
+});
+chrome.tabGroups.onRemoved.addListener(async (group) => {
+  await agentsReady;
+  let changed = false;
+  for (const ag of Object.values(agents)) {
+    if (ag.groupId === group.id) { ag.groupId = null; changed = true; }
+  }
+  if (changed) saveAgents();
+});
+
+// Tabs the PAGE opens in an agent window (target=_blank, window.open) join the
+// agent's group too, so nothing in the window is left ungrouped.
+async function adoptIntoAgentGroup(tabId, windowId) {
+  await agentsReady;
+  const entry = Object.entries(agents).find(([, ag]) => ag.windowId === windowId);
+  if (!entry) return;
+  const [agentId, ag] = entry;
+  await sleep(100); // let Chrome's own opener-grouping settle first
+  try {
+    const t = await chrome.tabs.get(tabId);
+    if (ag.groupId != null && t.groupId === ag.groupId) return;
+    await withAgentLock(agentId, () => groupIntoAgent(ag, tabId).then(saveAgents));
+  } catch (_) { /* tab already closed */ }
+}
+chrome.tabs.onCreated.addListener((tab) => adoptIntoAgentGroup(tab.id, tab.windowId));
+chrome.tabs.onAttached.addListener((tabId, info) => adoptIntoAgentGroup(tabId, info.newWindowId));
+
+// The window the user last focused that ISN'T an agent's — get_user_tab's answer.
+let lastUserWindowId = null;
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  await agentsReady;
+  if (!Object.values(agents).some((ag) => ag.windowId === windowId)) lastUserWindowId = windowId;
+});
+
+async function userTab() {
+  await agentsReady;
+  const isAgentWin = (id) => Object.values(agents).some((ag) => ag.windowId === id);
+  let winId = lastUserWindowId;
+  if (winId == null || isAgentWin(winId) || !(await windowAlive(winId))) {
+    const wins = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    const mine = wins.filter((w) => !isAgentWin(w.id));
+    const pick = mine.find((w) => w.focused) || mine[0];
+    if (!pick) throw new Error("No user browser window found.");
+    winId = pick.id;
+  }
+  const [t] = await chrome.tabs.query({ active: true, windowId: winId });
+  if (!t) throw new Error("The user's window has no active tab.");
+  return { tabId: t.id, title: t.title, url: t.url, readOnly: true };
 }
 
 // Resolve which tab a command targets: explicit params.tabId, else the active
-// tab (legacy single-tab behavior when a session hasn't opened its own tab).
+// tab (legacy single-tab behavior for clients that send no agentId; current
+// servers always send both).
 async function resolveTab(p) {
   if (p && p.tabId != null) {
     try { return await chrome.tabs.get(p.tabId); }
@@ -307,44 +473,81 @@ async function handle(action, p) {
     return { pong: true, ts: Date.now() };
   }
 
+  // The user's switch, read by the server on every approval gate.
+  if (action === "get_approval_mode") {
+    await settingsReady;
+    return { mode: S.approvalMode === "auto" ? "auto" : "ask" };
+  }
+
   // ----- Multi-tab management (no pre-existing active tab required) -----
   if (action === "open_tab") {
-    const created = await chrome.tabs.create({ url: p.url || "about:blank", active: true });
+    const { tab: created, ag } = await openAgentTab(p.agentId, p.clientName, p.url);
     // Attach CDP immediately (not lazily on first click) so console/network
     // capture covers the page load. Best-effort: chrome:// pages can't attach.
     try { await ensureDebugger(created.id); } catch (_) {}
     if (p.url) await waitForLoad(created.id);
-    const groupId = await ensureAgentGroup(p.agentId, p.agentLabel, created.id);
     const fresh = await chrome.tabs.get(created.id);
-    return { tabId: created.id, url: fresh.url, title: fresh.title, groupId };
+    return {
+      tabId: created.id, url: fresh.url, title: fresh.title,
+      windowId: ag.windowId, groupId: ag.groupId, label: ag.label,
+    };
   }
   if (action === "list_tabs") {
-    const groupId = agentGroups[p.agentId];
-    const tabs = groupId != null ? await chrome.tabs.query({ groupId }) : [];
+    await agentsReady;
+    const ag = agents[p.agentId];
+    const tabs = ag && (await windowAlive(ag.windowId))
+      ? await chrome.tabs.query({ windowId: ag.windowId })
+      : [];
     return tabs.map((t) => ({ tabId: t.id, title: t.title, url: t.url, active: t.active }));
   }
   if (action === "close_tab") {
-    try { await chrome.tabs.remove(p.tabId); } catch (_) {}
+    await agentsReady;
+    let t;
+    try { t = await chrome.tabs.get(p.tabId); } catch (_) { return { closed: p.tabId }; }
+    if (p.agentId && ownerOf(t) !== p.agentId) {
+      throw new Error(`Tab ${p.tabId} isn't in this session's window; only the session's own tabs can be closed.`);
+    }
+    await chrome.tabs.remove(p.tabId);
     return { closed: p.tabId };
+  }
+  if (action === "user_tab") {
+    return userTab();
   }
 
   lastAgentActivity = Date.now();
+  await agentsReady;
   const tab = await resolveTab(p);
-  // Focus-aware activation: when a SINGLE agent is running, bring its tab to the
-  // front on visible actions so the user can watch. When MULTIPLE agents are
-  // active (parallel), never steal focus — they'd fight over it. All actions
-  // work on background tabs anyway (CDP input + scripting + CDP screenshot), so
-  // activation is purely cosmetic. screenshot is excluded (it uses CDP capture,
-  // which needs no focus).
+  // Agents act only inside their own window. Any other tab — the user's, or
+  // another agent's — is read-only: these actions observe without changing the
+  // page (find_text's scroll is forced off below; screenshot avoids the
+  // debugger there).
+  const owned = !p.agentId || ownerOf(tab) === p.agentId;
+  const READ_ONLY = new Set([
+    "read_page", "read_elements", "find_text", "wait_for", "screenshot",
+    "hit_test", "locate_element", "resolve_element",
+  ]);
+  if (!owned) {
+    if (!READ_ONLY.has(action)) {
+      throw new Error(
+        `Tab ${tab.id} isn't in this session's window, so it is read-only ` +
+        `(read_page, read_elements, find_text, wait_for, screenshot). To work ` +
+        `with that page, open_tab its URL in the session's own window.`,
+      );
+    }
+    p = { ...p, scroll: false, readOnly: true };
+  }
+  // Bring the agent's tab to the front of ITS OWN window on visible actions so
+  // the user can watch. Activating a tab never focuses its window, so this
+  // can't steal focus from the user's window or from other agents (each has
+  // its own window). screenshot is excluded (CDP capture needs no focus).
   const VISIBLE = new Set([
     "navigate", "go_back", "go_forward", "reload",
     "click", "fill_element", "select_option", "hover", "drag",
     "type_text", "press_key", "scroll",
   ]);
   // p.background suppresses the activation: script replays meant to run
-  // silently while the user works elsewhere must never steal the tab focus.
-  const parallel = Object.keys(agentGroups).length > 1;
-  if (p.tabId != null && VISIBLE.has(action) && !parallel && !p.background && !tab.active) {
+  // silently must not even switch tabs inside the agent window.
+  if (owned && p.tabId != null && VISIBLE.has(action) && !p.background && !tab.active) {
     await chrome.tabs.update(tab.id, { active: true });
   }
 
@@ -919,7 +1122,17 @@ async function handle(action, p) {
       // it grabs the viewport at PHYSICAL pixels (CSS size x devicePixelRatio);
       // we scale back down to CSS pixels in an OffscreenCanvas so coordinates
       // read off the image map 1:1 to the CSS viewport coords click() expects.
-      await ensureDebugger(tab.id);
+      //
+      // The user's own (read-only) tab is the exception: attaching the debugger
+      // there would put the "being debugged" banner on their tab, so use
+      // captureVisibleTab instead — it only sees the active tab of a window,
+      // which is exactly what get_user_tab returns.
+      if (p.readOnly) {
+        if (p.fullPage) throw new Error("full_page screenshots aren't available on the user's tab.");
+        if (!tab.active) throw new Error(`Tab ${tab.id} is no longer the visible tab in the user's window; call get_user_tab again.`);
+      } else {
+        await ensureDebugger(tab.id);
+      }
       const [meta] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => ({
@@ -943,7 +1156,12 @@ async function handle(action, p) {
         capParams.captureBeyondViewport = true;
       }
       // JPEG q80: ~5-10x smaller than PNG on photo-heavy pages.
-      const cap = await cdp(tab.id, "Page.captureScreenshot", capParams);
+      const cap = p.readOnly
+        ? {
+            data: (await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 80 }))
+              .replace(/^data:image\/jpeg;base64,/, ""),
+          }
+        : await cdp(tab.id, "Page.captureScreenshot", capParams);
       const bitmap = await createImageBitmap(
         await (await fetch(`data:image/jpeg;base64,${cap.data}`)).blob(),
       );
@@ -1076,8 +1294,11 @@ function waitForLoad(tabId, timeoutMs = 15000) {
 
 // Re-inject cursor position after navigation (content scripts die on nav).
 let lastCursor = { x: 40, y: 40 };
-chrome.tabs.onUpdated.addListener(async (tabId, info) => {
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status !== "complete") return;
+  // Only agent tabs get the cursor back; the user's own tabs never show it.
+  await agentsReady;
+  if (Object.keys(agents).length && !ownerOf(tab)) return;
   // Respect the cursor visibility setting:
   //   off / disabled -> never restore
   //   always         -> restore on every navigation

@@ -8,7 +8,7 @@ authors = [{ name = "wen-da-ng", email = "lenus.ng.wen.da@gmail.com" }]
 # is version-sensitive — the dev guide warns it drifts between mcp releases.
 # These are the versions this project was built and verified against.
 dependencies = [
-    "mcp==1.28.1",
+    "mcp==1.30.0",
     "websockets==16.0",
 ]
 

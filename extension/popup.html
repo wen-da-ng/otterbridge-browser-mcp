@@ -21,6 +21,8 @@
     .slider::before { content: ""; position: absolute; height: 17px; width: 17px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
     .switch input:checked + .slider { background: var(--accent); }
     .switch input:checked + .slider::before { transform: translateX(19px); }
+    .hint { font-size: 11px; color: var(--muted); }
+    .hint.on { color: var(--accent); }
     .adv { display: block; width: 100%; margin-top: 14px; padding: 9px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; cursor: pointer; color: var(--text); font-weight: 600; }
     .adv:hover { border-color: var(--accent); }
   </style>
@@ -39,6 +41,11 @@
   <div class="toggle-row">
     <span><b>Show cursor</b></span>
     <label class="switch"><input type="checkbox" id="cursorEnabled" /><span class="slider"></span></label>
+  </div>
+
+  <div class="toggle-row">
+    <span><b>Full Auto</b><br /><span class="hint" id="autoHint">Ask before destructive clicks</span></span>
+    <label class="switch"><input type="checkbox" id="fullAuto" /><span class="slider"></span></label>
   </div>
 
   <button class="adv" id="adv">Advanced settings…</button>

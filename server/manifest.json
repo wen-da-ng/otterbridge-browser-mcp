@@ -52,8 +52,10 @@
     { "name": "read_network", "description": "List captured network requests." },
     { "name": "get_network_body", "description": "Fetch a captured response body by requestId." },
     { "name": "evaluate_js", "description": "Run JavaScript in the page (opt-in + per-call approval)." },
-    { "name": "open_tab", "description": "Open a new tab in this session's tab group." },
+    { "name": "run_script", "description": "Replay a recorded browser flow in one call at full speed." },
+    { "name": "open_tab", "description": "Open a new tab in this session's own window and tab group." },
     { "name": "list_tabs", "description": "List this session's tabs." },
+    { "name": "get_user_tab", "description": "Get the user's current tab, for read-only tools." },
     { "name": "use_tab", "description": "Set this session's current tab." },
     { "name": "close_tab", "description": "Close a tab this session opened." }
   ],

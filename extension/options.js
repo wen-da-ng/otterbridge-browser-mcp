@@ -21,6 +21,7 @@ const SCHEMA = [
   { group: "behavior", key: "idleDrift", label: "Idle drift", type: "toggle" },
   { group: "behavior", key: "driftIntensity", label: "Drift intensity", type: "range", min: 0, max: 2, step: 0.1, fmt: (v) => v.toFixed(1) + "×", dependsOn: "idleDrift" },
 
+  { group: "advanced", key: "approvalMode", label: "Approvals", type: "select", options: [["ask", "Ask before destructive actions"], ["auto", "Full Auto (no prompts)"]] },
   { group: "advanced", key: "allowJsEval", label: "Allow evaluate_js (run JS in pages)", type: "toggle" },
 
   { group: "appearance", key: "size", label: "Cursor size", type: "range", min: 20, max: 48, step: 1, fmt: (v) => v + "px" },

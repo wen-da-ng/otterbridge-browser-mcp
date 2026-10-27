@@ -8,6 +8,12 @@ import { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
+// Test servers bridge on a port far outside the range (8765-8774) the real
+// Otter extension scans, so a live Chrome never attaches to them. Spawned
+// servers inherit it through process.env.
+process.env.OTTERBRIDGE_WS_PORT ??= "18765";
+const WS_PORT = Number(process.env.OTTERBRIDGE_WS_PORT);
+
 let pass = 0, fail = 0;
 const ok = (n, c, e = "") => { if (c) { pass++; console.log(`  PASS  ${n}`); } else { fail++; console.log(`  FAIL  ${n} ${e}`); } };
 const firstText = (r) => r.content.find((c) => c.type === "text")?.text ?? "";
@@ -48,7 +54,7 @@ async function main() {
   const proc = spawn("node", ["dist/index.js"], { cwd: process.cwd(), stdio: ["ignore", "ignore", "ignore"] });
   try {
     await sleep(1200);
-    const ext = new WebSocket("ws://localhost:8765");
+    const ext = new WebSocket(`ws://localhost:${WS_PORT}`);
     ext.on("message", (raw) => {
       const { id, action, params } = JSON.parse(raw.toString());
       // Jittered async reply so in-flight commands reorder.

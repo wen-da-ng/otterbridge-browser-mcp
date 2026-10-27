@@ -9,6 +9,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
+// Test servers bridge on a port far outside the range (8765-8774) the real
+// Otter extension scans, so a live Chrome never attaches to them. Spawned
+// servers inherit it through process.env.
+process.env.OTTERBRIDGE_WS_PORT ??= "18765";
+const WS_PORT = Number(process.env.OTTERBRIDGE_WS_PORT);
+
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = "") => {
   if (cond) { pass++; console.log(`  PASS  ${name}`); }
@@ -24,9 +30,15 @@ const ELEMENTS = [
   { index: 0, tag: "a", text: "Home", x: 10, y: 10 },
   { index: 1, tag: "button", text: "Submit order", x: 20, y: 20 },
 ];
+let approvalMode = "ask"; // the extension popup's Full Auto switch
+const opened = [];          // open_tab calls seen, to check auto-open
 function handleExtension(action, p) {
   switch (action) {
     case "ping": return { pong: true, ts: 1 };
+    case "get_approval_mode": return { mode: approvalMode };
+    case "open_tab":
+      opened.push(p);
+      return { tabId: 42, url: p.url || "about:blank", title: "T", windowId: 9, groupId: 3, label: `Otter · ${p.clientName} 1` };
     case "navigate": return `Navigated to ${p.url}`;
     case "read_page": return { url: "https://example.com", title: "Example", text: "hello world" };
     case "read_elements": return ELEMENTS;
@@ -77,7 +89,7 @@ async function main() {
     await sleep(1200); // let both ports bind
 
     // Fake extension attaches to the bridge.
-    const ext = new WebSocket("ws://localhost:8765");
+    const ext = new WebSocket(`ws://localhost:${WS_PORT}`);
     ext.on("message", (raw) => {
       const { id, action, params } = JSON.parse(raw.toString());
       let result = null, error = null;
@@ -97,12 +109,16 @@ async function main() {
       "find_text", "get_network_body", "go_back", "go_forward", "hover", "list_tabs",
       "navigate", "open_tab", "press_key", "read_console", "read_elements",
       "read_network", "read_page", "reload", "run_script", "screenshot", "scroll",
-      "select_option", "type_text", "use_tab", "wait_for",
-    ];
-    ok("tools/list has all 23 core + 4 tab tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
+      "select_option", "type_text", "use_tab", "wait_for", "get_user_tab",
+    ].sort();
+    ok("tools/list has all 28 tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
 
     const rp = await client.callTool({ name: "read_page", arguments: {} });
     ok("read_page returns JSON text", firstText(rp).includes("example.com"));
+    ok("first tool call auto-opens the session's own tab", opened.length === 1 && typeof opened[0].agentId === "string", JSON.stringify(opened));
+    ok("open_tab carries the client name for the group label", opened[0]?.clientName === "smoketest", JSON.stringify(opened[0]));
+    await client.callTool({ name: "read_page", arguments: {} });
+    ok("later calls reuse the session tab (no second window)", opened.length === 1, `opened=${opened.length}`);
 
     const nav = await client.callTool({ name: "navigate", arguments: { url: "https://x.test" } });
     ok("navigate", firstText(nav) === "Navigated to https://x.test");
@@ -135,6 +151,14 @@ async function main() {
     const noElicit = await mkClient({ elicit: false });
     const denied = await noElicit.callTool({ name: "click_element", arguments: { index: 1 } });
     ok("destructive + no elicitation -> fail-safe DENY", firstText(denied).startsWith("Action denied by user"), `got "${firstText(denied)}"`);
+
+    // --- Full Auto (extension popup switch): no prompt, no denial ---
+    approvalMode = "auto";
+    const auto = await noElicit.callTool({ name: "click_element", arguments: { index: 1 } });
+    ok("Full Auto: destructive click proceeds without elicitation", firstText(auto) === "Clicked at (20, 20)", `got "${firstText(auto)}"`);
+    approvalMode = "ask";
+    const back = await noElicit.callTool({ name: "click_element", arguments: { index: 1 } });
+    ok("switching back to Ask re-arms the gate immediately", firstText(back).startsWith("Action denied by user"), `got "${firstText(back)}"`);
     await noElicit.close();
 
     console.log(`\n[test] ${pass} passed, ${fail} failed`);

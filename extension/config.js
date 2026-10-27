@@ -36,6 +36,12 @@
     cursorVisibility: "active", // "always" | "active" | "off"
     cursorEnabled: true, // master switch for the visible cursor
 
+    // --- Approvals ---
+    // "ask": destructive clicks and evaluate_js prompt for approval in the AI
+    // client. "auto": Full Auto — no prompts (evaluate_js still needs
+    // allowJsEval). Only the user can flip this; no tool can.
+    approvalMode: "ask",
+
     // --- Advanced ---
     allowJsEval: false, // permit the evaluate_js tool to run JS in pages (opt-in)
 

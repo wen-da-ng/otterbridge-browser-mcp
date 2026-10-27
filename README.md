@@ -93,9 +93,9 @@ and for the extension click the green **Code** button on the repo page →
 
 ## What your AI can do
 
-Twenty-six tools, each taking an optional `tab` id — plus multi-tab,
-multi-agent control where every MCP session gets its own colored Chrome tab
-group.
+Twenty-eight tools, each taking an optional `tab` id — plus multi-tab,
+multi-agent control where every MCP session works in its own Chrome window and
+colored tab group.
 
 <details>
 <summary><b>Observe &amp; navigate (9)</b></summary>
@@ -142,12 +142,23 @@ group.
 <details>
 <summary><b>Multi-tab / multi-agent</b></summary>
 
-Each MCP **session** is an agent with its own colored Chrome **tab group**.
+Each MCP **session** is an agent with its **own Chrome window** holding its own
+colored, labelled **tab group** (e.g. `Otter · Claude Code 2`). The window is
+opened (unfocused, so it never grabs your keyboard) on the session's first tool
+call — agents never act in the tabs you're using. Tabs a page opens inside an
+agent window are pulled into its group automatically, and grouping is verified:
+if Chrome dropped the group (its last tab closed), it's recreated.
+
 Manage tabs with `open_tab(url?)`, `list_tabs()`, `use_tab(tab)`,
-`close_tab(tab)`. Multiple agents (sessions) can drive multiple tabs
-**simultaneously** — the server routes each session's commands to its own tab,
-and a single agent never steals focus from another (background tabs are driven
-via CDP without activation).
+`close_tab(tab)`. Your own tabs are **read-only** to agents:
+`get_user_tab()` returns the tab you're looking at, which works with
+`read_page`, `read_elements`, `find_text`, `wait_for` and `screenshot` — any
+action on it is refused.
+
+**Several clients at once** (Claude Code *and* Claude Desktop, or a background
+session in another project): each server takes the first free bridge port in
+`8765–8774`, and the extension connects to all of them, so every client works
+simultaneously.
 </details>
 
 <details>
@@ -169,6 +180,12 @@ and everything binds to **localhost only** — nothing is exposed to the network
 <summary><b>Full security model</b></summary>
 
 - **Audit log:** every dispatched action is appended to `server/agent_actions.log`.
+- **Full Auto:** the **Full Auto** switch in the extension popup (also in
+  Options → Advanced) skips every approval prompt below, for all connected
+  clients, immediately — for unattended runs such as Claude's auto mode. The
+  toolbar icon shows an **AUTO** badge while it's on. It is deliberately a
+  browser-side switch: no MCP tool can change it, so a prompt-injected agent
+  can't turn its own approvals off. Auto-approvals are still audit-logged.
 - **Destructive-action gate:** a `click` whose target text matches danger words
   (`buy/pay/delete/send/submit/checkout/confirm/transfer/…`) is hit-tested at
   dispatch and requires human approval via MCP elicitation. Works for every
@@ -182,7 +199,7 @@ and everything binds to **localhost only** — nothing is exposed to the network
   the same human-approval elicitation as destructive clicks.
 - Servers bind to **localhost only**. Never expose them on the network.
 - **Bridge & endpoint are origin/host-locked** (defense against local-page
-  attacks): the `ws://localhost:8765` bridge only accepts the extension
+  attacks): the `ws://localhost:8765–8774` bridge only accepts the extension
   (`chrome-extension://` origin) or non-browser clients — a web page you visit
   can't connect to eavesdrop on or displace it. The HTTP endpoint rejects
   requests whose `Host`/`Origin` isn't loopback, blocking DNS-rebinding attempts
@@ -198,9 +215,9 @@ and everything binds to **localhost only** — nothing is exposed to the network
 ## For developers
 
 Everything below needs **git** and **Node.js ≥ 18** — regular Claude Desktop
-users never touch this. Run **only one** server at a time (Node, legacy Python,
-**or** the `.mcpb` inside Claude Desktop) — they share the `ws://localhost:8765`
-bridge and only one process can own it.
+users never touch this. Any number of servers can run at once (Claude Code,
+the `.mcpb` inside Claude Desktop, ...): each binds the first free bridge port in
+`ws://localhost:8765–8774` and the extension connects to every one.
 
 <details>
 <summary><b>Components</b></summary>
@@ -208,7 +225,7 @@ bridge and only one process can own it.
 | Path | What it is |
 |---|---|
 | `extension/` | Chrome MV3 extension — the hands & eyes. WebSocket client + `chrome.debugger` (CDP) input + animated fake cursor + a settings UI (popup + options page). |
-| `server/` | **OtterBridge (Node/TypeScript)** — the MCP server. Bridges browser actions to the extension over `ws://localhost:8765`, with two transports from one codebase: **stdio** (for the `.mcpb` / Claude Desktop) and **streamable HTTP** at `http://localhost:8000/mcp` (for Claude Code, MCP Inspector). Bundles into a one-click `.mcpb`. |
+| `server/` | **OtterBridge (Node/TypeScript)** — the MCP server. Bridges browser actions to the extension over `ws://localhost:8765–8774`, with two transports from one codebase: **stdio** (for the `.mcpb` / Claude Desktop) and **streamable HTTP** at `http://localhost:8000/mcp` (for Claude Code, MCP Inspector). Bundles into a one-click `.mcpb`. |
 | `legacy/` | The original **Python** (FastMCP) server + its setup scripts, kept as a reference/fallback. Single-tab only. See [`legacy/README.md`](legacy/README.md). |
 </details>
 
@@ -234,11 +251,11 @@ built `dist/index.js`:
 claude mcp add otterbridge-browser-mcp -- node /absolute/path/to/otterbridge-browser-mcp/server/dist/index.js --stdio
 ```
 
-Single-session only, and it can't run while the Claude Desktop `.mcpb` is
-loaded — both would fight over the `ws://localhost:8765` bridge.
+One session per Claude Code instance; it runs alongside the Claude Desktop
+`.mcpb` and other Claude Code sessions (each takes its own bridge port).
 
 **Option B — streamable HTTP (multi-agent).** Run one long-lived server that
-many sessions share, each getting its own colored tab group. You start it
+many sessions share, each getting its own window and colored tab group. You start it
 manually and keep it running:
 
 ```bash

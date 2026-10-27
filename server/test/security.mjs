@@ -8,12 +8,18 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { WebSocket } from "ws";
 import http from "node:http";
 
+// Test servers bridge on a port far outside the range (8765-8774) the real
+// Otter extension scans, so a live Chrome never attaches to them. Spawned
+// servers inherit it through process.env.
+process.env.OTTERBRIDGE_WS_PORT ??= "18765";
+const WS_PORT = Number(process.env.OTTERBRIDGE_WS_PORT);
+
 let pass = 0, fail = 0;
 const ok = (n, c, e = "") => { if (c) { pass++; console.log(`  PASS  ${n}`); } else { fail++; console.log(`  FAIL  ${n} ${e}`); } };
 
 function tryWs(origin) {
   return new Promise((resolve) => {
-    const ws = new WebSocket("ws://localhost:8765", origin ? { headers: { Origin: origin } } : {});
+    const ws = new WebSocket(`ws://localhost:${WS_PORT}`, origin ? { headers: { Origin: origin } } : {});
     ws.on("open", () => { ws.close(); resolve("open"); });
     ws.on("error", () => resolve("rejected"));
     ws.on("unexpected-response", () => resolve("rejected"));
