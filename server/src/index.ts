@@ -63,6 +63,10 @@ const DANGER_RE =
 //          allow ONLY for: allow | true | 1 | yes
 const gateRaw = (process.env.BROWSER_AGENT_GATE ?? "elicit").toLowerCase();
 const GATE_OFF = ["off", "false", "0", "no"].includes(gateRaw);
+
+// OTTERBRIDGE_PROFILE: pin every session of this server to one browser profile
+// (by name, email or id) — e.g. Claude Desktop always drives "Personal".
+const PINNED_PROFILE = (process.env.OTTERBRIDGE_PROFILE ?? "").trim();
 const fallbackRaw = (process.env.BROWSER_AGENT_GATE_FALLBACK ?? "deny").toLowerCase();
 const FALLBACK_ALLOW = ["allow", "true", "1", "yes"].includes(fallbackRaw);
 
@@ -117,8 +121,117 @@ const BRIDGE_PORTS = Array.from({ length: 10 }, (_, i) => BASE_PORT + i);
 let bridgePort: number | null = null; // this server's own command port
 let isRegistry = false;
 
-let extSocket: WebSocket | null = null; // the connected extension, if any
+// Browser profiles. Each Chrome (or Edge) profile runs its OWN copy of the
+// extension, and every copy connects here. A copy announces itself with
+// {type:"hello", profile:{id, name, email, browser}}; connections that never
+// do (older extensions, test fakes) count as one unnamed profile each. A
+// session targets exactly one profile — see profileFor() in buildServer.
+interface Profile {
+  id: string;
+  name: string;
+  email: string;
+  browser: string;
+  socket: WebSocket;
+}
+const profiles = new Map<string, Profile>(); // profile id -> live connection
+let anonSeq = 0;
+
+// Profile comings and goings, told to each session in its next tool result
+// ("→ Browser profile connected: Personal"). A disconnect is only reported if
+// the profile stays gone for 10 s, so an extension reload doesn't spam.
+const profileEvents: string[] = [];
+const SERVER_STARTED = Date.now(); // profiles connecting at startup aren't news
+// Grace periods (overridable so tests don't have to wait them out).
+const STARTUP_GRACE_MS = Number(process.env.OTTERBRIDGE_STARTUP_GRACE_MS ?? 8000);
+const DISCONNECT_GRACE_MS = Number(process.env.OTTERBRIDGE_DISCONNECT_GRACE_MS ?? 10000);
+const pendingDisconnect = new Map<string, NodeJS.Timeout>();
+
+// Session numbers for tab-group labels ("Otter · Claude Code 3"), handed out
+// by the REGISTRY so a session has the same number in every browser profile
+// and no two sessions share one. Other servers ask over their registration
+// socket, and re-report the numbers they hold when the registry changes hands.
+const sessionNumbers = new Map<string, number>(); // registry: agentId -> number
+let nextSessionNumber = 1;
+let registryReadyAt = 0; // a new registry waits for survivors to re-report first
+const knownNumbers = new Map<string, number>(); // numbers this server's sessions hold
+let registryLink: WebSocket | null = null; // non-registry: our registration socket
+const numberWaiters = new Map<string, (n: number) => void>();
+
+function mergeNumbers(nums: Record<string, number>): void {
+  for (const [agentId, n] of Object.entries(nums)) {
+    if (typeof n !== "number") continue;
+    if (!sessionNumbers.has(agentId)) sessionNumbers.set(agentId, n);
+    nextSessionNumber = Math.max(nextSessionNumber, n + 1);
+  }
+}
+
+async function assignNumber(agentId: string): Promise<number> {
+  const wait = registryReadyAt - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  let n = sessionNumbers.get(agentId);
+  if (n == null) {
+    n = nextSessionNumber++;
+    sessionNumbers.set(agentId, n);
+  }
+  return n;
+}
+
+// This session's number, or undefined if the registry can't be reached (the
+// extension then numbers the group itself).
+async function sessionNumber(agentId: string): Promise<number | undefined> {
+  const known = knownNumbers.get(agentId);
+  if (known != null) return known;
+  let n: number | undefined;
+  if (isRegistry) {
+    n = await assignNumber(agentId);
+  } else if (registryLink && registryLink.readyState === WebSocket.OPEN) {
+    const reqId = randomUUID();
+    const link = registryLink;
+    n = await Promise.race([
+      new Promise<number>((res) => {
+        numberWaiters.set(reqId, res);
+        link.send(JSON.stringify({ type: "number", agentId, reqId }));
+      }),
+      new Promise<undefined>((res) => setTimeout(() => res(undefined), 3000)),
+    ]);
+    numberWaiters.delete(reqId);
+  }
+  if (n != null) knownNumbers.set(agentId, n);
+  return n;
+}
+
+// Heartbeat: a ping every 20 s keeps Chrome from suspending an idle
+// extension (which would make an open profile look closed), and surfaces a
+// dead connection quickly.
+setInterval(() => {
+  for (const ws of extSockets) {
+    if (ws.readyState === WebSocket.OPEN) ws.send('{"type":"ping"}');
+  }
+}, 20000).unref();
 const extSockets = new Set<WebSocket>(); // every extension connection (registry fan-out)
+
+const profileLabel = (pr: Profile) =>
+  `${pr.name}${pr.email ? ` (${pr.email})` : ""}${pr.browser && pr.browser !== "Chrome" ? ` — ${pr.browser}` : ""}`;
+
+const profileList = () =>
+  [...profiles.values()].map((pr) => ({
+    id: pr.id,
+    name: pr.name,
+    email: pr.email || null,
+    browser: pr.browser || null,
+  }));
+
+// Find a profile by name, email or id: exact (case-insensitive) first, then a
+// unique substring. Several partial matches come back as a list.
+function matchProfile(query: string): Profile | Profile[] | null {
+  const q = query.trim().toLowerCase();
+  const all = [...profiles.values()];
+  const exact = all.find((pr) => [pr.id, pr.name, pr.email].some((v) => v && v.toLowerCase() === q));
+  if (exact) return exact;
+  const partial = all.filter((pr) => [pr.name, pr.email].some((v) => v && v.toLowerCase().includes(q)));
+  if (partial.length === 1) return partial[0];
+  return partial.length ? partial : null;
+}
 const registrants = new Map<WebSocket, number>(); // registry: other servers' ports
 interface Pending {
   resolve: (data: WsResponse) => void;
@@ -190,6 +303,19 @@ function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): 
     registrants.set(ws, port);
     log(`[bridge] registry: server on :${port} registered`);
     broadcastBridges();
+    ws.on("message", async (raw) => {
+      let m: { type?: string; agentId?: string; reqId?: string; numbers?: Record<string, number> };
+      try {
+        m = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+      if (m.type === "known" && m.numbers) mergeNumbers(m.numbers);
+      if (m.type === "number" && m.agentId && m.reqId) {
+        const number = await assignNumber(m.agentId);
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "number", reqId: m.reqId, number }));
+      }
+    });
     ws.on("close", () => {
       registrants.delete(ws);
       broadcastBridges();
@@ -198,16 +324,42 @@ function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): 
     return;
   }
 
-  extSocket = ws;
   extSockets.add(ws);
+  // Until it says hello, a connection is an unnamed profile of its own.
+  const pr: Profile = {
+    id: `unnamed-${++anonSeq}`,
+    name: "Unidentified profile (older OtterBridge extension — update it there)",
+    email: "",
+    browser: "",
+    socket: ws,
+  };
+  profiles.set(pr.id, pr);
   log("[bridge] extension connected");
   sendBridges(ws);
   ws.on("message", (raw) => {
-    let data: WsResponse;
+    let data: WsResponse & { type?: string; profile?: Partial<Profile> };
     try {
       data = JSON.parse(raw.toString());
     } catch {
       return; // ignore non-JSON frames
+    }
+    if (data.type === "hello" && data.profile && typeof data.profile.id === "string") {
+      const firstHello = pr.id.startsWith("unnamed-");
+      if (profiles.get(pr.id)?.socket === ws) profiles.delete(pr.id);
+      pr.id = data.profile.id.slice(0, 64);
+      const reconnect = pendingDisconnect.get(pr.id);
+      if (reconnect) {
+        clearTimeout(reconnect); // back within 10 s: not worth mentioning
+        pendingDisconnect.delete(pr.id);
+      } else if (firstHello && !profiles.has(pr.id) && Date.now() - SERVER_STARTED > STARTUP_GRACE_MS) {
+        setImmediate(() => profileEvents.push(`→ Browser profile connected: ${profileLabel(pr)}.`));
+      }
+      pr.name = String(data.profile.name || "Chrome profile").slice(0, 60);
+      pr.email = String(data.profile.email || "").slice(0, 120);
+      pr.browser = String(data.profile.browser || "").slice(0, 30);
+      profiles.set(pr.id, pr); // a reconnect of the same profile replaces the old one
+      log(`[bridge] profile: ${profileLabel(pr)}`);
+      return;
     }
     const entry = pending.get(data.id);
     if (entry) {
@@ -218,7 +370,19 @@ function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): 
   });
   ws.on("close", () => {
     extSockets.delete(ws);
-    if (extSocket === ws) extSocket = [...extSockets].pop() ?? null;
+    if (profiles.get(pr.id)?.socket === ws) {
+      profiles.delete(pr.id);
+      if (!pr.id.startsWith("unnamed-")) {
+        const label = profileLabel(pr);
+        const id = pr.id;
+        pendingDisconnect.set(id, setTimeout(() => {
+          pendingDisconnect.delete(id);
+          if (!profiles.has(id)) {
+            profileEvents.push(`→ Browser profile disconnected: ${label} (its Chrome profile was probably closed).`);
+          }
+        }, DISCONNECT_GRACE_MS));
+      }
+    }
     // Fail in-flight commands now instead of letting each sit out its timeout.
     for (const [id, entry] of pending) {
       if (entry.socket !== ws) continue;
@@ -236,6 +400,8 @@ async function becomeRegistry(): Promise<boolean> {
     const wss = await bindBridge(BASE_PORT);
     wss.on("connection", onConnection);
     isRegistry = true;
+    registryReadyAt = Date.now() + 2000; // let the other survivors re-report their numbers
+    mergeNumbers(Object.fromEntries(knownNumbers));
     log(`[bridge] registry on ws://localhost:${BASE_PORT}`);
     return true;
   } catch {
@@ -248,6 +414,16 @@ async function becomeRegistry(): Promise<boolean> {
 // re-register with whoever won.
 function registerWithRegistry(): void {
   const ws = new WebSocket(`ws://localhost:${BASE_PORT}/register?port=${bridgePort}`);
+  registryLink = ws;
+  ws.on("open", () => ws.send(JSON.stringify({ type: "known", numbers: Object.fromEntries(knownNumbers) })));
+  ws.on("message", (raw) => {
+    try {
+      const m = JSON.parse(raw.toString());
+      if (m.type === "number") numberWaiters.get(m.reqId)?.(m.number);
+    } catch {
+      /* ignore */
+    }
+  });
   let retried = false;
   const retry = () => {
     if (retried) return;
@@ -280,6 +456,7 @@ async function startBridge(): Promise<void> {
   log(`[bridge] WebSocket listening on ws://localhost:${bridgePort}`);
   if (bridgePort === BASE_PORT) {
     isRegistry = true; // first server: its own port IS the registry
+    registryReadyAt = Date.now() + 2000; // survivors of a previous registry may re-report
     log(`[bridge] registry on ws://localhost:${BASE_PORT}`);
   } else {
     registerWithRegistry();
@@ -290,17 +467,38 @@ async function startBridge(): Promise<void> {
 // as the registry itself, waits for the extension's next 3 s reconnect), so its
 // first tool call can arrive before the extension has attached. Give it a
 // short grace period rather than failing that call outright.
-async function waitForExtension(ms = 6000): Promise<WebSocket> {
+//
+// profileId: the session's profile. Without one there must be exactly one
+// profile connected — with several, guessing could act in the wrong account.
+async function waitForProfile(profileId: string | null, ms = 6000): Promise<Profile> {
   const deadline = Date.now() + ms;
-  while (!extSocket || extSocket.readyState !== WebSocket.OPEN) {
+  for (;;) {
+    if (profileId) {
+      const pr = profiles.get(profileId);
+      if (pr && pr.socket.readyState === WebSocket.OPEN) return pr;
+    } else {
+      const open = [...profiles.values()].filter((pr) => pr.socket.readyState === WebSocket.OPEN);
+      if (open.length === 1) return open[0];
+      if (open.length > 1) throw new Error(ambiguousProfiles());
+    }
     if (Date.now() >= deadline) {
       throw new Error(
-        "Chrome extension is not connected. Is Chrome open with the extension loaded?",
+        profileId
+          ? "The browser profile this session uses isn't connected any more — is that " +
+              "Chrome profile still open? Call list_profiles to see what's connected."
+          : "Chrome extension is not connected. Is Chrome open with the extension loaded?",
       );
     }
     await new Promise((r) => setTimeout(r, 200));
   }
-  return extSocket;
+}
+
+function ambiguousProfiles(): string {
+  const list = [...profiles.values()].map(profileLabel).join("; ");
+  return (
+    `${profiles.size} browser profiles are connected: ${list}. Ask the user which one to use ` +
+    `if it isn't clear, then call use_profile (or pin one with OTTERBRIDGE_PROFILE in the MCP config).`
+  );
 }
 
 async function sendCmd(
@@ -308,8 +506,9 @@ async function sendCmd(
   params?: Record<string, unknown>,
   timeoutMs = 30000,
   logged = true,
+  profileId: string | null = null,
 ): Promise<any> {
-  const socket = await waitForExtension();
+  const { socket } = await waitForProfile(profileId);
   if (logged) await audit(action, params);
   const id = randomUUID();
   const data: WsResponse = await new Promise((resolve, reject) => {
@@ -329,9 +528,9 @@ async function sendCmd(
 // reachable through any tool, so a prompt-injected agent can't turn off its
 // own approvals. Read fresh on every gate so flipping it applies immediately to
 // every connected client. Anything but an explicit "auto" means ask.
-async function fullAuto(): Promise<boolean> {
+async function fullAuto(profileId: string | null): Promise<boolean> {
   try {
-    const r = await sendCmd("get_approval_mode", undefined, 3000, false);
+    const r = await sendCmd("get_approval_mode", undefined, 3000, false, profileId);
     return r?.mode === "auto";
   } catch {
     return false;
@@ -340,9 +539,14 @@ async function fullAuto(): Promise<boolean> {
 
 // Ask the human to approve a destructive action via MCP elicitation. Returns
 // true only on explicit approval. Fail-safe on any error (client can't elicit).
-async function approved(server: McpServer, message: string): Promise<boolean> {
+// profileId: Full Auto is a per-profile switch — ask the profile being acted in.
+async function approved(
+  server: McpServer,
+  profileId: string | null,
+  message: string,
+): Promise<boolean> {
   if (GATE_OFF) return true;
-  if (await fullAuto()) {
+  if (await fullAuto(profileId)) {
     await audit("gate", undefined, `auto-approved (Full Auto): ${message}`);
     return true;
   }
@@ -390,7 +594,7 @@ const CLIENT_NAMES: Record<string, string> = {
 // (elicitation routes back to that session's client), while stdio uses one.
 function buildServer(stdio = false): McpServer {
   const server = new McpServer(
-    { name: "otterbridge-browser-mcp", version: "0.6.0" },
+    { name: "otterbridge-browser-mcp", version: "0.7.0" },
     {
       // Surfaced in the client's system prompt — often the ONLY thing the model
       // reads about this server before deciding whether to use it (clients may
@@ -413,7 +617,12 @@ function buildServer(stdio = false): McpServer {
         "looking at, for read_page / read_elements / find_text / wait_for / " +
         "screenshot. If several agents share this session (e.g. subagents " +
         "working in parallel), each must open_tab its OWN tab and pass that " +
-        "tab id on every call — otherwise they all act on one shared tab.\n\n" +
+        "tab id on every call — otherwise they all act on one shared tab " +
+        "(open_tab also takes a 'profile', and a tab always stays in its " +
+        "profile, so parallel agents can each work in a different one). The " +
+        "user may run OtterBridge in several Chrome profiles (e.g. work and " +
+        "personal accounts): list_profiles shows them, use_profile picks one, " +
+        "and results name the profile in use.\n\n" +
         "Method: observe with page_snapshot (a compact outline of the page " +
         "with element indices — cheaper than a screenshot), read_page or " +
         "screenshot; act by element index with click_element / fill_element / " +
@@ -474,8 +683,23 @@ function buildServer(stdio = false): McpServer {
     wait_for_download: { title: "Wait for download", ro: true },
     set_viewport: { title: "Set viewport size", idem: true },
     save_pdf: { title: "Save page as PDF", world: true },
+    list_profiles: { title: "List browser profiles", ro: true, idem: true },
+    use_profile: { title: "Choose browser profile", idem: true },
   };
-  // registerTool, with each tool's title + annotations filled in from META.
+  // Append profile comings and goings this session hasn't heard about yet.
+  const withProfileNotes = (cb: (...a: unknown[]) => Promise<{ content?: unknown[] }>) =>
+    async (...a: unknown[]) => {
+      const res = await cb(...a);
+      const fresh = profileEvents.slice(sess.eventIx);
+      sess.eventIx = profileEvents.length;
+      if (fresh.length && Array.isArray(res?.content)) {
+        res.content.push({ type: "text", text: fresh.join("\n") });
+      }
+      return res;
+    };
+
+  // registerTool, with each tool's title + annotations filled in from META,
+  // and profile notes appended to every result.
   const tool = ((name: string, config: Record<string, unknown>, cb: unknown) => {
     const m = META[name];
     return server.registerTool(
@@ -491,7 +715,7 @@ function buildServer(stdio = false): McpServer {
           openWorldHint: m.world ?? false,
         },
       },
-      cb as never,
+      withProfileNotes(cb as never) as never,
     );
   }) as typeof server.registerTool;
 
@@ -507,7 +731,74 @@ function buildServer(stdio = false): McpServer {
     const n = server.server.getClientVersion()?.name;
     return n ? (CLIENT_NAMES[n] ?? n) : undefined;
   };
-  const sess: { currentTab: number | null } = { currentTab: null };
+  const sess: { currentTab: number | null; profile: string | null; eventIx: number } = {
+    currentTab: null,
+    profile: null,
+    eventIx: profileEvents.length, // profile events this session has already been told
+  };
+
+  // Which browser profile this session acts in. Chosen once and then kept, so
+  // a second profile connecting later can't silently take the session over:
+  // the pinned profile (OTTERBRIDGE_PROFILE), else the only connected one,
+  // else the model must pick with use_profile.
+  const profileFor = async (): Promise<string> => {
+    if (sess.profile && !profiles.has(sess.profile) && sess.profile.startsWith("unnamed-")) {
+      sess.profile = null; // an extension that never named itself reconnected under a new id
+    }
+    if (sess.profile) return sess.profile;
+    if (PINNED_PROFILE) {
+      const deadline = Date.now() + 6000;
+      for (;;) {
+        const m = matchProfile(PINNED_PROFILE);
+        if (m && !Array.isArray(m)) {
+          sess.profile = m.id;
+          return m.id;
+        }
+        if (Date.now() >= deadline) {
+          const list = [...profiles.values()].map(profileLabel).join("; ") || "none";
+          throw new Error(
+            `OTTERBRIDGE_PROFILE="${PINNED_PROFILE}" doesn't match exactly one connected browser ` +
+              `profile (connected: ${list}). Is that Chrome profile open?`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+    const pr = await waitForProfile(null); // throws when none, or several
+    sess.profile = pr.id;
+    return pr.id;
+  };
+  // Every tab belongs to one profile. Commands naming a tab go to THAT
+  // profile, whatever the session's default is — so parallel subagents can
+  // each work in their own profile (open_tab(url, profile) + pass the tab).
+  const tabProfiles = new Map<number, string>(); // tab id -> profile id
+  const cmd = async (
+    action: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+    profileId?: string,
+  ) => sendCmd(action, params, timeoutMs, true, profileId ?? (await profileFor()));
+  const labelOfProfile = (id: string | null | undefined) => {
+    const pr = id ? profiles.get(id) : undefined;
+    return pr ? profileLabel(pr) : "";
+  };
+  const currentProfileLabel = () => labelOfProfile(sess.profile);
+  // The profile a tab lives in (falls back to the session default).
+  const profileOfTab = (tab?: number | null): string | undefined => {
+    const t = tab ?? sess.currentTab;
+    let id = t != null ? tabProfiles.get(t) : undefined;
+    if (id && !profiles.has(id) && id.startsWith("unnamed-")) id = undefined; // old extension reconnected
+    return id ?? sess.profile ?? undefined;
+  };
+  // A tool's optional `profile` argument -> profile id (throws a helpful error).
+  const resolveProfileArg = (query?: string): string | undefined => {
+    if (!query) return undefined;
+    const m = matchProfile(query);
+    const list = [...profiles.values()].map(profileLabel).join("; ") || "none";
+    if (!m) throw new Error(`No connected browser profile matches '${query}'. Connected: ${list}.`);
+    if (Array.isArray(m)) throw new Error(`'${query}' matches several profiles: ${m.map(profileLabel).join("; ")}.`);
+    return m.id;
+  };
 
   // open_tab is the ONLY way a session gets a tab, and the extension always
   // places it in the session's own window + group. With no current tab, the
@@ -515,10 +806,13 @@ function buildServer(stdio = false): McpServer {
   // user happens to have active.
   // reuse: pick up the window's current tab if the session already has a
   // window (e.g. after a reconnect) instead of opening yet another tab.
-  const openSessionTab = async (url?: string, reuse = false) => {
-    const info = await sendCmd("open_tab", { agentId, clientName: clientName(), url, reuse });
+  const openSessionTab = async (url?: string, reuse = false, profileId?: string) => {
+    const sessionNo = await sessionNumber(agentId);
+    const pid = profileId ?? (await profileFor());
+    const info = await cmd("open_tab", { agentId, clientName: clientName(), sessionNo, url, reuse }, undefined, pid);
+    tabProfiles.set(info.tabId, pid);
     sess.currentTab = info.tabId;
-    return info;
+    return { ...info, profileId: pid };
   };
   let opening: Promise<number> | null = null; // dedupes concurrent first calls
   const ensureTab = async (): Promise<number> => {
@@ -540,7 +834,7 @@ function buildServer(stdio = false): McpServer {
   ): Promise<any> => {
     const tabId = tab ?? (await ensureTab());
     try {
-      return await sendCmd(action, { ...params, agentId, tabId }, timeoutMs);
+      return await cmd(action, { ...params, agentId, tabId }, timeoutMs, profileOfTab(tabId));
     } catch (e) {
       const msg = (e as Error).message;
       if (tab == null && /^Tab \d+ not found/.test(msg)) {
@@ -618,7 +912,7 @@ function buildServer(stdio = false): McpServer {
         const label =
           expectText.trim().slice(0, 60) ||
           (target.index != null ? `element ${target.index}` : `(${target.x}, ${target.y})`);
-        if (!(await approved(server, `Approve clicking the '${label}' element? This looks destructive.`))) {
+        if (!(await approved(server, profileOfTab(tab) ?? null, `Approve clicking the '${label}' element? This looks destructive.`))) {
           return `Action denied by user: click on '${label}'.`;
         }
       }
@@ -673,14 +967,14 @@ function buildServer(stdio = false): McpServer {
     // reported it). Answer anyway; Chrome says if nothing is showing. An
     // unread dialog can't be checked for danger words, so OK needs approval.
     if (!info || !info.open) {
-      if (accept && !(await approved(server, "Approve answering OK to a JavaScript dialog whose text couldn't be read?"))) {
+      if (accept && !(await approved(server, profileOfTab(tab) ?? null, "Approve answering OK to a JavaScript dialog whose text couldn't be read?"))) {
         return "Action denied by user: accepting an unread dialog.";
       }
       return act("handle_dialog", tab, { accept, text: promptText });
     }
     if (accept && info.type !== "alert" && DANGER_RE.test(info.message ?? "")) {
       const msg = String(info.message).slice(0, 200);
-      if (!(await approved(server, `Approve answering OK to this ${info.type} dialog?\n\n"${msg}"`))) {
+      if (!(await approved(server, profileOfTab(tab) ?? null, `Approve answering OK to this ${info.type} dialog?\n\n"${msg}"`))) {
         return `Action denied by user: accepting the ${info.type} dialog.`;
       }
     }
@@ -1170,7 +1464,7 @@ function buildServer(stdio = false): McpServer {
     },
     async ({ code, tab }) => {
       const preview = code.length > 200 ? code.slice(0, 200) + "…" : code;
-      if (!(await approved(server, `Approve running JavaScript in the page?\n\n${preview}`))) {
+      if (!(await approved(server, profileOfTab(tab) ?? null, `Approve running JavaScript in the page?\n\n${preview}`))) {
         return text("Action denied by user: evaluate_js.");
       }
       return text(JSON.stringify(await act("evaluate_js", tab, { code })));
@@ -1552,7 +1846,7 @@ function buildServer(stdio = false): McpServer {
       // Locate the input first, so the approval names the actual website.
       const probe = await act("upload_file", tab, { files, index, selector, dryRun: true });
       const names = files.map((f) => basename(f)).join(", ");
-      if (!(await approved(server, `Approve uploading ${names} to ${hostOf(probe.url)}?`))) {
+      if (!(await approved(server, profileOfTab(tab) ?? null, `Approve uploading ${names} to ${hostOf(probe.url)}?`))) {
         return text(`Action denied by user: upload of ${names}.`);
       }
       return text(await act("upload_file", tab, { files, index, selector }));
@@ -1575,12 +1869,22 @@ function buildServer(stdio = false): McpServer {
           .max(300000)
           .optional()
           .describe("Max wait in milliseconds (default 30000)."),
+        tab: z
+          .number()
+          .int()
+          .optional()
+          .describe("The tab that started the download — downloads are per browser profile, so this picks the profile."),
       },
     },
-    async ({ timeout_ms }) =>
+    async ({ timeout_ms, tab }) =>
       text(
         JSON.stringify(
-          await sendCmd("wait_for_download", { agentId, timeoutMs: timeout_ms }, (timeout_ms ?? 30000) + 15000),
+          await cmd(
+            "wait_for_download",
+            { agentId, timeoutMs: timeout_ms },
+            (timeout_ms ?? 30000) + 15000,
+            profileOfTab(tab),
+          ),
         ),
       ),
   );
@@ -1646,6 +1950,49 @@ function buildServer(stdio = false): McpServer {
     },
   );
 
+  // ===== Browser profiles =====
+  tool(
+    "list_profiles",
+    {
+      description:
+        "List the Chrome (or Edge) profiles the user has OtterBridge running in — " +
+        "each with its name, signed-in Google account and browser — and which " +
+        "one this session uses. Each profile has its own logins, cookies and " +
+        "history. When several are connected, pick one with use_profile.",
+    },
+    async () =>
+      text(
+        JSON.stringify({
+          session_profile: currentProfileLabel() || null,
+          profiles: profileList().map((pr) => ({ ...pr, in_use_by_this_session: pr.id === sess.profile })),
+        }),
+      ),
+  );
+
+  tool(
+    "use_profile",
+    {
+      description:
+        "Choose which browser profile this session works in (see list_profiles), " +
+        "by name, email or id. Needed when several profiles are connected; the " +
+        "session then stays on it. Switching starts a fresh tab in that profile.",
+      inputSchema: { profile: z.string().describe("Profile name, email or id from list_profiles.") },
+    },
+    async ({ profile }) => {
+      const m = matchProfile(profile);
+      if (!m) {
+        const list = [...profiles.values()].map(profileLabel).join("; ") || "none";
+        return text(`No connected browser profile matches '${profile}'. Connected: ${list}.`);
+      }
+      if (Array.isArray(m)) {
+        return text(`'${profile}' matches several profiles: ${m.map(profileLabel).join("; ")}. Be more specific.`);
+      }
+      if (sess.profile !== m.id) sess.currentTab = null; // tabs belong to a profile
+      sess.profile = m.id;
+      return text(`This session now uses the browser profile: ${profileLabel(m)}.`);
+    },
+  );
+
   // ===== Multi-tab management =====
   tool(
     "open_tab",
@@ -1656,12 +2003,22 @@ function buildServer(stdio = false): McpServer {
         "current tab. Returns the tab id to pass as 'tab' to other tools. " +
         "Parallel agents sharing this session (subagents) must each open " +
         "their own tab here and pass its id as 'tab' on every call.",
-      inputSchema: { url: z.string().optional().describe("URL to load; omit for a blank tab.") },
+      inputSchema: {
+        url: z.string().optional().describe("URL to load; omit for a blank tab."),
+        profile: z
+          .string()
+          .optional()
+          .describe(
+            "Browser profile to open it in (name or email from list_profiles); default: the session's. " +
+              "The tab stays tied to that profile, so later calls passing this tab id act there.",
+          ),
+      },
     },
-    async ({ url }) => {
-      const info = await openSessionTab(url);
+    async ({ url, profile }) => {
+      const info = await openSessionTab(url, false, resolveProfileArg(profile));
       return text(
-        `Opened tab ${info.tabId} in group "${info.label}" (window ${info.windowId})` +
+        `Opened tab ${info.tabId} in group "${info.label}" (window ${info.windowId}, ` +
+          `profile: ${labelOfProfile(info.profileId) || "Chrome"})` +
           (info.url ? ` → ${info.url}` : "") +
           `. It is now this session's current tab.`,
       );
@@ -1670,8 +2027,19 @@ function buildServer(stdio = false): McpServer {
 
   tool(
     "list_tabs",
-    { description: "List the Chrome tabs in this session's window (id, title, url, active)." },
-    async () => text(JSON.stringify(await sendCmd("list_tabs", { agentId }))),
+    {
+      description: "List the Chrome tabs in this session's window (id, title, url, active), in one browser profile.",
+      inputSchema: {
+        profile: z.string().optional().describe("Browser profile (name or email from list_profiles); default: the session's."),
+      },
+    },
+    async ({ profile: wanted }) => {
+      const pid = resolveProfileArg(wanted) ?? (await profileFor());
+      const tabs = (await cmd("list_tabs", { agentId }, undefined, pid)) as Record<string, unknown>[];
+      const profile = labelOfProfile(pid);
+      for (const t of tabs) if (typeof t.tabId === "number") tabProfiles.set(t.tabId, pid);
+      return text(JSON.stringify(tabs.map((t) => ({ ...t, profile }))));
+    },
   );
 
   tool(
@@ -1683,8 +2051,16 @@ function buildServer(stdio = false): McpServer {
         "returned id works with read-only tools: read_page, read_elements, " +
         "find_text, wait_for, screenshot. Acting on it (click, type, navigate, " +
         "...) is refused — open_tab the URL to work with it.",
+      inputSchema: {
+        profile: z.string().optional().describe("Browser profile (name or email from list_profiles); default: the session's."),
+      },
     },
-    async () => text(JSON.stringify(await sendCmd("user_tab", { agentId }))),
+    async ({ profile }) => {
+      const pid = resolveProfileArg(profile) ?? (await profileFor());
+      const res = await cmd("user_tab", { agentId }, undefined, pid);
+      if (res && typeof res.tabId === "number") tabProfiles.set(res.tabId, pid);
+      return text(JSON.stringify({ ...res, profile: labelOfProfile(pid) }));
+    },
   );
 
   tool(
@@ -1706,7 +2082,8 @@ function buildServer(stdio = false): McpServer {
       inputSchema: { tab: z.number().int().describe("Tab id to close.") },
     },
     async ({ tab }) => {
-      await sendCmd("close_tab", { agentId, tabId: tab });
+      await cmd("close_tab", { agentId, tabId: tab }, undefined, profileOfTab(tab)); // the tab's own profile
+      tabProfiles.delete(tab);
       if (sess.currentTab === tab) sess.currentTab = null;
       return text(`Closed tab ${tab}.`);
     },

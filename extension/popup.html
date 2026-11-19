@@ -22,6 +22,8 @@
     .switch input:checked + .slider { background: var(--accent); }
     .switch input:checked + .slider::before { transform: translateX(19px); }
     .hint { font-size: 11px; color: var(--muted); }
+    .name { width: 100%; padding: 7px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); font: inherit; }
+    .name:focus { outline: none; border-color: var(--accent); }
     .hint.on { color: var(--accent); }
     .adv { display: block; width: 100%; margin-top: 14px; padding: 9px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; cursor: pointer; color: var(--text); font-weight: 600; }
     .adv:hover { border-color: var(--accent); }
@@ -29,6 +31,10 @@
 </head>
 <body>
   <div class="head"><img class="logo" src="icons/icon128.png" alt="OtterBridge logo" /><b>OtterBridge</b></div>
+
+  <div class="lbl">This profile</div>
+  <input id="profileName" class="name" type="text" maxlength="40" placeholder="e.g. Work" aria-label="Name for this Chrome profile" />
+  <div class="hint" id="profileEmail"></div>
 
   <div class="lbl">Speed preset</div>
   <div class="presets" id="presets">

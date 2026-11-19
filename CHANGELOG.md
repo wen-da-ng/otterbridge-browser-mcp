@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.7.0 — 2026-11-19
+
+### Added
+
+- **Several Chrome profiles.** Each profile running the extension now
+  announces itself — a name (set in the popup's new "This profile" field,
+  default: the signed-in account's name), the signed-in Google account and
+  the browser. New tools `list_profiles` and `use_profile`; every session
+  stays on one profile and results name it, so sessions can drive different
+  profiles at the same time. With several connected and none chosen, actions
+  are refused with the list instead of guessing. `OTTERBRIDGE_PROFILE` pins a
+  client to one profile. The extension asks for Chrome's `identity.email`
+  permission to read the signed-in account.
+- **Every tab is tied to its profile.** `open_tab`, `get_user_tab` and
+  `list_tabs` take an optional `profile`; any call passing a `tab` goes to
+  that tab's profile (approvals and Full Auto included), whatever the
+  session's default. Parallel subagents can each work in their own profile
+  without `use_profile`. `wait_for_download` takes the `tab` that started the
+  download, to pick its profile.
+- **No reconnecting when profiles come and go.** A profile opened (or an
+  extension installed) mid-session joins within seconds; the AI's next tool
+  result says so, and likewise when one is closed (unless it's back within
+  10 s, e.g. an extension reload). A 20 s heartbeat keeps Chrome from putting
+  an idle extension to sleep, which used to make an open profile look closed.
+- **Group numbers are per session**, handed out by the 8765 registry: a
+  session has the same "Otter · Claude Code N" label in every profile, and
+  two sessions never share one (each profile used to number on its own).
+- An extension too old to identify its profile is listed as
+  "Unidentified profile (older OtterBridge extension — update it there)".
+
+### Fixed
+
+- With the extension running in more than one profile, commands went to
+  whichever profile's extension had connected most recently — effectively a
+  random profile, which could change mid-session.
+
 ## 0.6.0 — 2026-10-28
 
 ### Added

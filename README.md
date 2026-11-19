@@ -107,7 +107,7 @@ and for the extension click the green **Code** button on the repo page →
 
 ## What your AI can do
 
-Thirty-four tools, each taking an optional `tab` id — plus multi-tab,
+Thirty-six tools, each taking an optional `tab` id — plus multi-tab,
 multi-agent control where every MCP session works in its own Chrome window and
 colored tab group. Everything that reads or acts on a page also works **inside
 iframes** (payment forms, embedded editors, nested frames) and **shadow DOM**
@@ -227,6 +227,28 @@ popup — it ungroups first, so nothing is left behind — or turn on *Close age
 windows 5 min after their AI client disconnects* in the options. Closing an
 agent window yourself? Right-click its group → **Delete group** instead of
 closing the window, or Chrome keeps the group.
+
+**Several Chrome profiles** (e.g. work and personal Google accounts): install
+the extension in each profile you want the AI to reach. Each profile tells the
+AI its name and signed-in account — rename it in the extension popup ("This
+profile"), e.g. *Work*. `list_profiles()` shows what's connected and
+`use_profile(profile)` sets the session's default by name or email, and
+`open_tab(url, profile)` opens a tab in a specific profile. Every tab stays
+tied to the profile it was opened in — any call that passes its `tab` acts
+there — so one session (e.g. parallel subagents) can work in several profiles
+at once, and different sessions can drive different profiles at the same
+time. Results name the profile. With only one profile connected nothing changes. With
+several, the AI must choose (it refuses to guess, so nothing happens in the
+wrong account) — or pin a client to one profile with `OTTERBRIDGE_PROFILE`
+in its MCP config (e.g. `"env": { "OTTERBRIDGE_PROFILE": "Personal" }`). A
+profile's extension only runs while that profile has a window open.
+
+It's all live — nothing needs reconnecting: open another profile (or install
+the extension in one) and it joins within seconds; close one and it drops
+out. The AI is told either way in its next tool result ("→ Browser profile
+connected: Personal …"). Group numbers are handed out per *session*, so a
+session is "Otter · Claude Code 2" in every profile it uses, and no two
+sessions share a number.
 
 **Subagents** of one Claude session share that session's window. To work in
 parallel, each opens its own tab (`open_tab`) and passes that `tab` id on every

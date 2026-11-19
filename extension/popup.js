@@ -29,9 +29,27 @@ function reflect() {
   hint.classList.toggle("on", auto);
 }
 
+// The name the AI sees for this Chrome profile (stored per profile, not
+// synced). Empty = the signed-in account's name part.
+async function initProfile() {
+  const input = document.getElementById("profileName");
+  const { profileName } = await chrome.storage.local.get("profileName");
+  input.value = profileName || "";
+  let email = "";
+  try {
+    email = (await new Promise((r) => chrome.identity.getProfileUserInfo({ accountStatus: "ANY" }, r))).email || "";
+  } catch (_) {}
+  if (!input.value && email) input.placeholder = email.split("@")[0];
+  document.getElementById("profileEmail").textContent = email
+    ? `Signed in as ${email} — the AI sees this name and email.`
+    : "Not signed in to Chrome — name this profile so the AI can tell it apart.";
+  input.addEventListener("change", () => chrome.storage.local.set({ profileName: input.value.trim() }));
+}
+
 async function init() {
   state = await C.load();
   reflect();
+  initProfile();
 
   document.querySelectorAll(".preset").forEach((b) => {
     if (b.dataset.preset === "custom") return;

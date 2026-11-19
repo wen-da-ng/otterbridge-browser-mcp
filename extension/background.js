@@ -79,12 +79,50 @@ Full Auto is ON — no approval prompts` : ACTION_TITLE,
 const REGISTRY_PORT = 8765; // must match BASE_PORT in server/src/index.ts
 const sockets = new Map(); // port -> WebSocket
 
+// ===== This browser profile =====
+// Each Chrome profile runs its own copy of this extension. On every connection
+// we say which profile we are, so servers can tell profiles apart and the AI
+// can pick one: a stable random id (per profile — storage.local isn't synced),
+// a name (set in the popup; defaults to the Google account's name part), the
+// signed-in account's email, and the browser (Chrome / Edge / ...).
+async function profileInfo() {
+  let { profileId, profileName } = await chrome.storage.local.get(["profileId", "profileName"]);
+  if (!profileId) {
+    profileId = crypto.randomUUID();
+    await chrome.storage.local.set({ profileId });
+  }
+  let email = "";
+  try {
+    email = (await new Promise((r) => chrome.identity.getProfileUserInfo({ accountStatus: "ANY" }, r))).email || "";
+  } catch (_) {}
+  const brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+  const brand = brands.map((b) => b.brand).find((b) => !/Chromium|Not.?A.?Brand/i.test(b)) || "Google Chrome";
+  const browser = brand.replace(/^(Google|Microsoft)\s+/, "");
+  const name = (profileName || "").trim() || (email ? email.split("@")[0] : `Profile ${profileId.slice(0, 4)}`);
+  return { id: profileId, name, email, browser };
+}
+
+async function sayHello(sock) {
+  try {
+    const profile = await profileInfo();
+    if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "hello", profile }));
+  } catch (_) {}
+}
+// Renamed in the popup: tell every connected server right away.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.profileName) for (const s of sockets.values()) sayHello(s);
+});
+
 function connectPort(port) {
   const sock = new WebSocket(`ws://localhost:${port}`);
   sockets.set(port, sock);
-  sock.onopen = () => console.log(`[agent] connected to MCP bridge on :${port}`);
+  sock.onopen = () => {
+    console.log(`[agent] connected to MCP bridge on :${port}`);
+    sayHello(sock);
+  };
   sock.onmessage = async (e) => {
     const msg = JSON.parse(e.data);
+    if (msg.type === "ping") return; // server heartbeat: keeps this worker awake
     if (msg.type === "bridges") {
       for (const p of msg.ports || []) {
         const s = sockets.get(p);
@@ -314,16 +352,18 @@ function withAgentLock(agentId, fn) {
   return run;
 }
 
-function agentRecord(agentId, clientName) {
+// sessionNo comes from the server (the 8765 registry hands numbers out), so a
+// session carries the same number in every Chrome profile; without one we
+// number locally.
+function agentRecord(agentId, clientName, sessionNo) {
   let ag = agents[agentId];
+  const n = sessionNo || (ag ? null : ++agentSeq);
   if (!ag) {
-    const n = ++agentSeq;
-    ag = agents[agentId] = {
-      windowId: null,
-      groupId: null,
-      label: `Otter · ${clientName || "agent"} ${n}`,
-      color: GROUP_COLORS[(n - 1) % GROUP_COLORS.length],
-    };
+    ag = agents[agentId] = { windowId: null, groupId: null, label: "", color: "" };
+  }
+  if (n) {
+    ag.label = `Otter · ${clientName || "agent"} ${n}`;
+    ag.color = GROUP_COLORS[(n - 1) % GROUP_COLORS.length];
   }
   return ag;
 }
@@ -378,10 +418,10 @@ async function windowAlive(windowId) {
 // doesn't grab the user's keyboard) and in its group. reuse: an agent that
 // already has a window (e.g. its client reconnected) continues in that
 // window's current tab instead of opening another.
-async function openAgentTab(agentId, clientName, url, reuse) {
+async function openAgentTab(agentId, clientName, url, reuse, sessionNo) {
   await agentsReady;
   return withAgentLock(agentId, async () => {
-    const ag = agentRecord(agentId, clientName);
+    const ag = agentRecord(agentId, clientName, sessionNo);
     let tab;
     const [current] = reuse && (await windowAlive(ag.windowId))
       ? await chrome.tabs.query({ windowId: ag.windowId, active: true })
@@ -1037,7 +1077,7 @@ async function handle(action, p) {
 
   // ----- Multi-tab management (no pre-existing active tab required) -----
   if (action === "open_tab") {
-    const { tab: created, ag } = await openAgentTab(p.agentId, p.clientName, p.url, p.reuse);
+    const { tab: created, ag } = await openAgentTab(p.agentId, p.clientName, p.url, p.reuse, p.sessionNo);
     // Attach CDP immediately (not lazily on first click) so console/network
     // capture covers the page load. Best-effort: chrome:// pages can't attach.
     try { await ensureDebugger(created.id); } catch (_) {}

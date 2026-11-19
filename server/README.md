@@ -47,6 +47,7 @@ call; the user's own tabs are read-only (`get_user_tab`).
 |---|---|---|---|
 | `BROWSER_AGENT_GATE` | `elicit` / `off` (also accepts `true`/`false`) | `elicit` | `off`/`false` disables the approval gate |
 | `BROWSER_AGENT_GATE_FALLBACK` | `deny` / `allow` (also accepts `false`/`true`) | `deny` | what to do when the client can't elicit |
+| `OTTERBRIDGE_PROFILE` | a profile name, email or id | — | pin every session of this server to one browser profile (otherwise: the only connected one, or the AI picks with `use_profile`) |
 
 The `.mcpb` exposes these as two checkboxes in Claude Desktop's settings
 (booleans substitute into the env as `"true"`/`"false"`, which the server
