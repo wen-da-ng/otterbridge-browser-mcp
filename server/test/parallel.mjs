@@ -7,6 +7,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { useTempHome, connectFakeExtension, httpTransport } from "./_ext.mjs";
+
+useTempHome();
 
 // Test servers bridge on a port far outside the range (8765-8774) the real
 // Otter extension scans, so a live Chrome never attaches to them. Spawned
@@ -45,7 +48,7 @@ function handleExt(action, p) {
 
 async function mkClient() {
   const c = new Client({ name: "par", version: "1.0.0" });
-  await c.connect(new StreamableHTTPClientTransport(new URL("http://127.0.0.1:8000/mcp")));
+  await c.connect(await httpTransport());
   return c;
 }
 const call = async (c, name, args = {}) => firstText(await c.callTool({ name, arguments: args }));
@@ -54,18 +57,13 @@ async function main() {
   const proc = spawn("node", ["dist/index.js"], { cwd: process.cwd(), stdio: ["ignore", "ignore", "ignore"] });
   try {
     await sleep(1200);
-    const ext = new WebSocket(`ws://localhost:${WS_PORT}`);
-    ext.on("message", (raw) => {
-      const { id, action, params } = JSON.parse(raw.toString());
-      // Jittered async reply so in-flight commands reorder.
-      const delay = 5 + Math.floor(Math.random() * 25);
-      setTimeout(() => {
-        let result = null, error = null;
-        try { result = handleExt(action, params || {}); } catch (e) { error = e.message; }
-        ext.send(JSON.stringify({ id, result, error }));
-      }, delay);
+    // Jittered async reply so in-flight commands reorder.
+    await connectFakeExtension(WS_PORT, {
+      onCommand: async (action, params) => {
+        await sleep(5 + Math.floor(Math.random() * 25));
+        return handleExt(action, params);
+      },
     });
-    await new Promise((res, rej) => { ext.on("open", res); ext.on("error", rej); });
 
     const A = await mkClient();
     const B = await mkClient();

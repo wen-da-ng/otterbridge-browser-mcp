@@ -69,6 +69,13 @@ confirm the install. Two safety checkboxes appear — **keep the defaults**.
 **4 — Try it:** with Chrome open, ask Claude:
 *"Open example.com and tell me what's on the page."*
 
+**Optional — extra security with pairing:** switch on **Require pairing** in
+the Otter popup and ask Claude to *"pair my browser"*. Claude shows you a code
+in a prompt: paste it into the popup, press **Pair**, then type the code's last
+4 characters in the prompt and press **Accept**. Another Chrome profile? In a
+paired profile's popup press **Show code → Copy** and paste it there. See
+[Security](#safety--security) for what it protects against.
+
 <details>
 <summary><b>No release download available?</b></summary>
 
@@ -83,6 +90,16 @@ and for the extension click the green **Code** button on the repo page →
 
 - **Nothing happens?** Make sure Chrome is open and the Otter extension is
   loaded (`chrome://extensions`). The extension reconnects automatically.
+- **A red "!" on the Otter icon / "not paired with this computer yet"?** That
+  profile has *Require pairing* on and needs the code. Ask Claude to "pair my
+  browser" — it shows you the code — or copy it from a paired profile's popup
+  (**Show code**). Or switch *Require pairing* off.
+- **"The pairing code … doesn't match"?** Paste the code again in the Otter
+  popup. (The code only changes if OtterBridge's settings folder was deleted.)
+- **"The Otter Chrome extension is older than this OtterBridge server"?**
+  Download the matching `otterbridge-browser-extension.zip`, replace the
+  unzipped folder, and click ↻ on the extension at `chrome://extensions`. The
+  extension and the `.mcpb` should always come from the same release.
 - **Not showing up in CoWork?** CoWork isn't supported yet (see the note
   above) — use a regular Claude Desktop chat session.
 - A **"Chrome is being debugged" banner** appears at the top — normal and
@@ -107,7 +124,7 @@ and for the extension click the green **Code** button on the repo page →
 
 ## What your AI can do
 
-Thirty-six tools, each taking an optional `tab` id — plus multi-tab,
+Thirty-seven tools, each taking an optional `tab` id — plus multi-tab,
 multi-agent control where every MCP session works in its own Chrome window and
 colored tab group. Everything that reads or acts on a page also works **inside
 iframes** (payment forms, embedded editors, nested frames) and **shadow DOM**
@@ -233,7 +250,8 @@ the extension in each profile you want the AI to reach. Each profile tells the
 AI its name and signed-in account — rename it in the extension popup ("This
 profile"), e.g. *Work*. `list_profiles()` shows what's connected and
 `use_profile(profile)` sets the session's default by name or email, and
-`open_tab(url, profile)` opens a tab in a specific profile. Every tab stays
+`open_tab(url, profile)` opens a tab in a specific profile (`pair_browser()`
+shows you the pairing code when a profile with pairing on is waiting). Every tab stays
 tied to the profile it was opened in — any call that passes its `tab` acts
 there — so one session (e.g. parallel subagents) can work in several profiles
 at once, and different sessions can drive different profiles at the same
@@ -321,6 +339,27 @@ and everything binds to **localhost only** — nothing is exposed to the network
 - **`evaluate_js` is doubly gated:** disabled unless you switch it on in the
   extension's options page (Advanced), and even then every call goes through
   the same human-approval elicitation as destructive clicks.
+- **Pairing (opt-in):** without it, the extension trusts whatever answers on
+  `localhost:8765–8774` — another program on your computer that grabs those
+  ports gets your profile name and Google email and can drive your browser
+  without approval prompts. Switch on *Require pairing* in the popup and the
+  extension and every OtterBridge server must prove they share a pairing code
+  (in `~/.otterbridge/pairing.json`), in both directions, before anything else
+  is exchanged; the HTTP endpoint then needs it as a bearer token. This keeps
+  out other users of the computer, containers / VMs / WSL sharing
+  `localhost`, sandboxed apps, and any unrelated program listening on those
+  ports. It does **not** protect against a program running as *you* with
+  access to your files: that program can read the code, like any other file of
+  yours. The code is shown to you, never to the AI, and never written to the
+  audit log. The setting is per computer and only changes through a paired
+  extension or your OK in the AI app, so a fake extension can't switch it off.
+- **Second line of defence:** commands you approved are marked as approved,
+  and the extension itself refuses a destructive-looking click, an OK on a
+  destructive dialog, an upload or `evaluate_js` that arrives unmarked (unless
+  Full Auto is on). Approval prompts still appear in your AI app, as before.
+- **Known gap:** pressing Enter in a form field (or typing into a field that
+  submits on its own) submits the form without an approval prompt — only
+  clicks, dialogs, uploads and `evaluate_js` are gated.
 - Servers bind to **localhost only**. Never expose them on the network.
 - **Bridge & endpoint are origin/host-locked** (defense against local-page
   attacks): the `ws://localhost:8765–8774` bridge only accepts the extension
@@ -389,12 +428,18 @@ manually and keep it running:
 npm start                 # streamable HTTP at http://localhost:8000/mcp
 ```
 
-Then register it once (a reconnect fails with `-32000` if the server isn't
-running):
+Then register it once, with the pairing code as a bearer token (a reconnect
+fails with `-32000` if the server isn't running). `node dist/index.js
+--pairing-code` prints the code:
 
 ```
-claude mcp add --transport http otterbridge-browser-mcp http://localhost:8000/mcp
+claude mcp add --transport http otterbridge-browser-mcp http://localhost:8000/mcp --header "Authorization: Bearer <pairing code>"
 ```
+
+The code lives in `~/.otterbridge/pairing.json` on macOS and Linux and in
+`%USERPROFILE%\.otterbridge\pairing.json` on Windows (`OTTERBRIDGE_HOME`
+moves it). Deleting it creates a new code on the next start, and every
+extension then has to pair again.
 
 Either way, wait for `[bridge] extension connected` (the extension
 auto-reconnects), then run `/mcp` in Claude Code to attach.
@@ -408,7 +453,9 @@ streamable-HTTP endpoint:
 ```
 npx @modelcontextprotocol/inspector
 ```
-Transport `Streamable HTTP` → `http://localhost:8000/mcp`.
+Transport `Streamable HTTP` → `http://localhost:8000/mcp`, with the header
+`Authorization: Bearer <pairing code>` (`node dist/index.js --pairing-code`
+prints it).
 </details>
 
 <details>

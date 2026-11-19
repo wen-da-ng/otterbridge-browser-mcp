@@ -5,6 +5,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { useTempHome, connectFakeExtension, httpTransport } from "./_ext.mjs";
+
+useTempHome();
 
 // Test servers bridge on a port far outside the range (8765-8774) the real
 // Otter extension scans, so a live Chrome never attaches to them. Spawned
@@ -49,7 +52,7 @@ function handleExt(action, p) {
 
 async function mkClient() {
   const client = new Client({ name: "mt", version: "1.0.0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL("http://127.0.0.1:8000/mcp")));
+  await client.connect(await httpTransport());
   return client;
 }
 const call = async (c, name, args = {}) => firstText(await c.callTool({ name, arguments: args }));
@@ -58,14 +61,7 @@ async function main() {
   const proc = spawn("node", ["dist/index.js"], { cwd: process.cwd(), stdio: ["ignore", "ignore", "ignore"] });
   try {
     await sleep(1200);
-    const ext = new WebSocket(`ws://localhost:${WS_PORT}`);
-    ext.on("message", (raw) => {
-      const { id, action, params } = JSON.parse(raw.toString());
-      let result = null, error = null;
-      try { result = handleExt(action, params || {}); } catch (e) { error = e.message; }
-      ext.send(JSON.stringify({ id, result, error }));
-    });
-    await new Promise((res, rej) => { ext.on("open", res); ext.on("error", rej); });
+    await connectFakeExtension(WS_PORT, { onCommand: handleExt });
 
     // Two independent MCP sessions (= two agents).
     const A = await mkClient();

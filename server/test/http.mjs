@@ -10,6 +10,9 @@ import { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { useTempHome, connectFakeExtension, httpTransport } from "./_ext.mjs";
+
+useTempHome();
 
 // Test servers bridge on a port far outside the range (8765-8774) the real
 // Otter extension scans, so a live Chrome never attaches to them. Spawned
@@ -32,7 +35,12 @@ const ELEMENTS = [
   { index: 0, tag: "a", text: "Home", x: 10, y: 10 },
   { index: 1, tag: "button", text: "Submit order", x: 20, y: 20 },
   { index: 2, tag: "button", text: "Open menu", x: 30, y: 30 }, // under a cookie banner
+  // The extension's own gate check: the live target turned out destructive.
+  { index: 3, tag: "button", text: "Home2", x: 40, y: 40 },  // -> "Delete" unless gated
+  { index: 4, tag: "button", text: "Weird", x: 50, y: 50 },  // refused with the SAME text
 ];
+const clicks = [];          // params of every click command
+let evalParams = null;
 let dialog = { open: false };
 let approvalMode = "ask"; // the extension popup's Full Auto switch
 const opened = [];          // open_tab calls seen, to check auto-open
@@ -59,7 +67,10 @@ function handleExtension(action, p) {
       // coords from the element list (the server no longer passes x/y for
       // index clicks). Raw clicks fall back to the given coordinates.
       const el = p.index != null ? ELEMENTS[p.index] : null;
+      clicks.push(p);
       if (p.index === 2) return { changed: true, covered: true, actualText: "Accept cookies", x: 30, y: 30 };
+      if (p.index === 3 && p.gated !== true) return { changed: true, ungated: true, actualText: "Delete", x: 40, y: 40 };
+      if (p.index === 4) return { changed: true, ungated: true, actualText: "Weird", x: 50, y: 50 };
       const verb = p.button === "right" ? "Right-clicked" : p.double ? "Double-clicked" : "Clicked";
       return `${verb} at (${el ? el.x : p.x}, ${el ? el.y : p.y})`;
     }
@@ -70,6 +81,7 @@ function handleExtension(action, p) {
     case "upload_file": return p.dryRun ? { ok: true, url: "https://upload.example/form", multiple: false } : "Attached 1 file(s) to the file input.";
     case "dialog_info": return dialog;
     case "handle_dialog": dialog = { open: false }; return `${p.accept ? "Accepted" : "Dismissed"} the dialog.`;
+    case "evaluate_js": evalParams = p; return { type: "number", result: "2" };
     case "screenshot":
       return { base64: TINY_JPEG, format: "jpeg", width: 800, height: 600, dpr: 1, capturedWidth: 800, capturedHeight: 600 };
     default: throw new Error(`Unknown action: ${action}`);
@@ -82,8 +94,7 @@ async function mkClient({ elicit }) {
   if (elicit) {
     client.setRequestHandler(ElicitRequestSchema, async () => ({ action: "accept", content: {} }));
   }
-  const transport = new StreamableHTTPClientTransport(new URL("http://127.0.0.1:8000/mcp"));
-  await client.connect(transport);
+  await client.connect(await httpTransport());
   return client;
 }
 const firstText = (r) => r.content.find((c) => c.type === "text")?.text ?? "";
@@ -99,16 +110,8 @@ async function main() {
     await sleep(1200); // let both ports bind
 
     // Fake extension attaches to the bridge.
-    const ext = new WebSocket(`ws://localhost:${WS_PORT}`);
-    ext.on("message", (raw) => {
-      const { id, action, params } = JSON.parse(raw.toString());
-      let result = null, error = null;
-      try { result = handleExtension(action, params || {}); }
-      catch (e) { error = e.message; }
-      ext.send(JSON.stringify({ id, result, error }));
-    });
-    await new Promise((res, rej) => { ext.on("open", res); ext.on("error", rej); });
-    console.log("[test] fake extension connected to bridge");
+    const ext = await connectFakeExtension(WS_PORT, { onCommand: handleExtension });
+    console.log("[test] fake extension paired with the bridge");
 
     // --- MCP client that CAN elicit (approves destructive) ---
     const client = await mkClient({ elicit: true });
@@ -126,9 +129,9 @@ async function main() {
       "read_network", "read_page", "reload", "run_script", "screenshot", "scroll",
       "select_option", "type_text", "use_tab", "wait_for", "get_user_tab",
       "page_snapshot", "handle_dialog", "upload_file", "wait_for_download", "set_viewport", "save_pdf",
-      "list_profiles", "use_profile",
+      "list_profiles", "use_profile", "pair_browser",
     ].sort();
-    ok("tools/list has all 36 tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
+    ok("tools/list has all 37 tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
 
     const rp = await client.callTool({ name: "read_page", arguments: {} });
     ok("read_page returns JSON text", firstText(rp).includes("example.com"));
@@ -157,6 +160,17 @@ async function main() {
 
     const rawClickDanger = await client.callTool({ name: "click", arguments: { x: 20, y: 20 } });
     ok("click(x,y) on destructive + elicit-accept -> clicks", firstText(rawClickDanger) === "Clicked at (20, 20)");
+
+    // Second line of defence: approved commands are marked, others aren't.
+    clicks.length = 0;
+    await client.callTool({ name: "click_element", arguments: { index: 1 } });
+    await client.callTool({ name: "click_element", arguments: { index: 0 } });
+    ok("approved destructive click carries gated: true", clicks[0]?.gated === true, JSON.stringify(clicks[0]));
+    ok("harmless click carries no gated flag", clicks[1] && !("gated" in clicks[1]), JSON.stringify(clicks[1]));
+    const regated = await client.callTool({ name: "click_element", arguments: { index: 3 } });
+    ok("extension refuses an ungated 'Delete' -> server gates it, then clicks", firstText(regated) === "Clicked at (40, 40)", `got "${firstText(regated)}"`);
+    await client.callTool({ name: "evaluate_js", arguments: { code: "1+1" } });
+    ok("approved evaluate_js carries gated: true", evalParams?.gated === true, JSON.stringify(evalParams));
 
     const typed = await client.callTool({ name: "type_text", arguments: { text: "hello" } });
     ok("type_text", firstText(typed) === "Typed 5 chars");
@@ -200,6 +214,12 @@ async function main() {
     ok("right-click on destructive element is not gated", firstText(rc) === "Right-clicked at (20, 20)", `got "${firstText(rc)}"`);
     const rcRaw = await noElicit.callTool({ name: "click", arguments: { x: 20, y: 20, button: "right" } });
     ok("right-click(x,y) is not gated either", firstText(rcRaw) === "Right-clicked at (20, 20)", `got "${firstText(rcRaw)}"`);
+
+    // The extension saw a destructive target the server didn't gate.
+    const refusedNew = await noElicit.callTool({ name: "click_element", arguments: { index: 3 } });
+    ok("ungated 'Delete' seen by the extension -> server asks -> denied", firstText(refusedNew) === "Action denied by user: click on 'Delete'.", `got "${firstText(refusedNew)}"`);
+    const refusedSame = await noElicit.callTool({ name: "click_element", arguments: { index: 4 } });
+    ok("extension refusal with unchanged text -> refused, no loop", firstText(refusedSame).startsWith("Click refused by the browser extension: 'Weird'"), `got "${firstText(refusedSame)}"`);
 
     // --- Full Auto (extension popup switch): no prompt, no denial ---
     approvalMode = "auto";

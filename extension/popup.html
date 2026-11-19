@@ -3,66 +3,181 @@
 <head>
   <meta charset="utf-8" />
   <style>
-    :root { --accent:#F24E07; --accent2:#FFC814; --bg:#fff; --panel:#f6f7f9; --border:#e3e6ea; --text:#1b1f24; --muted:#6b7280; }
-    @media (prefers-color-scheme: dark) { :root { --bg:#16191d; --panel:#1f242a; --border:#2c333b; --text:#e8eaed; --muted:#9aa4af; } }
+    :root {
+      --accent: #F24E07; --accent-ink: #fff;
+      --bg: #fff; --panel: #f4f5f7; --border: #e1e4e8; --text: #1b1f24; --muted: #5f6873;
+      --ok: #188038; --warn: #a15c00; --danger: #c5221f; --idle: #9aa0a6;
+      --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16191d; --panel: #1f242a; --border: #2e353d; --text: #e8eaed; --muted: #a3acb6;
+        --ok: #81c995; --warn: #fdd663; --danger: #f28b82; --idle: #6b737c;
+      }
+    }
     * { box-sizing: border-box; }
-    body { width: 260px; margin: 0; padding: 14px; font: 13px/1.45 system-ui, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
-    .head { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
-    .logo { width: 26px; height: 26px; border-radius: 7px; object-fit: contain; display: block; }
-    .head b { font-size: 14px; }
-    .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 12px 0 6px; }
-    .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-    .preset { padding: 8px 6px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; cursor: pointer; font-weight: 600; color: var(--text); text-align: center; }
-    .preset[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: #fff; }
-    .toggle-row { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; }
-    .switch { position: relative; width: 42px; height: 23px; }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .slider { position: absolute; inset: 0; background: var(--border); border-radius: 999px; transition: .2s; cursor: pointer; }
-    .slider::before { content: ""; position: absolute; height: 17px; width: 17px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
-    .switch input:checked + .slider { background: var(--accent); }
-    .switch input:checked + .slider::before { transform: translateX(19px); }
-    .hint { font-size: 11px; color: var(--muted); }
-    .name { width: 100%; padding: 7px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); font: inherit; }
-    .name:focus { outline: none; border-color: var(--accent); }
-    .hint.on { color: var(--accent); }
-    .adv { display: block; width: 100%; margin-top: 14px; padding: 9px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; cursor: pointer; color: var(--text); font-weight: 600; }
-    .adv:hover { border-color: var(--accent); }
+    ::selection { background: var(--accent); color: var(--accent-ink); }
+    body {
+      width: 280px; margin: 0; padding: 14px 16px 16px;
+      font: 13px/1.4 system-ui, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text); caret-color: var(--accent);
+    }
+    button, input { font: inherit; color: inherit; }
+    :focus-visible { outline: none; box-shadow: var(--ring); }
+    [hidden] { display: none !important; }
+    /* No animation until the first render, so switches don't slide on open. */
+    body:not(.ready) * { transition: none !important; }
+
+    /* Header */
+    .head { display: flex; align-items: center; gap: 8px; }
+    .logo { width: 24px; height: 24px; border-radius: 6px; object-fit: contain; }
+    .head b { font-size: 14px; font-weight: 650; }
+    .status { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
+    .status[data-tone="ok"] .dot { background: var(--ok); }
+    .status[data-tone="warn"] .dot { background: var(--warn); }
+    .status[data-tone="danger"] .dot { background: var(--danger); }
+    .status[data-tone="danger"] { color: var(--danger); }
+
+    section { padding: 14px 0; border-top: 1px solid var(--border); }
+    .head + section { margin-top: 12px; }
+    section:last-of-type { padding-bottom: 0; }
+
+    /* Rows: label left, control right */
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 28px; }
+    .row + .row { margin-top: 6px; }
+    .row-label { font-weight: 550; }
+    .sub { margin-top: 2px; font-size: 12px; color: var(--muted); }
+    .sub.warn { color: var(--warn); }
+    .sub.danger { color: var(--danger); }
+    .sub.ok { color: var(--ok); }
+    .on-note { font-size: 12px; color: var(--accent); font-weight: 550; margin-left: 6px; }
+
+    /* Switch */
+    .switch { position: relative; width: 36px; height: 20px; flex: none; }
+    .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+    .track { position: absolute; inset: 0; border-radius: 999px; background: var(--border); transition: background .18s ease-out; pointer-events: none; }
+    .track::before { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgb(0 0 0 / .25); transition: transform .18s cubic-bezier(.2, .8, .2, 1); }
+    .switch input:checked + .track { background: var(--accent); }
+    .switch input:checked + .track::before { transform: translateX(16px); }
+    .switch input:focus-visible + .track { box-shadow: var(--ring); }
+
+    /* Pairing code */
+    .pair-row { display: flex; gap: 6px; margin-top: 10px; }
+    .field {
+      width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px;
+      background: var(--panel); transition: border-color .15s ease-out;
+    }
+    .field:hover { border-color: var(--muted); }
+    .field:focus-visible { border-color: var(--accent); box-shadow: none; }
+    .field::placeholder { color: var(--muted); opacity: .8; }
+    .code { flex: 1; min-width: 0; font-family: ui-monospace, Consolas, monospace; font-size: 12px; letter-spacing: .02em; }
+    .btn {
+      padding: 7px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+      font-weight: 600; cursor: pointer; transition: border-color .15s ease-out, background .15s ease-out;
+    }
+    .btn:hover { border-color: var(--muted); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+    .btn.primary:hover { filter: brightness(1.06); }
+    .btn:disabled { opacity: .55; cursor: default; }
+    .link { padding: 0; border: 0; background: none; color: var(--muted); font-size: 12px; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; border-radius: 3px; }
+    .link:hover { color: var(--text); }
+    .links { display: flex; gap: 14px; margin-top: 4px; }
+    .reveal { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+    .reveal code {
+      flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px;
+      background: var(--panel); font: 12px/1.3 ui-monospace, Consolas, monospace; letter-spacing: .02em;
+      user-select: all; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    /* Profile + speed */
+    .stack-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+    .seg { display: grid; grid-template-columns: repeat(3, 1fr); padding: 2px; border-radius: 9px; background: var(--panel); border: 1px solid var(--border); }
+    .seg button { padding: 5px 0; border: 0; border-radius: 7px; background: none; font-weight: 600; font-size: 12px; color: var(--muted); cursor: pointer; transition: background .15s ease-out, color .15s ease-out; }
+    .seg button:hover { color: var(--text); }
+    .seg button[aria-pressed="true"] { background: var(--bg); color: var(--text); box-shadow: 0 1px 3px rgb(0 0 0 / .14); }
+    .speed-head { display: flex; justify-content: space-between; align-items: baseline; margin: 12px 0 5px; }
+    .speed-head .stack-label { margin: 0; }
+    .custom-tag { font-size: 12px; color: var(--accent); font-weight: 550; }
+
+    /* Footer */
+    .actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .actions .btn { font-size: 12px; padding: 7px 12px; white-space: nowrap; }
+    .msg { min-height: 0; margin-top: 8px; font-size: 12px; color: var(--muted); }
+    .msg:empty { display: none; }
   </style>
 </head>
 <body>
-  <div class="head"><img class="logo" src="icons/icon128.png" alt="OtterBridge logo" /><b>OtterBridge</b></div>
-
-  <div class="lbl">This profile</div>
-  <input id="profileName" class="name" type="text" maxlength="40" placeholder="e.g. Work" aria-label="Name for this Chrome profile" />
-  <div class="hint" id="profileEmail"></div>
-
-  <div class="lbl">Speed preset</div>
-  <div class="presets" id="presets">
-    <button class="preset" data-preset="natural" aria-pressed="false">Natural</button>
-    <button class="preset" data-preset="fast" aria-pressed="false">Fast</button>
-    <button class="preset" data-preset="instant" aria-pressed="false">Instant</button>
-    <button class="preset" data-preset="custom" aria-pressed="false" disabled>Custom</button>
+  <div class="head">
+    <img class="logo" src="icons/icon128.png" alt="" />
+    <b>OtterBridge</b>
+    <span class="status" id="status" role="status" data-tone="idle"><span class="dot"></span><span id="statusText">—</span></span>
   </div>
 
-  <div class="toggle-row">
-    <span><b>Show cursor</b></span>
-    <label class="switch"><input type="checkbox" id="cursorEnabled" /><span class="slider"></span></label>
-  </div>
+  <section aria-label="Security">
+    <div class="row">
+      <div>
+        <div class="row-label" id="reqLabel">Require pairing</div>
+        <div class="sub" id="reqSub">Switch on for extra security</div>
+      </div>
+      <label class="switch"><input type="checkbox" id="requirePairing" aria-labelledby="reqLabel" aria-describedby="reqSub" /><span class="track"></span></label>
+    </div>
+    <div id="pairForm" hidden>
+      <div class="pair-row">
+        <input id="pairCode" class="field code" type="text" maxlength="40" autocomplete="off" spellcheck="false"
+               placeholder="XXXX-XXXX-XXXX-XXXX-XXXX" aria-label="Pairing code" aria-describedby="pairHint" />
+        <button class="btn primary" id="pairBtn">Pair</button>
+      </div>
+    </div>
+    <div class="sub" id="pairHint" aria-live="polite"></div>
+    <div class="links" id="pairLinks" hidden>
+      <button class="link" id="showCode" aria-expanded="false" aria-controls="codeReveal">Show code</button>
+      <button class="link" id="pairChange">Change code</button>
+    </div>
+    <div class="reveal" id="codeReveal" hidden>
+      <code id="codeText" aria-label="Pairing code"></code>
+      <button class="btn" id="copyCode">Copy</button>
+    </div>
+  </section>
 
-  <div class="toggle-row">
-    <span><b>Fast mode</b><br /><span class="hint" id="fastHint">Animated cursor, human-paced typing</span></span>
-    <label class="switch"><input type="checkbox" id="fastMode" /><span class="slider"></span></label>
-  </div>
+  <section aria-label="This browser">
+    <label class="stack-label" for="profileName">Profile name</label>
+    <input id="profileName" class="field" type="text" maxlength="40" placeholder="e.g. Work" aria-describedby="profileEmail" />
+    <div class="sub" id="profileEmail"></div>
 
-  <div class="toggle-row">
-    <span><b>Full Auto</b><br /><span class="hint" id="autoHint">Ask before destructive clicks</span></span>
-    <label class="switch"><input type="checkbox" id="fullAuto" /><span class="slider"></span></label>
-  </div>
+    <div class="speed-head">
+      <span class="stack-label" id="speedLabel">Speed</span>
+      <span class="custom-tag" id="customTag" hidden>Custom</span>
+    </div>
+    <div class="seg" role="group" aria-labelledby="speedLabel" id="presets">
+      <button data-preset="natural" aria-pressed="false">Natural</button>
+      <button data-preset="fast" aria-pressed="false">Fast</button>
+      <button data-preset="instant" aria-pressed="false">Instant</button>
+    </div>
+  </section>
 
-  <button class="adv" id="cleanup" title="Ungroups and closes every agent window, so Chrome doesn't keep their tab groups on the bookmarks bar.">Close agent windows</button>
-  <div class="hint" id="cleanupMsg" style="margin-top:6px;min-height:1em"></div>
+  <section aria-label="Behaviour">
+    <div class="row">
+      <span class="row-label" id="cursorLabel">Show cursor</span>
+      <label class="switch"><input type="checkbox" id="cursorEnabled" aria-labelledby="cursorLabel" /><span class="track"></span></label>
+    </div>
+    <div class="row" title="No cursor glide or typing delays — still real input.">
+      <span class="row-label" id="fastLabel">Fast mode</span>
+      <label class="switch"><input type="checkbox" id="fastMode" aria-labelledby="fastLabel" /><span class="track"></span></label>
+    </div>
+    <div class="row" title="Skip approval prompts for destructive actions.">
+      <span><span class="row-label" id="autoLabel">Full Auto</span><span class="on-note" id="autoNote" hidden>No prompts</span></span>
+      <label class="switch"><input type="checkbox" id="fullAuto" aria-labelledby="autoLabel" /><span class="track"></span></label>
+    </div>
+  </section>
 
-  <button class="adv" id="adv">Advanced settings…</button>
+  <section aria-label="Actions">
+    <div class="actions">
+      <button class="btn" id="cleanup" title="Ungroups and closes every agent window, so Chrome doesn't keep their tab groups on the bookmarks bar.">Close agent windows</button>
+      <button class="btn" id="adv">Settings</button>
+    </div>
+    <div class="msg" id="cleanupMsg" aria-live="polite"></div>
+  </section>
 
   <script src="config.js"></script>
   <script src="popup.js"></script>

@@ -6,6 +6,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { useTempHome, connectFakeExtension, httpTransport } from "./_ext.mjs";
+
+useTempHome();
 
 // Test servers bridge on a port far outside the range (8765-8774) the real
 // Otter extension scans, so a live Chrome never attaches to them. Spawned
@@ -19,28 +22,22 @@ const firstText = (r) => r.content.find((c) => c.type === "text")?.text ?? "";
 
 // A fake extension for one profile: says hello, records what it was asked.
 async function fakeProfile(id, name, email) {
-  const ws = new WebSocket(`ws://localhost:${WS_PORT}`);
-  const seen = [];
   const sessionNos = []; // sessionNo of each open_tab
-  ws.on("message", (raw) => {
-    const msg = JSON.parse(raw.toString());
-    if (msg.type) return; // registry messages / heartbeat
-    seen.push(msg.action);
-    if (msg.action === "open_tab") sessionNos.push(msg.params.sessionNo);
-    const result =
-      msg.action === "open_tab" ? { tabId: name === "Work" ? 70 : name === "Personal" ? 80 : 7, url: "about:blank", windowId: 1, label: "Otter · test 1" }
-      : msg.action === "navigate" ? `Navigated in ${name}`
-      : "ok";
-    ws.send(JSON.stringify({ id: msg.id, result }));
+  const { ws, seen } = await connectFakeExtension(WS_PORT, {
+    hello: { id, name, email, browser: "Chrome" },
+    onCommand: (action, params) => {
+      if (action === "open_tab") sessionNos.push(params.sessionNo);
+      return action === "open_tab" ? { tabId: name === "Work" ? 70 : name === "Personal" ? 80 : 7, url: "about:blank", windowId: 1, label: "Otter · test 1" }
+        : action === "navigate" ? `Navigated in ${name}`
+        : "ok";
+    },
   });
-  await new Promise((res, rej) => { ws.on("open", res); ws.on("error", rej); });
-  ws.send(JSON.stringify({ type: "hello", profile: { id, name, email, browser: "Chrome" } }));
   return { ws, seen, sessionNos };
 }
 
 async function client() {
   const c = new Client({ name: "profiles-test", version: "1.0.0" });
-  await c.connect(new StreamableHTTPClientTransport(new URL("http://127.0.0.1:8000/mcp")));
+  await c.connect(await httpTransport());
   return c;
 }
 

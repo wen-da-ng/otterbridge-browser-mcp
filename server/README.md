@@ -1,7 +1,7 @@
 # OtterBridge — Node server (`server/`)
 
 The Node/TypeScript port of the OtterBridge MCP server. One codebase, two
-transports, byte-compatible with the same unchanged Otter Chrome extension:
+transports, both talking to the Otter Chrome extension:
 
 - **stdio** (`--stdio`) — for Claude Desktop / the `.mcpb` bundle, which launches
   the server itself. **This is the zero-prerequisite path**: Node ships inside
@@ -18,6 +18,18 @@ empty ports). If the registry's server exits, another takes `8765` over.
 `OTTERBRIDGE_WS_PORT` moves the base port (the tests use 18765 so a live
 Chrome never attaches to them).
 
+**Pairing (opt-in).** The extension and the servers share a pairing code,
+kept in `~/.otterbridge/pairing.json` (created by the first server that
+starts; move the folder with `OTTERBRIDGE_HOME`). Every server registration
+proves knowledge of it. With "Require pairing" switched on in the popup,
+`pairing.json` holds `"required": true` and every bridge connection must prove
+the code before anything else is exchanged, and the HTTP endpoint needs it as
+`Authorization: Bearer <code>`. The setting changes only through a paired
+extension or the user's OK in an approval prompt. The user gets the code in an
+approval prompt (`pair_browser`, or automatically when no profile is
+connected); `node dist/index.js --pairing-code` prints it in a terminal. The
+code is never shown to the AI, written to the audit log or printed to stderr.
+
 > **Claude Desktop CoWork is not supported yet.** CoWork runs its agent in a
 > sandboxed VM that currently fails to connect to locally installed MCP
 > extensions ([known issue](https://github.com/anthropics/claude-code/issues/27492)).
@@ -25,11 +37,11 @@ Chrome never attaches to them).
 
 ## Tools
 
-28 tools — see the [root README](../README.md#what-your-ai-can-do). Each MCP
+37 tools — see the [root README](../README.md#what-your-ai-can-do). Each MCP
 session works in its own Chrome window + tab group, opened on its first tool
 call; the user's own tabs are read-only (`get_user_tab`).
 
-## Safety (identical to the Python server)
+## Safety
 
 - **Destructive-action gate**: clicks whose target text matches
   `buy|purchase|pay|checkout|order|delete|remove|send|submit|confirm|transfer|withdraw|post|publish|unsubscribe`
@@ -39,6 +51,10 @@ call; the user's own tabs are read-only (`get_user_tab`).
   default.
 - **Full Auto**: the extension popup's Full Auto switch skips approvals for all
   connected servers (read live on every gate; no tool can change it).
+- **Second line of defence**: commands the user approved carry `gated: true`;
+  the extension independently refuses a destructive-looking click, an OK on a
+  destructive or unread dialog, an upload or `evaluate_js` that arrives without
+  it (unless Full Auto is on).
 - All logging goes to **stderr** (stdout is the stdio protocol channel).
 
 ### Configuration (env)
@@ -48,6 +64,7 @@ call; the user's own tabs are read-only (`get_user_tab`).
 | `BROWSER_AGENT_GATE` | `elicit` / `off` (also accepts `true`/`false`) | `elicit` | `off`/`false` disables the approval gate |
 | `BROWSER_AGENT_GATE_FALLBACK` | `deny` / `allow` (also accepts `false`/`true`) | `deny` | what to do when the client can't elicit |
 | `OTTERBRIDGE_PROFILE` | a profile name, email or id | — | pin every session of this server to one browser profile (otherwise: the only connected one, or the AI picks with `use_profile`) |
+| `OTTERBRIDGE_HOME` | a folder | `~/.otterbridge` | where `pairing.json` (the pairing code) lives |
 
 The `.mcpb` exposes these as two checkboxes in Claude Desktop's settings
 (booleans substitute into the env as `"true"`/`"false"`, which the server

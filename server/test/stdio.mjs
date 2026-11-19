@@ -6,6 +6,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { useTempHome, connectFakeExtension } from "./_ext.mjs";
+
+useTempHome();
 
 // Test servers bridge on a port far outside the range (8765-8774) the real
 // Otter extension scans, so a live Chrome never attaches to them. Spawned
@@ -29,22 +32,15 @@ async function main() {
   await client.connect(transport);
 
   // Fake extension attaches to the bridge this stdio server hosts.
-  const ext = new WebSocket(`ws://localhost:${WS_PORT}`);
-  const announced = new Set(); // ports the registry told us about
-  ext.on("message", (raw) => {
-    const msg = JSON.parse(raw.toString());
-    if (msg.type === "bridges") { msg.ports.forEach((p) => announced.add(p)); return; }
-    const { id, action } = msg;
-    const result =
+  const { announced } = await connectFakeExtension(WS_PORT, {
+    onCommand: (action) =>
       action === "read_page" ? { url: "https://ok.test", title: "T", text: "x" }
       : action === "open_tab" ? { tabId: 7, url: "about:blank", windowId: 1, label: "Otter · stdio-test 1" }
-      : "ok";
-    ext.send(JSON.stringify({ id, result }));
-  });
-  await new Promise((res, rej) => { ext.on("open", res); ext.on("error", rej); });
+      : "ok",
+  }); // `announced`: ports the registry told us about
 
   const tools = (await client.listTools()).tools;
-  ok("stdio: tools/list returns 36 tools", tools.length === 36, `got ${tools.length}`);
+  ok("stdio: tools/list returns 37 tools", tools.length === 37, `got ${tools.length}`);
   const rp = await client.callTool({ name: "read_page", arguments: {} });
   ok("stdio: read_page round-trips through bridge", rp.content[0].text.includes("ok.test"));
 
@@ -56,10 +52,10 @@ async function main() {
   while (!/listening on ws:\/\/localhost:\d+/.test(stderr) && second.exitCode == null && Date.now() < deadline) await sleep(100);
   ok("second instance binds the next free port", stderr.includes(`listening on ws://localhost:${WS_PORT + 1}`), stderr.slice(0, 200));
   ok("second instance keeps running", second.exitCode == null, `exit=${second.exitCode}`);
-  const ext2 = new WebSocket(`ws://localhost:${WS_PORT + 1}`);
-  const opened = await new Promise((res) => { ext2.on("open", () => res(true)); ext2.on("error", () => res(false)); });
-  ok("extension can attach to the second instance too", opened);
-  ext2.close();
+  // Pairs on the second port too (the MAC is bound to the port it's on).
+  const ext2 = await connectFakeExtension(WS_PORT + 1).catch((e) => e);
+  ok("extension can pair with the second instance too", !(ext2 instanceof Error), String(ext2));
+  if (!(ext2 instanceof Error)) ext2.ws.close();
   for (let i = 0; i < 30 && !announced.has(WS_PORT + 1); i++) await sleep(100);
   ok("registry announces the second instance's port to the extension", announced.has(WS_PORT + 1), JSON.stringify([...announced]));
 

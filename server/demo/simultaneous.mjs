@@ -7,6 +7,13 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { setTimeout as sleep } from "node:timers/promises";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+// The HTTP endpoint needs the pairing code as a bearer token.
+const PAIRING_FILE = join(process.env.OTTERBRIDGE_HOME || join(homedir(), ".otterbridge"), "pairing.json");
+const AUTH = { requestInit: { headers: { Authorization: `Bearer ${JSON.parse(readFileSync(PAIRING_FILE, "utf-8")).code}` } } };
 
 // Default to the tabs opened by the earlier multi-agent demo; override via argv.
 const TAB_IDS = (process.argv.slice(2).map(Number).filter(Boolean));
@@ -18,7 +25,7 @@ const call = (c, name, args = {}) => c.callTool({ name, arguments: args }).then(
 
 async function mk(name) {
   const c = new Client({ name, version: "1.0.0" });
-  await c.connect(new StreamableHTTPClientTransport(new URL("http://127.0.0.1:8000/mcp")));
+  await c.connect(new StreamableHTTPClientTransport(new URL("http://127.0.0.1:8000/mcp"), AUTH));
   return c;
 }
 

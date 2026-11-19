@@ -49,23 +49,41 @@ async function drawAutoIcon() {
   return imageData;
 }
 
+let autoBadgeFallback = false; // Full Auto mark couldn't be drawn: shown as a badge
+
 async function reflectApprovalMode() {
   const auto = S.approvalMode === "auto";
-  chrome.action.setBadgeText({ text: "" });
+  autoBadgeFallback = false;
   chrome.action.setTitle({
     title: auto ? `${ACTION_TITLE}
 Full Auto is ON — no approval prompts` : ACTION_TITLE,
   });
   if (!auto) {
     chrome.action.setIcon({ path: Object.fromEntries(ICON_SIZES.map((s) => [s, `icons/icon${s}.png`])) });
+    refreshBadge();
     return;
   }
   try {
     autoIcon = autoIcon || (await drawAutoIcon());
     if (S.approvalMode === "auto") chrome.action.setIcon({ imageData: autoIcon });
   } catch (_) {
-    chrome.action.setBadgeText({ text: "▶▶" }); // can't draw: fall back to a badge
+    autoBadgeFallback = true; // can't draw: fall back to a badge
+  }
+  refreshBadge();
+}
+
+// The one owner of the toolbar badge: pairing trouble wins ("!" — open the
+// popup), otherwise the Full Auto fallback badge, otherwise nothing.
+function refreshBadge() {
+  const st = pairingStatus().state;
+  if (["unpaired", "mismatch", "refused", "waiting"].includes(st)) {
+    chrome.action.setBadgeText({ text: "!" });
+    chrome.action.setBadgeBackgroundColor({ color: "#D93025" });
+  } else if (autoBadgeFallback && S.approvalMode === "auto") {
+    chrome.action.setBadgeText({ text: "▶▶" });
     chrome.action.setBadgeBackgroundColor({ color: "#F24E07" });
+  } else {
+    chrome.action.setBadgeText({ text: "" });
   }
 }
 
@@ -99,7 +117,7 @@ async function profileInfo() {
   const brand = brands.map((b) => b.brand).find((b) => !/Chromium|Not.?A.?Brand/i.test(b)) || "Google Chrome";
   const browser = brand.replace(/^(Google|Microsoft)\s+/, "");
   const name = (profileName || "").trim() || (email ? email.split("@")[0] : `Profile ${profileId.slice(0, 4)}`);
-  return { id: profileId, name, email, browser };
+  return { id: profileId, name, email, browser, version: chrome.runtime.getManifest().version };
 }
 
 async function sayHello(sock) {
@@ -109,19 +127,222 @@ async function sayHello(sock) {
   } catch (_) {}
 }
 // Renamed in the popup: tell every connected server right away.
+// Only paired sockets ever learn who we are.
+const trustedSockets = new WeakSet();
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.profileName) for (const s of sockets.values()) sayHello(s);
+  if (area === "local" && changes.profileName) {
+    for (const s of sockets.values()) if (trustedSockets.has(s)) sayHello(s);
+  }
 });
 
+// ===== Pairing =====
+// We obey a server only after both sides proved they know the pairing code
+// (shown to the user by their AI app, pasted into the popup). Until then a
+// socket gets nothing from us — not even who we are — and we act on nothing
+// it sends, in particular not `bridges` (which says where to dial next).
+// See authenticate() in server/src/index.ts for the protocol.
+let pairingCode = null; // normalized code, or null when not paired yet
+// The popup's "Require pairing" switch — opt-in, off by default. Off: we tell
+// servers so and work with any that agrees (this computer's OtterBridge
+// agrees unless pairing was switched on for the computer).
+let pairingRequired = false;
+const pairingReady = chrome.storage.local.get(["pairingCode", "pairingRequired"]).then((r) => {
+  pairingCode = r.pairingCode || null;
+  pairingRequired = r.pairingRequired === true;
+});
+const pairedSockets = new WeakSet(); // proved the code (not merely let in)
+// Content scripts must never read the code from storage.local.
+try {
+  const p = chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+  if (p && p.catch) p.catch(() => {});
+} catch (_) {}
+
+// port -> { state, locked? }. States: "connected" (paired), "open" (working
+// without pairing), "waiting" (asked to work without pairing; the user must OK
+// it in the AI app), "refused" (they said no), "unpaired", "mismatch",
+// "old-server".
+const portState = new Map();
+const backoffUntil = new Map(); // port -> ts: don't redial a port that failed pairing for 30 s
+const BACKOFF_MS = 30000;
+
+function setPortState(port, state, extra = {}) {
+  if (state) portState.set(port, { state, ...extra });
+  else portState.delete(port);
+  refreshBadge();
+}
+
+// The best state over all ports, for the popup and the badge.
+function pairingStatus() {
+  const states = [...portState.values()];
+  const order = ["connected", "open", "mismatch", "refused", "waiting", "unpaired", "old-server"];
+  const state = order.find((s) => states.some((p) => p.state === s)) || "idle";
+  // This profile requires pairing but the computer doesn't: another profile
+  // (or the user, in the AI app) switched it off.
+  const computerOff = pairingRequired && states.some((p) => p.state === "connected" && p.computerRequired === false);
+  return { required: pairingRequired, hasCode: !!pairingCode, state, computerOff, locked: states.some((p) => p.locked) };
+}
+
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+function randomHex(n) {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return hex(a);
+}
+const hmacKeys = new Map(); // code -> CryptoKey
+async function hmacHex(code, msg) {
+  let key = hmacKeys.get(code);
+  if (!key) {
+    key = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(code), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    hmacKeys.set(code, key);
+  }
+  return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg)));
+}
+
+// A new code was pasted in the popup (or removed): start over on every port.
+function restartBridges() {
+  backoffUntil.clear();
+  portState.clear();
+  for (const s of sockets.values()) { try { s.close(); } catch (_) {} }
+  sockets.clear();
+  refreshBadge();
+  scanBridges();
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !(changes.pairingCode || changes.pairingRequired)) return;
+  if (changes.pairingCode) pairingCode = changes.pairingCode.newValue || null;
+  if (changes.pairingRequired) pairingRequired = changes.pairingRequired.newValue === true;
+  restartBridges();
+});
+
+// The popup's switch. Off: first tell every server we're PAIRED with, so the
+// computer's setting follows without asking (only a paired extension may
+// change it), then forget the code. On: the next successful pairing turns the
+// computer's setting back on too.
+async function setRequirePairing(on) {
+  pairingRequired = on; // the popup's next status read already reflects it
+  refreshBadge();
+  if (on) {
+    await chrome.storage.local.set({ pairingRequired: true, pairingJustEnabled: true });
+    return;
+  }
+  let told = false;
+  for (const s of sockets.values()) {
+    if (pairedSockets.has(s) && s.readyState === WebSocket.OPEN) {
+      s.send(JSON.stringify({ type: "pairing_off" }));
+      told = true;
+    }
+  }
+  if (told) await sleep(200); // let it land before the sockets close
+  pairingCode = null;
+  await chrome.storage.local.set({ pairingRequired: false });
+  await chrome.storage.local.remove(["pairingCode", "pairingJustEnabled"]);
+}
+
 function connectPort(port) {
+  if ((backoffUntil.get(port) || 0) > Date.now()) return;
   const sock = new WebSocket(`ws://localhost:${port}`);
   sockets.set(port, sock);
-  sock.onopen = () => {
-    console.log(`[agent] connected to MCP bridge on :${port}`);
-    sayHello(sock);
+  let trusted = false;
+  let stage = "challenge"; // -> "auth" -> "ok" | "unpaired"
+  let ns = null, ne = null, code = null, timer = null;
+  let gaveUp = false;
+
+  // Pairing failed on this port: remember why, and leave it alone for 30 s.
+  const giveUp = (state, extra) => {
+    gaveUp = true;
+    clearTimeout(timer);
+    backoffUntil.set(port, Date.now() + BACKOFF_MS);
+    setPortState(port, state, extra);
+    try { sock.close(); } catch (_) {}
   };
-  sock.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
+
+  const onHandshake = async (msg) => {
+    if (stage === "challenge") {
+      clearTimeout(timer);
+      if (msg.type !== "challenge" || msg.v !== 2 || typeof msg.nonce !== "string") {
+        giveUp("old-server"); // a server from before pairing (or not a server at all)
+        return;
+      }
+      await pairingReady;
+      if (!pairingRequired) {
+        stage = "open";
+        setPortState(port, "waiting");
+        sock.send(JSON.stringify({ type: "open", v: 2 }));
+        return; // the server may hold us until the user answers in the AI app
+      }
+      if (!pairingCode) {
+        stage = "unpaired";
+        setPortState(port, "unpaired");
+        sock.send(JSON.stringify({ type: "unpaired", v: 2 }));
+        return;
+      }
+      code = pairingCode;
+      ns = msg.nonce;
+      ne = randomHex(16);
+      stage = "auth";
+      const mac = await hmacHex(code, `otterbridge/v2/ext|${ns}|${ne}|${port}`);
+      sock.send(JSON.stringify({ type: "auth", v: 2, nonce: ne, mac }));
+      timer = setTimeout(() => giveUp(null), 4000); // no answer: drop it quietly
+      return;
+    }
+    if (stage === "auth") {
+      clearTimeout(timer);
+      if (msg.type === "auth_ok" && typeof msg.mac === "string" &&
+          msg.mac === (await hmacHex(code, `otterbridge/v2/srv|${ns}|${ne}|${port}`))) {
+        trusted = true;
+        trustedSockets.add(sock);
+        pairedSockets.add(sock);
+        stage = "ok";
+        setPortState(port, "connected");
+        console.log(`[agent] paired with MCP bridge on :${port}`);
+        sayHello(sock);
+        // Pairing was just switched back on: the computer requires it again.
+        const { pairingJustEnabled } = await chrome.storage.local.get("pairingJustEnabled");
+        if (pairingJustEnabled) {
+          sock.send(JSON.stringify({ type: "require_pairing" }));
+          await chrome.storage.local.remove("pairingJustEnabled");
+        }
+        return;
+      }
+      giveUp("mismatch", { locked: msg.type === "auth_failed" && msg.reason === "locked" });
+      return;
+    }
+    if (stage === "open") {
+      if (msg.type === "auth_ok" && msg.open === true) {
+        trusted = true;
+        trustedSockets.add(sock);
+        stage = "ok";
+        setPortState(port, "open");
+        console.log(`[agent] connected to MCP bridge on :${port} without pairing`);
+        sayHello(sock);
+        return;
+      }
+      giveUp(msg.type === "auth_failed" && msg.reason === "pairing_required" ? "refused" : null);
+      return;
+    }
+    // stage "unpaired": nothing more to do until a code is pasted.
+  };
+
+  sock.onopen = () => {
+    timer = setTimeout(() => { if (stage === "challenge") giveUp("old-server"); }, 4000);
+  };
+  // Handshake messages are handled strictly in order (each step awaits
+  // crypto); once trusted, commands run concurrently as before.
+  let handshake = Promise.resolve();
+  sock.onmessage = (e) => {
+    if (trusted) { onMessage(e.data); return; }
+    handshake = handshake.then(() => {
+      if (trusted) { onMessage(e.data); return; }
+      let msg;
+      try { msg = JSON.parse(e.data); } catch (_) { return; }
+      return onHandshake(msg);
+    }).catch(() => {});
+  };
+
+  const onMessage = async (data) => {
+    let msg;
+    try { msg = JSON.parse(data); } catch (_) { return; }
     if (msg.type === "ping") return; // server heartbeat: keeps this worker awake
     if (msg.type === "bridges") {
       for (const p of msg.ports || []) {
@@ -130,6 +351,13 @@ function connectPort(port) {
       }
       return;
     }
+    if (msg.type === "pairing_state") {
+      // The computer's setting (it may differ from this profile's switch).
+      const cur = portState.get(port);
+      if (cur) setPortState(port, cur.state, { ...cur, computerRequired: msg.required !== false });
+      return;
+    }
+    if (msg.type) return; // commands carry no type; nothing else is for us
     const { id, action, params } = msg;
     if (params && params.agentId) noteAgentActive(params.agentId, sock);
     let result = null, error = null;
@@ -143,7 +371,13 @@ function connectPort(port) {
   // Registered servers that go away stay gone; the registry lists them again
   // if they come back.
   sock.onclose = () => {
-    if (sockets.get(port) === sock) sockets.delete(port);
+    clearTimeout(timer);
+    if (sockets.get(port) === sock) {
+      sockets.delete(port);
+      // A failed pairing keeps its state (the popup explains it); a plain
+      // disconnect means nothing is known about that port any more.
+      if (!gaveUp) setPortState(port, null);
+    }
     onBridgeClosed(sock);
   };
   sock.onerror = () => sock.close();
@@ -583,6 +817,20 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "closeAgentWindows") {
     closeAgentWindows().then((closed) => sendResponse({ closed }), (e) => sendResponse({ error: e.message }));
+    return true; // async response
+  }
+  if (msg && msg.type === "setRequirePairing") {
+    setRequirePairing(!!msg.on).then(() => sendResponse({ ok: true }), (e) => sendResponse({ error: e.message }));
+    return true; // async response
+  }
+  if (msg && msg.type === "retryPairing") {
+    // The same code was pasted again (storage fires no change): retry now.
+    restartBridges();
+    sendResponse({ ok: true });
+    return;
+  }
+  if (msg && msg.type === "pairingStatus") {
+    pairingReady.then(() => sendResponse(pairingStatus()), () => sendResponse(pairingStatus()));
     return true; // async response
   }
 });
@@ -1336,6 +1584,7 @@ async function perform(action, p, tab, fast) {
       // press: the live element under the pointer must still be the one the
       // gate saw. For index clicks that's the element itself (not covered by
       // an overlay); for coordinate clicks, the same text at that point.
+      let liveText = null; // text of what is about to be pressed, when known
       if (hasIndex) {
         const pos = await refPos(tab.id, ref);
         if (!pos) return { changed: true, actualText: null, x, y };
@@ -1349,10 +1598,19 @@ async function perform(action, p, tab, fast) {
         if (guard && (!hit || hit.text !== expectText)) {
           return { changed: true, actualText: hit ? hit.text : null, x, y };
         }
-      } else if (guard) {
+        if (hit) liveText = hit.text || "";
+      } else {
         const cur = await hitTestAll(tab.id, x, y);
         const curText = (cur && (cur.text ?? "")) || "";
-        if (!cur || curText !== expectText) return { changed: true, actualText: cur ? curText : null, x, y };
+        if (guard && (!cur || curText !== expectText)) return { changed: true, actualText: cur ? curText : null, x, y };
+        if (cur) liveText = curText;
+      }
+      // Second line of defence: a left click on something destructive-looking
+      // that the server didn't mark as approved is not pressed. (Unknown text
+      // — no page library on this tab — is pressed as before.)
+      if (button === "left" && liveText != null &&
+          OtterConfig.refuseUngated({ kind: "click", text: liveText, gated: p.gated, approvalMode: S.approvalMode })) {
+        return { changed: true, ungated: true, actualText: liveText, x, y };
       }
       pulse(tab.id);
       lastCursor = { x, y };
@@ -1717,6 +1975,9 @@ async function perform(action, p, tab, fast) {
           "Otter extension options (right-click the extension icon → Options → Advanced).",
         );
       }
+      if (OtterConfig.refuseUngated({ kind: "eval", gated: p.gated, approvalMode: S.approvalMode })) {
+        throw new Error("Refused: evaluate_js needs the user's approval.");
+      }
       await ensureDebugger(tab.id);
       const res = await cdp(tab.id, "Runtime.evaluate", {
         expression: p.code,
@@ -1753,7 +2014,14 @@ async function perform(action, p, tab, fast) {
     case "handle_dialog": {
       // Answer through CDP even when no dialog event was seen: Chrome itself
       // knows whether one is showing, and says so if not.
-      const d = dialogs.get(tab.id) || { type: "JavaScript", message: "" };
+      const known = dialogs.get(tab.id);
+      const d = known || { type: "JavaScript", message: "" };
+      if (p.accept && (!known || known.type !== "alert") &&
+          OtterConfig.refuseUngated({
+            kind: known ? "dialog" : "dialog_unread", text: d.message, gated: p.gated, approvalMode: S.approvalMode,
+          })) {
+        throw new Error("Refused: accepting this dialog needs the user's approval.");
+      }
       const before = tab.url;
       await ensureDebugger(tab.id);
       try {
@@ -1958,6 +2226,9 @@ async function uploadFile(tab, p) {
       throw new Error("That file input accepts only one file.");
     }
     if (p.dryRun) return { ok: true, url: mark.url, accept: mark.accept, multiple: mark.multiple };
+    if (OtterConfig.refuseUngated({ kind: "upload", gated: p.gated, approvalMode: S.approvalMode })) {
+      throw new Error("Refused: uploading files needs the user's approval.");
+    }
     await cdp(tab.id, "DOM.getDocument", { depth: 0 });
     const { searchId, resultCount } = await cdp(tab.id, "DOM.performSearch", {
       query: `[data-otter-upload="${token}"]`,

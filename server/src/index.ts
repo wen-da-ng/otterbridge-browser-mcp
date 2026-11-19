@@ -19,8 +19,8 @@
  *
  * Part of the Otter browser-agent project. Author: wen-da-ng (OtterBridge).
  */
-import { randomUUID } from "node:crypto";
-import { appendFile, stat, writeFile } from "node:fs/promises";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { appendFile, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,6 +100,172 @@ async function audit(
     log(`[audit] WARNING could not write log: ${(e as Error).message}`);
   }
 }
+
+const SERVER_VERSION = "0.8.0";
+
+// ===== Pairing =====
+// The extension and every server share one secret, the pairing code, and prove
+// they know it before anything else crosses the bridge. Without it, any local
+// process that took a bridge port would get ungated control of the user's
+// logged-in Chrome (the approval gate lives in this server), and the extension
+// would hand it the profile name and Google account email.
+//
+// The code lives in a file in the user's home directory, so a program running
+// as the same user with file access can still read it. Pairing keeps out other
+// OS users, containers / VMs / WSL sharing loopback, sandboxed apps, and any
+// unrelated program that happens to listen on these ports.
+//
+// THE CODE IS A SECRET: it must never reach a tool result, an error the model
+// sees, the audit log or stderr. It is only shown to the HUMAN — in an MCP
+// elicitation prompt, or on stdout via the explicit --pairing-code flag.
+const PAIR_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // Crockford base32: no I L O U
+const OB_HOME = process.env.OTTERBRIDGE_HOME || join(homedir(), ".otterbridge");
+const PAIRING_FILE = join(OB_HOME, "pairing.json");
+let PAIR_CODE = ""; // normalized, 20 chars; set in main() before the bridge starts
+let PAIR_KEY: Buffer = Buffer.alloc(0);
+
+// Uppercase, read the look-alikes O/I/L as 0/1/1, drop everything else
+// (dashes, spaces). Valid only if exactly 20 code characters remain.
+const cleanCode = (s: string) =>
+  s
+    .toUpperCase()
+    .replace(/O/g, "0")
+    .replace(/[IL]/g, "1")
+    .split("")
+    .filter((ch) => PAIR_ALPHABET.includes(ch))
+    .join("");
+function normalizeCode(s: string): string | null {
+  const t = cleanCode(s);
+  return t.length === 20 ? t : null;
+}
+const formatCode = (c: string) => c.match(/.{4}/g)!.join("-");
+
+function generateCode(): string {
+  return [...randomBytes(20)].map((b) => PAIR_ALPHABET[b & 31]).join("");
+}
+
+// Several servers may start at once: create the file exclusively, and if
+// another process won the race, read theirs (retrying while they write it).
+// Never overwrite an existing file — that would unpair every extension.
+async function loadPairingCode(): Promise<string> {
+  await mkdir(OB_HOME, { recursive: true, mode: 0o700 });
+  try {
+    const fh = await open(PAIRING_FILE, "wx", 0o600);
+    const code = generateCode();
+    try {
+      await fh.writeFile(JSON.stringify({ v: 1, code: formatCode(code), required: false }) + "\n", "utf-8");
+    } finally {
+      await fh.close();
+    }
+    log(`[pairing] created a new pairing code in ${PAIRING_FILE}`);
+    return code;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+  }
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const j = JSON.parse(await readFile(PAIRING_FILE, "utf-8"));
+      const code = normalizeCode(String(j?.code ?? ""));
+      if (code) return code;
+    } catch {
+      /* being written by another process — retry */
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(
+    `Could not read the pairing code from ${PAIRING_FILE}. Delete that file to create a new ` +
+      `code (the Otter extension will then need to be paired again).`,
+  );
+}
+
+const hmac = (msg: string) => createHmac("sha256", PAIR_KEY).update(msg, "utf-8").digest("hex");
+function macEqual(presented: unknown, expected: string): boolean {
+  if (typeof presented !== "string") return false;
+  const a = Buffer.from(presented, "utf-8");
+  const b = Buffer.from(expected, "utf-8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+const sha256 = (s: string) => createHash("sha256").update(s, "utf-8").digest();
+
+// ----- Opting in -----
+// Pairing is opt-in: off by default, switched on with "Require pairing" in
+// the Otter popup.
+// The choice is stored for the whole computer in pairing.json ("required"),
+// NOT taken from whoever connects: if any extension that merely CLAIMS
+// "pairing is off" were accepted, a fake extension could make that claim on
+// computers that do pair. So "required" changes only through
+//   - a paired extension (its popup toggle), over an authenticated socket, or
+//   - the human approving it in the AI app (promptPairing).
+// Read fresh each time: several servers share the file.
+async function readPairingFile(): Promise<Record<string, unknown>> {
+  try {
+    return JSON.parse(await readFile(PAIRING_FILE, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+async function pairingRequired(): Promise<boolean> {
+  return (await readPairingFile()).required === true; // opt-in: off unless switched on
+}
+async function setPairingRequired(required: boolean): Promise<void> {
+  const j = await readPairingFile();
+  if (!normalizeCode(String(j.code ?? ""))) return; // never write a file we can't read
+  if ((j.required === true) === required) return;
+  const tmp = `${PAIRING_FILE}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify({ ...j, v: 1, required }) + "\n", { encoding: "utf-8", mode: 0o600 });
+  await rename(tmp, PAIRING_FILE);
+  log(`[pairing] pairing is now ${required ? "required" : "OFF"} on this computer`);
+  await audit("pairing", undefined, required ? "pairing turned back on" : "pairing turned off");
+  broadcastPairingState(required);
+  if (required) {
+    // Extensions let in without pairing must pair now.
+    for (const ws of openAttached) ws.close(4403, "pairing required");
+  } else {
+    for (const ws of [...openSockets]) admitOpen(ws);
+  }
+}
+
+// Tell connected extensions the computer's setting, so a profile with pairing
+// on can show that another profile switched it off for the computer.
+function broadcastPairingState(required: boolean): void {
+  for (const ws of extSockets) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "pairing_state", required }));
+  }
+}
+
+// What the bridge has seen, so a failed tool call can say WHY nothing is
+// connected (see notConnectedError).
+const unpairedSockets = new Set<WebSocket>(); // extensions waiting for their code
+const openSockets = new Set<WebSocket>(); // set to "no pairing", waiting for the user's OK
+const openAttached = new Set<WebSocket>(); // let in without pairing
+let lastMismatch = 0; // an extension presented a wrong code
+let lastLegacyKnock = 0; // a client never answered the challenge (0.7.0 extension)
+const authFailures: number[] = []; // timestamps, for the lockout
+const AUTH_TIMEOUT_MS = 5000;
+
+// Thrown when an extension is connected but unpaired. Its message is the
+// plain help text (no code) — safe if it ever reaches the model. buildServer
+// catches it and shows the code to the human instead (promptPairing).
+class PairingNeededError extends Error {}
+// canPrompt: this AI app can show the pairing prompt (elicitation), so trying
+// again shows the code to the user again. Without it, the code comes from a
+// paired profile's popup — or, for developers, the CLI / the file.
+const pairingHelpText = (canPrompt = true) =>
+  openSockets.size > 0 && unpairedSockets.size === 0
+    ? `The Otter extension is set to work without pairing, but this computer still requires it. ` +
+      (canPrompt
+        ? `Try again: the user will be asked whether to allow working without pairing. `
+        : `This app can't ask the user about it. `) +
+      `Alternatively, ask them to turn "Require pairing" back on in the Otter popup and pair it.`
+    : canPrompt
+      ? `The Otter extension in Chrome isn't paired with this computer yet. Call pair_browser (or ` +
+        `try again): the user will be shown the pairing code in a prompt, to paste into the Otter ` +
+        `popup. (An already paired Chrome profile can also show the code: "Show code" in its popup.)`
+      : `The Otter extension in Chrome isn't paired with this computer yet, and this app can't show ` +
+        `the pairing prompt. Ask the user to open the Otter popup in a Chrome profile that is ` +
+        `already paired, press "Show code", and paste it into this profile's popup. If none is ` +
+        `paired yet, the code is printed by "node dist/index.js --pairing-code" in the OtterBridge ` +
+        `server folder (it is stored in ${PAIRING_FILE}).`;
 
 // ===== WebSocket bridge =====
 // Several MCP clients (Claude Code + Claude Desktop, background sessions in
@@ -289,14 +455,20 @@ function sendBridges(ws: WebSocket): void {
 const broadcastBridges = () => extSockets.forEach(sendBridges);
 
 // One handler for every listener this server owns (its own port, plus 8765
-// while it is the registry).
-function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): void {
+// while it is the registry). listenPort: the port of the listener this socket
+// arrived on — it is bound into the pairing MACs (see authenticate).
+function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage, listenPort: number): void {
   const url = new URL(req.url ?? "/", "http://localhost");
   if (url.pathname === "/register") {
     // Another OtterBridge server announcing its port. Only ports inside our
-    // range — the registry never points the extension anywhere else.
+    // range — the registry never points the extension anywhere else — and
+    // only from a server that knows the pairing code, recently.
     const port = Number(url.searchParams.get("port"));
-    if (!isRegistry || !BRIDGE_PORTS.includes(port) || port === BASE_PORT) {
+    const ts = url.searchParams.get("ts") ?? "";
+    const fresh = Math.abs(Date.now() - Number(ts)) < 60000;
+    const signed = macEqual(url.searchParams.get("mac"), hmac(`otterbridge/v2/reg|${port}|${ts}`));
+    if (!isRegistry || !BRIDGE_PORTS.includes(port) || port === BASE_PORT || !fresh || !signed) {
+      if (isRegistry && (!fresh || !signed)) log(`[bridge] registry: rejected an unsigned registration for :${port}`);
       ws.close();
       return;
     }
@@ -324,7 +496,125 @@ function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): 
     return;
   }
 
+  authenticate(ws, listenPort);
+}
+
+// Pairing handshake (protocol v2). Until it succeeds the socket is NOT an
+// extension: it isn't listed as a profile, gets no `bridges`, no heartbeat and
+// no command, and everything it sends but `auth` / `unpaired` is ignored.
+//
+//   server → ext   {type:"challenge", v:2, nonce:Ns}
+//   ext → server   {type:"auth", v:2, nonce:Ne, mac:M1}  |  {type:"unpaired", v:2}
+//   server → ext   {type:"auth_ok", mac:M2}  |  {type:"auth_failed", reason}
+//   M1 = HMAC(code, "otterbridge/v2/ext|Ns|Ne|port"), M2 = same with "srv"
+//
+// The port is the listener's own: a rogue listener on another port can't
+// relay the handshake to the real server, because the MAC wouldn't match.
+function authenticate(ws: WebSocket, listenPort: number): void {
+  const ns = randomBytes(16).toString("hex");
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    // What a 0.7.0 extension looks like: it says hello and never answers.
+    lastLegacyKnock = Date.now();
+    log("[bridge] a client never answered the pairing challenge (an older Otter extension?)");
+    ws.close(4400, "pairing required");
+  }, AUTH_TIMEOUT_MS);
+
+  const onMessage = (raw: import("ws").RawData) => {
+    if (settled) return;
+    let m: { type?: string; v?: number; nonce?: unknown; mac?: unknown };
+    try {
+      m = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (m.type === "unpaired" && m.v === 2) {
+      settled = true;
+      clearTimeout(timer);
+      ws.off("message", onMessage);
+      unpairedSockets.add(ws); // kept open, sent nothing more
+      log("[bridge] an unpaired Otter extension is waiting for its pairing code");
+      void audit("pairing", undefined, "an unpaired extension connected");
+      return;
+    }
+    if (m.type === "open" && m.v === 2) {
+      // The extension's "Require pairing" switch is off. Let it in only if
+      // this computer agreed; otherwise hold it until the user approves in
+      // the AI app (promptPairing) — never on the extension's word alone.
+      settled = true;
+      clearTimeout(timer);
+      ws.off("message", onMessage);
+      openSockets.add(ws);
+      void pairingRequired().then((required) => {
+        if (!required) admitOpen(ws);
+        else {
+          log("[bridge] an Otter extension asks to work without pairing; waiting for the user's OK");
+          void audit("pairing", undefined, "an extension asked to work without pairing");
+        }
+      });
+      return;
+    }
+    if (m.type !== "auth" || m.v !== 2 || typeof m.nonce !== "string" || typeof m.mac !== "string") return;
+    settled = true;
+    clearTimeout(timer);
+    ws.off("message", onMessage);
+    const now = Date.now();
+    while (authFailures.length && now - authFailures[0] > 60000) authFailures.shift();
+    if (authFailures.length >= 5) {
+      ws.send(JSON.stringify({ type: "auth_failed", reason: "locked" }));
+      ws.close(4401, "locked");
+      return;
+    }
+    const ne = m.nonce.slice(0, 128);
+    if (!macEqual(m.mac, hmac(`otterbridge/v2/ext|${ns}|${ne}|${listenPort}`))) {
+      authFailures.push(now);
+      lastMismatch = now;
+      log("[bridge] an Otter extension presented the wrong pairing code");
+      void audit("pairing", undefined, "an extension presented the wrong pairing code");
+      ws.send(JSON.stringify({ type: "auth_failed", reason: "mismatch" }));
+      ws.close(4401, "mismatch");
+      return;
+    }
+    ws.send(JSON.stringify({ type: "auth_ok", mac: hmac(`otterbridge/v2/srv|${ns}|${ne}|${listenPort}`) }));
+    attachExtension(ws);
+  };
+  ws.on("message", onMessage);
+  ws.on("close", () => {
+    clearTimeout(timer);
+    unpairedSockets.delete(ws);
+    openSockets.delete(ws);
+    openAttached.delete(ws);
+  });
+  ws.on("error", () => {});
+  ws.send(JSON.stringify({ type: "challenge", v: 2, nonce: ns }));
+}
+
+// An extension with pairing switched off, on a computer that allows it.
+function admitOpen(ws: WebSocket): void {
+  if (!openSockets.delete(ws) || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "auth_ok", open: true }));
+  openAttached.add(ws);
+  attachExtension(ws, false);
+}
+
+// The user said no to working without pairing.
+function refuseOpen(): void {
+  for (const ws of [...openSockets]) {
+    openSockets.delete(ws);
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "auth_failed", reason: "pairing_required" }));
+    ws.close(4403, "pairing required");
+  }
+}
+
+// A paired extension: from here on it is a browser profile like before.
+// paired: it proved the code — only then may it change the pairing setting.
+function attachExtension(ws: WebSocket, paired = true): void {
   extSockets.add(ws);
+  void pairingRequired().then((required) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "pairing_state", required }));
+  });
   // Until it says hello, a connection is an unnamed profile of its own.
   const pr: Profile = {
     id: `unnamed-${++anonSeq}`,
@@ -342,6 +632,12 @@ function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): 
       data = JSON.parse(raw.toString());
     } catch {
       return; // ignore non-JSON frames
+    }
+    // The popup's "Require pairing" switch, sent by an extension that proved
+    // the code. (One let in without pairing can't change the setting.)
+    if (data.type === "pairing_off" || data.type === "require_pairing") {
+      if (paired) void setPairingRequired(data.type === "require_pairing");
+      return;
     }
     if (data.type === "hello" && data.profile && typeof data.profile.id === "string") {
       const firstHello = pr.id.startsWith("unnamed-");
@@ -398,7 +694,7 @@ function onConnection(ws: WebSocket, req: import("node:http").IncomingMessage): 
 async function becomeRegistry(): Promise<boolean> {
   try {
     const wss = await bindBridge(BASE_PORT);
-    wss.on("connection", onConnection);
+    wss.on("connection", (ws, req) => onConnection(ws, req, BASE_PORT));
     isRegistry = true;
     registryReadyAt = Date.now() + 2000; // let the other survivors re-report their numbers
     mergeNumbers(Object.fromEntries(knownNumbers));
@@ -413,7 +709,9 @@ async function becomeRegistry(): Promise<boolean> {
 // take 8765 over (random delay so survivors don't all collide), else
 // re-register with whoever won.
 function registerWithRegistry(): void {
-  const ws = new WebSocket(`ws://localhost:${BASE_PORT}/register?port=${bridgePort}`);
+  const ts = String(Date.now());
+  const mac = hmac(`otterbridge/v2/reg|${bridgePort}|${ts}`);
+  const ws = new WebSocket(`ws://localhost:${BASE_PORT}/register?port=${bridgePort}&ts=${ts}&mac=${mac}`);
   registryLink = ws;
   ws.on("open", () => ws.send(JSON.stringify({ type: "known", numbers: Object.fromEntries(knownNumbers) })));
   ws.on("message", (raw) => {
@@ -441,7 +739,7 @@ async function startBridge(): Promise<void> {
   for (const port of BRIDGE_PORTS) {
     try {
       const wss = await bindBridge(port);
-      wss.on("connection", onConnection);
+      wss.on("connection", (ws, req) => onConnection(ws, req, port));
       bridgePort = port;
       break;
     } catch (e) {
@@ -470,7 +768,11 @@ async function startBridge(): Promise<void> {
 //
 // profileId: the session's profile. Without one there must be exactly one
 // profile connected — with several, guessing could act in the wrong account.
-async function waitForProfile(profileId: string | null, ms = 6000): Promise<Profile> {
+//
+// failFastUnpaired: with no paired profile but an unpaired extension waiting,
+// fail at once (PairingNeededError) instead of sitting out the grace period.
+// promptPairing turns it off while it waits for the user to paste the code.
+async function waitForProfile(profileId: string | null, ms = 6000, failFastUnpaired = true): Promise<Profile> {
   const deadline = Date.now() + ms;
   for (;;) {
     if (profileId) {
@@ -480,17 +782,47 @@ async function waitForProfile(profileId: string | null, ms = 6000): Promise<Prof
       const open = [...profiles.values()].filter((pr) => pr.socket.readyState === WebSocket.OPEN);
       if (open.length === 1) return open[0];
       if (open.length > 1) throw new Error(ambiguousProfiles());
+      if (failFastUnpaired && (unpairedSockets.size > 0 || openSockets.size > 0)) {
+        throw new PairingNeededError(pairingHelpText());
+      }
     }
     if (Date.now() >= deadline) {
-      throw new Error(
-        profileId
-          ? "The browser profile this session uses isn't connected any more — is that " +
-              "Chrome profile still open? Call list_profiles to see what's connected."
-          : "Chrome extension is not connected. Is Chrome open with the extension loaded?",
-      );
+      throw profileId
+        ? new Error(
+            "The browser profile this session uses isn't connected any more — is that " +
+              "Chrome profile still open? Call list_profiles to see what's connected.",
+          )
+        : notConnectedError();
     }
     await new Promise((r) => setTimeout(r, 200));
   }
+}
+
+// A profile asked for by name isn't connected. An unpaired extension doesn't
+// say who it is (it says nothing before pairing) — it may well be that one.
+const unpairedNote = () =>
+  unpairedSockets.size > 0
+    ? " An Otter extension that isn't paired yet is also waiting — if that's this profile, call " +
+      "pair_browser to show the user the pairing code (or they can switch off \"Require pairing\" there)."
+    : "";
+
+// No profile connected: say why, from what the bridge has seen.
+function notConnectedError(): Error {
+  const now = Date.now();
+  if (unpairedSockets.size > 0 || openSockets.size > 0) return new PairingNeededError(pairingHelpText());
+  if (now - lastMismatch < 60000) {
+    return new Error(
+      "The pairing code saved in the Otter extension doesn't match this computer's code. Ask the " +
+        "user to open the Otter popup in Chrome and enter the code again.",
+    );
+  }
+  if (now - lastLegacyKnock < 15000) {
+    return new Error(
+      `The Otter Chrome extension is older than this OtterBridge server. Ask the user to update the ` +
+        `extension to ${SERVER_VERSION} and reload it at chrome://extensions.`,
+    );
+  }
+  return new Error("Chrome extension is not connected. Is Chrome open with the extension loaded?");
 }
 
 function ambiguousProfiles(): string {
@@ -594,7 +926,7 @@ const CLIENT_NAMES: Record<string, string> = {
 // (elicitation routes back to that session's client), while stdio uses one.
 function buildServer(stdio = false): McpServer {
   const server = new McpServer(
-    { name: "otterbridge-browser-mcp", version: "0.7.0" },
+    { name: "otterbridge-browser-mcp", version: SERVER_VERSION },
     {
       // Surfaced in the client's system prompt — often the ONLY thing the model
       // reads about this server before deciding whether to use it (clients may
@@ -622,7 +954,8 @@ function buildServer(stdio = false): McpServer {
         "profile, so parallel agents can each work in a different one). The " +
         "user may run OtterBridge in several Chrome profiles (e.g. work and " +
         "personal accounts): list_profiles shows them, use_profile picks one, " +
-        "and results name the profile in use.\n\n" +
+        "and results name the profile in use. If a profile is waiting to be paired " +
+        "(list_profiles says so), pair_browser shows the user the pairing code.\n\n" +
         "Method: observe with page_snapshot (a compact outline of the page " +
         "with element indices — cheaper than a screenshot), read_page or " +
         "screenshot; act by element index with click_element / fill_element / " +
@@ -685,7 +1018,138 @@ function buildServer(stdio = false): McpServer {
     save_pdf: { title: "Save page as PDF", world: true },
     list_profiles: { title: "List browser profiles", ro: true, idem: true },
     use_profile: { title: "Choose browser profile", idem: true },
+    pair_browser: { title: "Pair a browser profile" },
   };
+  // ----- Pairing prompt -----
+  // An unpaired extension is waiting: show the human the code in an approval
+  // dialog (elicitation — the user sees it, the model doesn't). Concurrent
+  // tool calls share one prompt. A missed or half-done prompt is shown again
+  // on the next call; only an explicit "no" pauses it for 2 minutes.
+  let pairingPrompt: Promise<void> | null = null;
+  let lastDeclined = 0;
+  // A prompt that errored: if this app can show prompts at all, it was a
+  // one-off (e.g. the form was submitted incomplete) — try again; otherwise
+  // say where else the code comes from.
+  const promptFailed = () =>
+    server.server.getClientCapabilities()?.elicitation
+      ? new Error("The pairing prompt didn't complete, so nothing was paired. Try again to show it again.")
+      : new Error(pairingHelpText(false));
+  // Profiles that proved the code (not merely let in without pairing).
+  const pairedCount = () => [...profiles.values()].filter((pr) => !openAttached.has(pr.socket)).length;
+  // showCode: always the code prompt (pair_browser), even when the waiting
+  // extension is one that asks to work WITHOUT pairing.
+  const promptPairing = (showCode = false): Promise<void> => {
+    pairingPrompt ??= (async () => {
+      if (Date.now() - lastDeclined < 120000) {
+        throw new Error("The user said no to pairing a moment ago. Ask them whether to continue before trying again.");
+      }
+      if (!showCode && openSockets.size > 0 && unpairedSockets.size === 0) {
+        // The extension's "Require pairing" switch is off: the human decides
+        // for this computer, here, where the model can't answer for them.
+        await audit("pairing", undefined, "asked the user to allow working without pairing");
+        let res;
+        try {
+          res = await server.server.elicitInput({
+            message:
+              "Otter in Chrome is set to work without pairing.\n\n" +
+              "Allow that on this computer? Any app on this computer could then use your " +
+              "logged-in browser.\n\n" +
+              "Accept to allow. Decline to keep pairing on.",
+            requestedSchema: { type: "object", properties: {} },
+          });
+        } catch (e) {
+          await audit("pairing", undefined, `the prompt failed (${(e as Error).message})`);
+          throw promptFailed();
+        }
+        if (res.action !== "accept") {
+          lastDeclined = Date.now();
+          await audit("pairing", undefined, "the user kept pairing on");
+          refuseOpen();
+          throw new Error(
+            "The user chose to keep pairing on. Ask them to turn \"Require pairing\" back on in the " +
+              "Otter popup and paste the pairing code there.",
+          );
+        }
+        await setPairingRequired(false); // admits the waiting extension(s)
+        try {
+          await waitForProfile(null, 5000, false);
+        } catch {
+          /* several profiles: the retry sorts it out */
+        }
+        return;
+      }
+      await audit("pairing", undefined, "showed the user the pairing code");
+      const pairedBefore = pairedCount();
+      // Accept counts only with the code's last 4 characters typed in: a
+      // prompt waved through unread can't leave the user stuck, it simply
+      // comes back on the next call.
+      let res;
+      try {
+        res = await server.server.elicitInput({
+          message:
+            "Pair Otter with this computer.\n\n" +
+            `Pairing code:   ${formatCode(PAIR_CODE)}\n\n` +
+            "1. Click the Otter icon in Chrome's toolbar.\n" +
+            "2. Paste the code there and press Pair. Do this in each Chrome profile that\n" +
+            "   asks for it (or later: Show code \u2192 Copy in a paired profile's popup).\n" +
+            "3. Type the code's last 4 characters below and press Accept.",
+          requestedSchema: {
+            type: "object",
+            properties: {
+              last4: { type: "string", title: "Last 4 characters of the code", minLength: 4, maxLength: 4 },
+            },
+            required: ["last4"],
+          },
+        });
+      } catch (e) {
+        await audit("pairing", undefined, `the pairing prompt failed (${(e as Error).message})`);
+        throw promptFailed();
+      }
+      if (res.action === "accept" && cleanCode(String(res.content?.last4 ?? "")) !== PAIR_CODE.slice(-4)) {
+        await audit("pairing", undefined, "the pairing prompt was accepted without the right confirmation");
+        throw new Error(
+          "The pairing prompt was accepted without typing the code's last 4 characters, so it may not " +
+            "have been read. Nothing was paired. Try again to show the user the code again.",
+        );
+      }
+      if (res.action !== "accept") {
+        lastDeclined = Date.now();
+        await audit("pairing", undefined, "the user cancelled pairing");
+        throw new Error(
+          "The user cancelled pairing. Ask them whether to continue; the browser can't be used " +
+            "until the Otter extension is paired.",
+        );
+      }
+      // Wait for a newly paired profile (other profiles may already be connected).
+      const deadline = Date.now() + 30000;
+      while (pairedCount() <= pairedBefore && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+      if (pairedCount() <= pairedBefore) {
+        throw new Error(
+          "The code was confirmed, but no Otter extension paired within 30 seconds. Ask the user " +
+            "whether they pasted it into the Otter popup and pressed Pair, then try again.",
+        );
+      }
+      await audit("pairing", undefined, "pairing completed");
+    })().finally(() => {
+      pairingPrompt = null;
+    });
+    return pairingPrompt;
+  };
+  // A tool hitting an unpaired extension: prompt, then run it once more. The
+  // error is thrown before any command reaches a browser (none is connected),
+  // so re-running the whole tool repeats nothing.
+  const withPairing =
+    (cb: (...a: unknown[]) => Promise<{ content?: unknown[] }>) =>
+    async (...a: unknown[]) => {
+      try {
+        return await cb(...a);
+      } catch (e) {
+        if (!(e instanceof PairingNeededError)) throw e;
+        await promptPairing();
+        return cb(...a);
+      }
+    };
+
   // Append profile comings and goings this session hasn't heard about yet.
   const withProfileNotes = (cb: (...a: unknown[]) => Promise<{ content?: unknown[] }>) =>
     async (...a: unknown[]) => {
@@ -715,7 +1179,7 @@ function buildServer(stdio = false): McpServer {
           openWorldHint: m.world ?? false,
         },
       },
-      withProfileNotes(cb as never) as never,
+      withProfileNotes(withPairing(cb as never)) as never,
     );
   }) as typeof server.registerTool;
 
@@ -753,6 +1217,9 @@ function buildServer(stdio = false): McpServer {
         if (m && !Array.isArray(m)) {
           sess.profile = m.id;
           return m.id;
+        }
+        if (profiles.size === 0 && (unpairedSockets.size > 0 || openSockets.size > 0)) {
+          throw new PairingNeededError(pairingHelpText());
         }
         if (Date.now() >= deadline) {
           const list = [...profiles.values()].map(profileLabel).join("; ") || "none";
@@ -795,7 +1262,7 @@ function buildServer(stdio = false): McpServer {
     if (!query) return undefined;
     const m = matchProfile(query);
     const list = [...profiles.values()].map(profileLabel).join("; ") || "none";
-    if (!m) throw new Error(`No connected browser profile matches '${query}'. Connected: ${list}.`);
+    if (!m) throw new Error(`No connected browser profile matches '${query}'. Connected: ${list}.${unpairedNote()}`);
     if (Array.isArray(m)) throw new Error(`'${query}' matches several profiles: ${m.map(profileLabel).join("; ")}.`);
     return m.id;
   };
@@ -908,6 +1375,10 @@ function buildServer(stdio = false): McpServer {
     const button = opts.button ?? "left";
     let expectText = initialText ?? "";
     for (let attempt = 0; attempt < 4; attempt++) {
+      // gated: the user (or Full Auto / BROWSER_AGENT_GATE=off) approved
+      // exactly this text. The extension refuses a destructive-looking click
+      // that arrives without it — a second line of defence, see config.js.
+      let gated = false;
       if (button === "left" && DANGER_RE.test(expectText)) {
         const label =
           expectText.trim().slice(0, 60) ||
@@ -915,6 +1386,7 @@ function buildServer(stdio = false): McpServer {
         if (!(await approved(server, profileOfTab(tab) ?? null, `Approve clicking the '${label}' element? This looks destructive.`))) {
           return `Action denied by user: click on '${label}'.`;
         }
+        gated = true;
       }
       const res = await act("click", tab, {
         ...target,
@@ -924,6 +1396,7 @@ function buildServer(stdio = false): McpServer {
         button,
         double: opts.double ?? false,
         noReport: opts.noReport ?? false,
+        ...(gated ? { gated: true } : {}),
       });
       if (res && typeof res === "object" && res.covered) {
         // Something sits on top of the target (cookie banner, modal, overlay):
@@ -933,6 +1406,18 @@ function buildServer(stdio = false): McpServer {
           `Click aborted: the target is covered by '${res.actualText || "another element"}' ` +
           `(an overlay, banner or dialog?). Close that first, then re-read the page.`
         );
+      }
+      if (res && typeof res === "object" && res.changed && res.ungated) {
+        // The extension saw a destructive-looking target this click wasn't
+        // approved for. Different text: gate that one. Same text: we should
+        // have gated it and didn't — refuse rather than loop.
+        const actual = (res.actualText as string) ?? "";
+        await audit("click", target as Record<string, unknown>, `extension refused ungated target '${actual}'`);
+        if (actual !== expectText) {
+          expectText = actual;
+          continue;
+        }
+        return `Click refused by the browser extension: '${actual.trim().slice(0, 60)}' looks destructive and was not approved.`;
       }
       if (res && typeof res === "object" && res.changed) {
         // The element under the pointer changed after the gate decision. Never
@@ -970,13 +1455,14 @@ function buildServer(stdio = false): McpServer {
       if (accept && !(await approved(server, profileOfTab(tab) ?? null, "Approve answering OK to a JavaScript dialog whose text couldn't be read?"))) {
         return "Action denied by user: accepting an unread dialog.";
       }
-      return act("handle_dialog", tab, { accept, text: promptText });
+      return act("handle_dialog", tab, { accept, text: promptText, ...(accept ? { gated: true } : {}) });
     }
     if (accept && info.type !== "alert" && DANGER_RE.test(info.message ?? "")) {
       const msg = String(info.message).slice(0, 200);
       if (!(await approved(server, profileOfTab(tab) ?? null, `Approve answering OK to this ${info.type} dialog?\n\n"${msg}"`))) {
         return `Action denied by user: accepting the ${info.type} dialog.`;
       }
+      return act("handle_dialog", tab, { accept, text: promptText, gated: true });
     }
     return act("handle_dialog", tab, { accept, text: promptText });
   };
@@ -1467,7 +1953,7 @@ function buildServer(stdio = false): McpServer {
       if (!(await approved(server, profileOfTab(tab) ?? null, `Approve running JavaScript in the page?\n\n${preview}`))) {
         return text("Action denied by user: evaluate_js.");
       }
-      return text(JSON.stringify(await act("evaluate_js", tab, { code })));
+      return text(JSON.stringify(await act("evaluate_js", tab, { code, gated: true })));
     },
   );
 
@@ -1583,6 +2069,15 @@ function buildServer(stdio = false): McpServer {
         );
       }
 
+      // Get the session tab before the loop: each step catches its own errors,
+      // which would swallow "not paired yet" instead of prompting for pairing.
+      if (tab == null) {
+        try {
+          await ensureTab();
+        } catch (e) {
+          if (e instanceof PairingNeededError) throw e; // anything else: the first step reports it
+        }
+      }
       await audit("run_script", {
         steps: resolved.length,
         vars: Object.keys(v),
@@ -1849,7 +2344,7 @@ function buildServer(stdio = false): McpServer {
       if (!(await approved(server, profileOfTab(tab) ?? null, `Approve uploading ${names} to ${hostOf(probe.url)}?`))) {
         return text(`Action denied by user: upload of ${names}.`);
       }
-      return text(await act("upload_file", tab, { files, index, selector }));
+      return text(await act("upload_file", tab, { files, index, selector, gated: true }));
     },
   );
 
@@ -1965,6 +2460,8 @@ function buildServer(stdio = false): McpServer {
         JSON.stringify({
           session_profile: currentProfileLabel() || null,
           profiles: profileList().map((pr) => ({ ...pr, in_use_by_this_session: pr.id === sess.profile })),
+          ...(unpairedSockets.size > 0 ? { unpaired_extension_waiting: true } : {}),
+          ...(openSockets.size > 0 ? { extension_waiting_to_work_without_pairing: true } : {}),
         }),
       ),
   );
@@ -1982,7 +2479,7 @@ function buildServer(stdio = false): McpServer {
       const m = matchProfile(profile);
       if (!m) {
         const list = [...profiles.values()].map(profileLabel).join("; ") || "none";
-        return text(`No connected browser profile matches '${profile}'. Connected: ${list}.`);
+        return text(`No connected browser profile matches '${profile}'. Connected: ${list}.${unpairedNote()}`);
       }
       if (Array.isArray(m)) {
         return text(`'${profile}' matches several profiles: ${m.map(profileLabel).join("; ")}. Be more specific.`);
@@ -1990,6 +2487,32 @@ function buildServer(stdio = false): McpServer {
       if (sess.profile !== m.id) sess.currentTab = null; // tabs belong to a profile
       sess.profile = m.id;
       return text(`This session now uses the browser profile: ${profileLabel(m)}.`);
+    },
+  );
+
+  tool(
+    "pair_browser",
+    {
+      description:
+        "Show the USER the pairing code for the Otter extension, in a prompt in this app (the code " +
+        "is never shown to you). Use it when a Chrome profile is waiting to be paired — " +
+        "list_profiles reports unpaired_extension_waiting — or when the user asks to pair a " +
+        "browser or switched on \"Require pairing\" in the Otter popup.",
+    },
+    async () => {
+      if (unpairedSockets.size === 0) {
+        return text(
+          "No Otter extension is waiting to be paired. Ask the user to switch on \"Require pairing\" " +
+            "in the Otter popup of the Chrome profile they want to pair, then call pair_browser again.",
+        );
+      }
+      await promptPairing(true);
+      return text(
+        `Paired. Connected profiles: ${[...profiles.values()].map(profileLabel).join("; ")}. ` +
+          (unpairedSockets.size > 0
+            ? "Another profile is still waiting for the code; the user can paste the same code there."
+            : ""),
+      );
     },
   );
 
@@ -2096,6 +2619,16 @@ function buildServer(stdio = false): McpServer {
 async function main(): Promise<void> {
   const useStdio = process.argv.includes("--stdio");
 
+  PAIR_CODE = await loadPairingCode();
+  PAIR_KEY = Buffer.from(PAIR_CODE, "utf-8");
+
+  // The one sanctioned way to show the code in a terminal: the human asked.
+  if (process.argv.includes("--pairing-code")) {
+    process.stdout.write(formatCode(PAIR_CODE) + "\n");
+    process.exit(0);
+  }
+  log(`[pairing] pairing code is stored in ${PAIRING_FILE}`);
+
   // Bind the bridge first; if :8765 is taken, fail before touching the MCP
   // transport (a second instance can't bridge the extension anyway).
   await startBridge();
@@ -2159,6 +2692,29 @@ async function startHttp(): Promise<void> {
       res
         .writeHead(403, { "Content-Type": "application/json" })
         .end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden" }, id: null }));
+      return;
+    }
+
+    // Any local process could otherwise drive the browser through this
+    // endpoint: it needs the pairing code as a bearer token (unless the user
+    // switched pairing off for this computer).
+    const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "");
+    const presented = bearer ? normalizeCode(bearer[1]) : null;
+    const authorized = !!presented && timingSafeEqual(sha256(presented), sha256(PAIR_CODE));
+    if (!authorized && (await pairingRequired())) {
+      log("[http] rejected a request without the right Authorization header");
+      res.writeHead(401, { "Content-Type": "application/json" }).end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32001,
+            message:
+              'Unauthorized: add the header "Authorization: Bearer <pairing code>" ' +
+              '(run "node dist/index.js --pairing-code" to see the code).',
+          },
+          id: null,
+        }),
+      );
       return;
     }
 

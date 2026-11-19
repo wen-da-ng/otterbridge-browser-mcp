@@ -11,6 +11,10 @@ tools, same safety model (destructive-action gate + audit log + origin/host
 guards). It is **single-tab only** — the multi-tab / per-agent tab-group
 features live only in the Node server.
 
+> **Not compatible with the Otter extension 0.8.0 or later**, which only talks
+> to servers that know the pairing code. The Python server doesn't speak
+> pairing; use it only with extension 0.7.0 or earlier.
+
 > Run **either** the Node server **or** this one — never both at once. They
 > share the `ws://localhost:8765` bridge, and only one process can own it.
 

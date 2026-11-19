@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.8.0 — 2026-11-20
+
+### Added
+
+- **Optional pairing (opt-in).** Switch on "Require pairing" in the Otter
+  popup and the extension and OtterBridge must prove they share a pairing code
+  (`~/.otterbridge/pairing.json`, created on first start; `OTTERBRIDGE_HOME`
+  moves it) before anything else is exchanged — in both directions, bound to
+  the port in use. Until then the extension doesn't say which profile or
+  account it is, and the server sends it nothing. Off by default: everything
+  works out of the box as before.
+  - **Getting the code:** your AI app shows it to **you** in a prompt (the
+    first time no profile is connected, or when you ask it to pair a browser —
+    new tool `pair_browser`). Paste it into the popup, then type its last 4
+    characters in the prompt to confirm; a prompt accepted unread just comes
+    back. Another Chrome profile? **Show code → Copy** in a paired profile's
+    popup. The code is never shown to the AI, written to the audit log or
+    printed to stderr.
+  - **The setting is per computer**, stored next to the code. It changes only
+    through a paired extension's switch or your OK in the AI app — an
+    extension merely claiming "no pairing" is never let in on its own word
+    while pairing is on. A profile with pairing on shows when another profile
+    switched it off for the computer.
+  - A red "!" on the toolbar icon means the extension needs the code (or has
+    the wrong one). Five wrong codes within a minute lock pairing for that
+    minute.
+- Cleaner popup: connection status in the header, the pairing switch on top,
+  a segmented speed control, and hints only when something needs you.
+- `node dist/index.js --pairing-code` prints the code in a terminal.
+- **The extension refuses ungated destructive actions.** Commands you
+  approved are marked as approved; the extension independently recognises a
+  destructive-looking click, an OK on a destructive or unreadable dialog, an
+  upload or `evaluate_js`, and refuses one that arrives unmarked (unless Full
+  Auto is on). This catches a server code path that forgets to ask. Approval
+  prompts still appear in your AI app, exactly as before.
+- `list_profiles` reports an unpaired extension waiting for its code.
+
+### Changed
+
+- **With pairing on, the HTTP endpoint (`localhost:8000/mcp`) needs the
+  code** as `Authorization: Bearer <code>` — add it in Claude Code with
+  `--header "Authorization: Bearer <code>"`. stdio and the `.mcpb` are
+  unaffected.
+- Servers register with the 8765 registry using the pairing code, so only a
+  paired server can make the extension connect to its port.
+- **Update everything together and restart all AI clients after updating:**
+  an 0.8.0 extension doesn't talk to older servers, and an 0.8.0 server
+  doesn't accept older extensions (the AI is told which side to update).
+- The legacy Python server doesn't speak the new handshake and no longer
+  works with the extension from 0.8.0 on.
+
+### Security
+
+- With pairing on, other users of the computer, containers / VMs / WSL
+  sharing `localhost`, sandboxed apps, and any unrelated program listening on
+  the bridge ports are kept out — without it, such a program receives your
+  profile name and Google account email from the extension and can drive the
+  browser without approval prompts. Pairing does **not** protect against a
+  program running as you with access to your files: it can read the code like
+  any other file of yours.
+
+### Known limitations
+
+- Pressing Enter in a form field (or typing into a field that submits on its
+  own) submits the form without an approval prompt; only clicks, dialogs,
+  uploads and `evaluate_js` are gated.
+
 ## 0.7.0 — 2026-11-19
 
 ### Added

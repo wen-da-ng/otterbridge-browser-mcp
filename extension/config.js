@@ -165,10 +165,49 @@
     });
   }
 
+  // ---- Pairing code (must match normalizeCode in server/src/index.ts) ----
+  // Crockford base32 without I L O U. Uppercase, read the look-alikes O/I/L
+  // as 0/1/1, drop dashes and spaces; valid only with exactly 20 left.
+  const PAIR_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  function normalizePairingCode(s) {
+    const t = String(s || "")
+      .toUpperCase()
+      .replace(/O/g, "0")
+      .replace(/[IL]/g, "1")
+      .split("")
+      .filter((ch) => PAIR_ALPHABET.includes(ch))
+      .join("");
+    return t.length === 20 ? t : null;
+  }
+
+  // ---- Second line of defence for the approval gate ----
+  // The server asks the user before destructive actions and marks the command
+  // `gated: true` once they approved. The extension independently recognises
+  // the same actions and refuses one that arrives unmarked — so a server code
+  // path that forgets to gate can't slip through. Approval prompts stay in the
+  // server; this never asks anything itself.
+  // DANGER_SOURCE must equal DANGER_RE in server/src/index.ts (test/gate.mjs
+  // fails the build if they drift apart).
+  const DANGER_SOURCE =
+    "\\b(buy|purchase|pay|checkout|order|place\\s+order|delete|remove|send|submit|confirm|transfer|withdraw|post|publish|unsubscribe)\\b";
+  const DANGER_RE = new RegExp(DANGER_SOURCE, "i");
+  const isDanger = (text) => DANGER_RE.test(String(text || ""));
+
+  // kind: "click" | "dialog" (accepting a non-alert dialog whose text is
+  // known) | "dialog_unread" | "upload" | "eval". True = refuse.
+  function refuseUngated({ kind, text, gated, approvalMode }) {
+    if (approvalMode === "auto") return false; // Full Auto: the user's own switch
+    if (gated === true) return false;
+    if (kind === "click" || kind === "dialog") return isDanger(text);
+    return kind === "dialog_unread" || kind === "upload" || kind === "eval";
+  }
+
   root.OtterConfig = {
     KEY, DEFAULTS, PRESETS,
     applyPreset, normalize,
     moveDuration, curveFactor, typeDelay, scrollAmount, easingFn, EASINGS,
     load, save,
+    normalizePairingCode,
+    DANGER_SOURCE, isDanger, refuseUngated,
   };
 })(typeof self !== "undefined" ? self : this);
