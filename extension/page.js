@@ -16,7 +16,7 @@
 //
 // Re-injection is cheap: a frame that already has this version returns early.
 (() => {
-  const VERSION = 5;
+  const VERSION = 7;
   if (window.__otter && window.__otter.v === VERSION) return;
 
   // What counts as interactive without looking at styles. ARIA menu/option
@@ -564,6 +564,128 @@
     };
   }
 
+  // ===== Performance measurement (perf_audit / perf_record) =====
+  // Fixed measurement code reading the browser's own performance timeline;
+  // top frame only. Numbers are milliseconds since navigation start.
+  const r0 = (n) => (n == null ? null : Math.round(n));
+  function perfLabel(el) {
+    if (!el || !el.tagName) return null;
+    let d = el.tagName.toLowerCase();
+    if (el.id) d += `#${el.id}`;
+    else if (el.classList && el.classList.length) d += "." + [...el.classList].slice(0, 2).join(".");
+    return d.slice(0, 80);
+  }
+  function longFrames(entries, n = 10) {
+    return [...entries].sort((a, b) => b.duration - a.duration).slice(0, n).map((e) => ({
+      start: r0(e.startTime), duration: r0(e.duration), blocking: r0(e.blockingDuration),
+      scripts: [...(e.scripts || [])].sort((a, b) => b.duration - a.duration).slice(0, 3).map((sc) => ({
+        url: String(sc.sourceURL || "").slice(0, 300), fn: sc.sourceFunctionName || "",
+        invoker: String(sc.invoker || "").slice(0, 120), duration: r0(sc.duration),
+      })),
+    }));
+  }
+  // Largest session window of layout shifts (the CLS definition): shifts
+  // less than 1 s apart, window at most 5 s, shifts right after input ignored.
+  function clsOf(shifts) {
+    let best = 0, cur = 0, first = 0, prev = 0;
+    for (const e of shifts) {
+      if (e.hadRecentInput) continue;
+      if (cur && e.startTime - prev < 1000 && e.startTime - first < 5000) cur += e.value;
+      else { cur = e.value; first = e.startTime; }
+      prev = e.startTime;
+      best = Math.max(best, cur);
+    }
+    return Math.round(best * 1000) / 1000;
+  }
+  function domStats() {
+    let nodes = 0, maxDepth = 0;
+    const stack = [[document.documentElement, 1]];
+    while (stack.length) {
+      const [el, d] = stack.pop();
+      if (!el) continue;
+      nodes++;
+      if (d > maxDepth) maxDepth = d;
+      for (const c of el.children) stack.push([c, d + 1]);
+    }
+    return { nodes, maxDepth };
+  }
+  // Buffered entries of the given types (delivered asynchronously).
+  function timeline(types) {
+    const supported = (window.PerformanceObserver && PerformanceObserver.supportedEntryTypes) || [];
+    const got = {}, obs = [];
+    for (const t of types) {
+      got[t] = [];
+      if (!supported.includes(t)) continue;
+      try {
+        const o = new PerformanceObserver((list) => got[t].push(...list.getEntries()));
+        o.observe({ type: t, buffered: true });
+        obs.push([t, o]);
+      } catch (_) {}
+    }
+    return new Promise((resolve) => setTimeout(() => {
+      for (const [t, o] of obs) { try { got[t].push(...o.takeRecords()); o.disconnect(); } catch (_) {} }
+      resolve({ got, supported });
+    }, 50));
+  }
+
+  async function perfCollect() {
+    const { got, supported } = await timeline([
+      "navigation", "paint", "largest-contentful-paint", "layout-shift", "longtask", "long-animation-frame", "resource",
+    ]);
+    const nav = got.navigation[0] || performance.getEntriesByType("navigation")[0];
+    const fcpE = got.paint.find((e) => e.name === "first-contentful-paint");
+    const fcp = fcpE ? fcpE.startTime : null;
+    const lcpE = got["largest-contentful-paint"].at(-1);
+    const tbt = got.longtask
+      .filter((e) => fcp == null || e.startTime >= fcp)
+      .reduce((sum, e) => sum + Math.max(0, e.duration - 50), 0);
+    return {
+      visibility: document.visibilityState,
+      supported: ["largest-contentful-paint", "layout-shift", "longtask", "long-animation-frame"].filter((t) => supported.includes(t)),
+      ttfb: nav ? r0(nav.responseStart) : null,
+      dom_content_loaded: nav ? r0(nav.domContentLoadedEventEnd) : null,
+      load: nav ? r0(nav.loadEventEnd) : null,
+      fcp: r0(fcp),
+      lcp: lcpE ? { time: r0(lcpE.startTime), size: lcpE.size, element: perfLabel(lcpE.element), url: String(lcpE.url || "").slice(0, 300) } : null,
+      cls: clsOf(got["layout-shift"]),
+      tbt: r0(tbt),
+      long_frames: longFrames(got["long-animation-frame"]),
+      render_blocking: got.resource.filter((e) => e.renderBlockingStatus === "blocking").map((e) => e.name.slice(0, 300)),
+      dom: domStats(),
+    };
+  }
+
+  // perf_record: live observers between start and stop.
+  let rec = null;
+  function perfRecStart() {
+    if (rec) rec.obs.forEach(([, o]) => o.disconnect());
+    const supported = (window.PerformanceObserver && PerformanceObserver.supportedEntryTypes) || [];
+    rec = { t0: performance.now(), entries: { longtask: [], "long-animation-frame": [], "layout-shift": [], event: [] }, obs: [] };
+    for (const t of Object.keys(rec.entries)) {
+      if (!supported.includes(t)) continue;
+      try {
+        const o = new PerformanceObserver((list) => rec && rec.entries[t].push(...list.getEntries()));
+        o.observe(t === "event" ? { type: t, durationThreshold: 40 } : { type: t });
+        rec.obs.push([t, o]);
+      } catch (_) {}
+    }
+    return true;
+  }
+  function perfRecStop() {
+    if (!rec) return { navigated: true };
+    const { entries, obs } = rec;
+    for (const [t, o] of obs) { try { entries[t].push(...o.takeRecords()); o.disconnect(); } catch (_) {} }
+    rec = null;
+    return {
+      slowest_interactions: [...entries.event].sort((a, b) => b.duration - a.duration).slice(0, 10)
+        .map((e) => ({ type: e.name, duration: r0(e.duration), target: perfLabel(e.target) })),
+      long_frames: longFrames(entries["long-animation-frame"]),
+      blocking_ms: r0(entries.longtask.reduce((sum, e) => sum + Math.max(0, e.duration - 50), 0)),
+      cls: clsOf(entries["layout-shift"]),
+      dom: domStats(),
+    };
+  }
+
   window.__otter = {
     v: VERSION,
     collect, rect, scrollTo, hitIs, hitTest, hitTestTop, match, labelAt: (i) => (elAt(i) ? labelOf(elAt(i)).slice(0, 80) : null),
@@ -571,5 +693,6 @@
     focusSelect, fieldState, selectOption, markFileInput, unmarkFileInput,
     snapshot, watchMutations, mutationCount,
     broadcast, frameInfo,
+    perfCollect, perfRecStart, perfRecStop,
   };
 })();

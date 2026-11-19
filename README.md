@@ -124,7 +124,7 @@ and for the extension click the green **Code** button on the repo page →
 
 ## What your AI can do
 
-Thirty-seven tools, each taking an optional `tab` id — plus multi-tab,
+Forty-one tools, each taking an optional `tab` id — plus multi-tab,
 multi-agent control where every MCP session works in its own Chrome window and
 colored tab group. Everything that reads or acts on a page also works **inside
 iframes** (payment forms, embedded editors, nested frames) and **shadow DOM**
@@ -178,6 +178,24 @@ AI rarely needs a second call just to check.
 | `wait_for_download(timeout_ms?)` | Wait for a download to finish; returns the saved file's full path, size and type. |
 | `save_pdf(path?, tab?)` | Save the page as a PDF (default: your Downloads folder, named after the page). |
 | `set_viewport(width?, height?, mobile?, scale?, reset?, tab?)` | Emulate another screen size, e.g. a phone, to test responsive layouts. |
+</details>
+
+<details>
+<summary><b>Measure &amp; optimise your web app (4)</b></summary>
+
+| Tool | Does |
+|---|---|
+| `perf_audit(url?, cold?, network?, cpu?, settle_ms?, tab?)` | Reloads the page (cold cache by default) and reports load metrics — TTFB, FCP, LCP and its element, CLS, Total Blocking Time — plus main-thread and memory figures, network totals by type, third-party hosts, the largest / slowest / failed requests, the longest frames with the script and function behind them, console errors, and **prioritised findings** (uncompressed text, huge images, render-blocking CSS, missing caching, …). `network` / `cpu` throttle that run only. |
+| `perf_record(action, tab?)` | `start`, do something (click, type, scroll), `stop`: the slowest interactions, long frames, layout shifts, main-thread time, and the change in JS heap and DOM size. Repeat an action several times to spot a leak. |
+| `throttle(network?, cpu?, reset?, tab?)` | Simulate slow-3g / fast-3g / fast-4g / offline and a slower CPU — stays on until `reset`. |
+| `css_coverage(action, tab?)` | `start`, reload and/or use the page, `stop`: unused bytes per stylesheet. |
+
+Numbers are lab data from one run on your machine: compare **before and
+after** a change rather than against a target. A browser extension can't use
+Chrome's JavaScript profiler, so there's no JS coverage or CPU profile — the
+long-frame report names the script and function behind each slow frame
+instead. In Claude Code, the AI can measure, find the cause in your source,
+fix it, and measure again.
 </details>
 
 <details>
@@ -521,6 +539,8 @@ setup scripts (`bootstrap` + `start`) and docs. It's single-tab only. See
 - [x] Iframes, shadow DOM, JS dialogs, file upload/download, key combinations
 - [x] Page snapshot + "what changed" reports — fewer screenshots and round trips
 - [x] Rookie-friendly releases — prebuilt `.mcpb` + extension zip on every release
+- [x] Optional pairing + extension-side check of approvals
+- [x] Web-app performance tools — page-load audit, interaction recording, throttling, CSS coverage
 - [ ] Chrome Web Store (unlisted) — extension installs from a link, no Developer mode
 - [ ] Detection refinements — brief-attach debugger, extra behavioral jitter, cursor overshoot
 - [ ] Standalone example agent client (LangGraph/Ollama) — any MCP client can already attach

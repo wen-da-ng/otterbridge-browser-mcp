@@ -427,14 +427,31 @@ async function ensureDebugger(tabId) {
   enableErrors.set(tabId, errs);
 }
 
-chrome.debugger.onDetach.addListener(({ tabId }) => attached.delete(tabId));
+chrome.debugger.onDetach.addListener(({ tabId }) => {
+  attached.delete(tabId);
+  clearMeasurement(tabId); // a detach silently ends throttling and tracking
+});
+
+// ===== Measurement state (throttle / perf_record / css_coverage) =====
+const throttleState = new Map(); // tabId -> { network, cpu } while throttled
+const perfRec = new Map();       // tabId -> { t, metrics } while perf_record runs
+const cssTracking = new Map();   // tabId -> Map(styleSheetId -> { url, length, inline })
+const cssNavigated = new Set();  // tabs whose page navigated while css_coverage ran
+function clearMeasurement(tabId) {
+  throttleState.delete(tabId);
+  perfRec.delete(tabId);
+  cssTracking.delete(tabId);
+  cssNavigated.delete(tabId);
+}
 
 // ===== Console + network capture (per-tab ring buffers) =====
 // Filled by CDP events while a debugger is attached. Buffers survive a detach
 // (the data stays readable); they're dropped when the tab closes.
 const consoleBuf = new Map(); // tabId -> [{ ts, level, text, url?, source? }]
 const networkBuf = new Map(); // tabId -> Map(requestId -> entry), insertion-ordered
-const CONSOLE_CAP = 500, NETWORK_CAP = 300;
+// The network buffer holds a whole heavy page load (perf_audit); read_network
+// still returns at most NETWORK_READ_MAX entries, as before.
+const CONSOLE_CAP = 500, NETWORK_CAP = 1000, NETWORK_READ_MAX = 300;
 
 // ===== JavaScript dialogs (alert / confirm / prompt / beforeunload) =====
 // An open dialog freezes the page: scripts, input and screenshots all stall
@@ -495,17 +512,51 @@ chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
       type: params.type,
       ts: params.wallTime,
       startMs: Date.now(), // local clock, for wait_for(url) after an action
+      perf: { t0: params.timestamp, initiator: params.initiator && params.initiator.type, decoded: 0 },
     });
     if (buf.size > NETWORK_CAP) buf.delete(buf.keys().next().value);
   } else if (method === "Network.responseReceived") {
     const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
-    if (e) { e.status = params.response.status; e.mimeType = params.response.mimeType; }
+    if (e) {
+      const r = params.response;
+      e.status = r.status;
+      e.mimeType = r.mimeType;
+      const h = {};
+      for (const [k, v] of Object.entries(r.headers || {})) h[k.toLowerCase()] = String(v);
+      Object.assign(e.perf, {
+        protocol: r.protocol,
+        fromCache: !!(r.fromDiskCache || r.fromPrefetchCache) || !!e.perf.fromCache,
+        fromSW: !!r.fromServiceWorker,
+        enc: h["content-encoding"] || "",
+        cache: h["cache-control"] || "",
+        waitMs: r.timing ? r.timing.receiveHeadersEnd - r.timing.sendEnd : undefined,
+      });
+    }
+  } else if (method === "Network.requestServedFromCache") {
+    const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
+    if (e) e.perf.fromCache = true;
+  } else if (method === "Network.dataReceived") {
+    const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
+    if (e) e.perf.decoded += params.dataLength || 0;
+  } else if (method === "CSS.styleSheetAdded") {
+    const sheets = cssTracking.get(tabId);
+    const h = params.header;
+    if (sheets && h) sheets.set(h.styleSheetId, { url: h.sourceURL || "", length: h.length || 0, inline: !!h.isInline });
+  } else if (method === "CSS.styleSheetRemoved") {
+    const sheets = cssTracking.get(tabId);
+    if (sheets) sheets.delete(params.styleSheetId);
+  } else if (method === "Page.frameNavigated" && params.frame && !params.frame.parentId && cssTracking.has(tabId)) {
+    // A reload or navigation replaces every stylesheet with a new copy, and
+    // Chrome doesn't report the old ones removed: start a fresh list for the
+    // new document, or the same file would count twice.
+    cssTracking.set(tabId, new Map());
+    cssNavigated.add(tabId);
   } else if (method === "Network.loadingFailed") {
     const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
     if (e) { e.error = params.errorText; e.doneMs = Date.now(); }
   } else if (method === "Network.loadingFinished") {
     const e = (networkBuf.get(tabId) || new Map()).get(params.requestId);
-    if (e) { e.encodedBytes = Math.round(params.encodedDataLength); e.doneMs = Date.now(); }
+    if (e) { e.encodedBytes = Math.round(params.encodedDataLength); e.doneMs = Date.now(); e.perf.t1 = params.timestamp; }
   }
 });
 
@@ -516,6 +567,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   elementRefs.delete(tabId);
   childTabs.delete(tabId);
   lastActionTs.delete(tabId);
+  clearMeasurement(tabId);
 });
 
 async function cdp(tabId, method, params) {
@@ -1171,7 +1223,10 @@ function dialogNote(d, triggered) {
 
 // Resolve with the action's result, or with a dialog notice the moment a
 // dialog opens (the action itself would hang until the dialog is answered).
-function raceDialog(tabId, promise) {
+// watchdog: also treat a page that stops answering as a dialog. Off for
+// perf_audit, whose (often CPU-throttled) load can keep the page busy for
+// seconds — a reported dialog still ends it.
+function raceDialog(tabId, promise, watchdogOn = true) {
   return new Promise((resolve, reject) => {
     let done = false;
     const waiters = dialogWaiters.get(tabId) || new Set();
@@ -1189,7 +1244,7 @@ function raceDialog(tabId, promise) {
     // is still running, check the page still answers.
     let probing = false;
     const watchdog = setInterval(async () => {
-      if (done || probing) return;
+      if (done || probing || !watchdogOn) return;
       probing = true;
       const ok = await pageResponsive(tabId);
       probing = false;
@@ -1283,7 +1338,7 @@ const DIALOG_OK = new Set(["handle_dialog", "dialog_info", "read_console", "read
 const VISIBLE = new Set([
   "navigate", "go_back", "go_forward", "reload",
   "click", "fill_element", "select_option", "hover", "drag",
-  "type_text", "press_key", "scroll", "upload_file",
+  "type_text", "press_key", "scroll", "upload_file", "perf_audit",
 ]);
 // Actions that start "something happening" — wait_for(url) watches from here.
 const ACTING = new Set([
@@ -1423,7 +1478,7 @@ async function handle(action, p) {
   return withTabLock(tab.id, async () => {
     busyWindows.set(tab.windowId, (busyWindows.get(tab.windowId) || 0) + 1);
     try {
-      return await raceDialog(tab.id, run());
+      return await raceDialog(tab.id, run(), action !== "perf_audit");
     } finally {
       const n = (busyWindows.get(tab.windowId) || 1) - 1;
       if (n > 0) busyWindows.set(tab.windowId, n); else busyWindows.delete(tab.windowId);
@@ -1935,14 +1990,14 @@ async function perform(action, p, tab, fast) {
       await ensureDebugger(tab.id);
       if (!wasAttached) await sleep(300);
       const buf = networkBuf.get(tab.id);
-      let out = buf ? [...buf.values()].map(({ startMs, doneMs, ...e }) => e) : [];
+      let out = buf ? [...buf.values()].map(({ startMs, doneMs, perf, ...e }) => e) : [];
       if (p.filter) {
         const f = p.filter.toLowerCase();
         out = out.filter(
           (e) => e.url.toLowerCase().includes(f) || (e.type || "").toLowerCase() === f,
         );
       }
-      const limit = Math.min(Math.max(p.limit || 50, 1), NETWORK_CAP);
+      const limit = Math.min(Math.max(p.limit || 50, 1), NETWORK_READ_MAX);
       out = out.slice(-limit);
       if (p.clear) networkBuf.delete(tab.id);
       return {
@@ -2065,6 +2120,15 @@ async function perform(action, p, tab, fast) {
       return `Viewport set to ${p.width}x${p.height}${p.mobile ? " (mobile, touch)" : ""}. Use set_viewport(reset=true) to undo.`;
     }
 
+    case "throttle":
+      return throttleTab(tab, p);
+    case "perf_audit":
+      return perfAudit(tab, p);
+    case "perf_record":
+      return perfRecord(tab, p);
+    case "css_coverage":
+      return cssCoverage(tab, p);
+
     case "save_pdf": {
       const res = await cdp(tab.id, "Page.printToPDF", { printBackground: true, preferCSSPageSize: true });
       return { base64: res.data, title: tab.title, url: tab.url };
@@ -2073,6 +2137,158 @@ async function perform(action, p, tab, fast) {
     default:
       throw new Error(`Unknown action: ${action}`);
   }
+}
+
+// ===== Measuring web apps (throttle / perf_audit / perf_record / css_coverage) =====
+// Only debugger domains Chrome allows extensions are used (Performance,
+// Network, Emulation, CSS, DOM). Profiler / HeapProfiler aren't available, so
+// there's no JS coverage, CPU profile or heap snapshot. Measurement code run in
+// the page is fixed code in page.js, never model-supplied.
+const NET_PRESETS = {
+  "slow-3g": { latency: 2000, downloadThroughput: 50000, uploadThroughput: 50000 },
+  "fast-3g": { latency: 563, downloadThroughput: 180000, uploadThroughput: 84375 },
+  "fast-4g": { latency: 165, downloadThroughput: 1012500, uploadThroughput: 168750 },
+  offline: { latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+  none: { latency: 0, downloadThroughput: -1, uploadThroughput: -1 },
+};
+
+async function applyThrottle(tabId, { network = "none", cpu = 1 }) {
+  const preset = NET_PRESETS[network];
+  if (!preset) throw new Error(`Unknown network preset '${network}'.`);
+  await cdp(tabId, "Network.emulateNetworkConditions", { offline: network === "offline", ...preset });
+  await cdp(tabId, "Emulation.setCPUThrottlingRate", { rate: cpu });
+  if (network === "none" && cpu === 1) throttleState.delete(tabId);
+  else throttleState.set(tabId, { network, cpu });
+}
+
+async function throttleTab(tab, p) {
+  const cur = throttleState.get(tab.id) || { network: "none", cpu: 1 };
+  const next = p.reset ? { network: "none", cpu: 1 } : { network: p.network ?? cur.network, cpu: p.cpu ?? cur.cpu };
+  await applyThrottle(tab.id, next);
+  return next;
+}
+
+async function cdpMetrics(tabId) {
+  const { metrics } = await cdp(tabId, "Performance.getMetrics");
+  return Object.fromEntries(metrics.map((m) => [m.name, m.value]));
+}
+
+// Network entries started at or after `since` (local ms), with their timing.
+function requestsSince(tabId, since) {
+  const buf = networkBuf.get(tabId);
+  if (!buf) return [];
+  return [...buf.values()].filter((e) => e.startMs >= since).map((e) => ({
+    url: e.url, type: e.type, method: e.method, status: e.status, mimeType: e.mimeType,
+    error: e.error, transfer: e.encodedBytes, decoded: e.perf.decoded,
+    protocol: e.perf.protocol, fromCache: !!e.perf.fromCache, fromSW: !!e.perf.fromSW,
+    enc: e.perf.enc, cache: e.perf.cache, waitMs: e.perf.waitMs,
+    ms: e.perf.t1 != null && e.perf.t0 != null ? (e.perf.t1 - e.perf.t0) * 1000 : undefined,
+    done: e.doneMs != null || e.error != null,
+  }));
+}
+
+// Load the page (cold by default, optionally throttled) and collect raw data;
+// the server turns it into the report. The tab is never left throttled or
+// cache-disabled by an audit.
+async function perfAudit(tab, p) {
+  const unavailable = [];
+  const cold = p.cold !== false;
+  const runThrottle = p.network || p.cpu ? { network: p.network || "none", cpu: p.cpu || 1 } : null;
+  const before = throttleState.get(tab.id) || { network: "none", cpu: 1 };
+  await ensureDebugger(tab.id);
+  try { await cdp(tab.id, "Performance.enable"); } catch (e) { unavailable.push(`page metrics: ${e.message}`); }
+  consoleBuf.set(tab.id, []);
+  networkBuf.delete(tab.id);
+  const start = Date.now();
+  let page = null, metrics = null;
+  try {
+    if (cold) {
+      try { await cdp(tab.id, "Network.setCacheDisabled", { cacheDisabled: true }); }
+      catch (e) { unavailable.push(`cold cache: ${e.message}`); }
+    }
+    if (runThrottle) await applyThrottle(tab.id, runThrottle);
+    const loaded = waitForLoad(tab.id, 45000);
+    if (p.url) await chrome.tabs.update(tab.id, { url: p.url });
+    else await chrome.tabs.reload(tab.id, { bypassCache: cold });
+    await loaded;
+    // Network idle: nothing that started during the audit still in flight
+    // for 500 ms (at most 10 s), then the extra settle time.
+    const idleCap = Date.now() + 10000;
+    let quietSince = Date.now();
+    while (Date.now() < idleCap) {
+      if (requestsSince(tab.id, start).some((r) => !r.done)) quietSince = Date.now();
+      else if (Date.now() - quietSince >= 500) break;
+      await sleep(100);
+    }
+    await sleep(Math.min(Math.max(p.settleMs ?? 1000, 0), 10000));
+    try {
+      await ensureLib(tab.id);
+      page = await inFrame(tab.id, 0, () => (window.__otter ? window.__otter.perfCollect() : null));
+      if (!page) unavailable.push("page metrics: the page didn't answer");
+    } catch (e) { unavailable.push(`page metrics: ${e.message}`); }
+    try { metrics = await cdpMetrics(tab.id); } catch (e) { unavailable.push(`cpu metrics: ${e.message}`); }
+  } finally {
+    if (cold) { try { await cdp(tab.id, "Network.setCacheDisabled", { cacheDisabled: false }); } catch (_) {} }
+    if (runThrottle) { try { await applyThrottle(tab.id, before); } catch (_) {} }
+  }
+  const fresh = await chrome.tabs.get(tab.id).catch(() => tab);
+  const errors = (consoleBuf.get(tab.id) || []).filter((e) => e.level === "error");
+  return {
+    url: fresh.url, cold, throttle: runThrottle || before, page, metrics,
+    requests: requestsSince(tab.id, start),
+    consoleErrors: { count: errors.length, first: errors.slice(0, 5).map((e) => clip(e.text, 200)) },
+    unavailable,
+  };
+}
+
+async function perfRecord(tab, p) {
+  if (p.action === "start") {
+    await ensureDebugger(tab.id);
+    await cdp(tab.id, "Performance.enable");
+    await ensureLib(tab.id);
+    await inFrame(tab.id, 0, () => window.__otter && window.__otter.perfRecStart());
+    perfRec.set(tab.id, { t: Date.now(), metrics: await cdpMetrics(tab.id) });
+    return { started: true };
+  }
+  const rec = perfRec.get(tab.id);
+  if (!rec) throw new Error("No recording in progress — call perf_record(action='start') first.");
+  perfRec.delete(tab.id);
+  const page = await inFrame(tab.id, 0, () => (window.__otter ? window.__otter.perfRecStop() : null));
+  let after = null;
+  try { after = await cdpMetrics(tab.id); } catch (_) {}
+  return {
+    durationMs: Date.now() - rec.t,
+    page: page || { navigated: true },
+    before: rec.metrics, after,
+    requests: requestsSince(tab.id, rec.t),
+  };
+}
+
+async function cssCoverage(tab, p) {
+  if (p.action === "start") {
+    await ensureDebugger(tab.id);
+    cssTracking.set(tab.id, new Map()); // filled by CSS.styleSheetAdded
+    cssNavigated.delete(tab.id);
+    await cdp(tab.id, "DOM.enable");
+    await cdp(tab.id, "CSS.enable"); // announces the existing stylesheets
+    await cdp(tab.id, "CSS.startRuleUsageTracking");
+    return { started: true };
+  }
+  const sheets = cssTracking.get(tab.id);
+  if (!sheets) throw new Error("CSS coverage isn't running — call css_coverage(action='start') first.");
+  const { ruleUsage } = await cdp(tab.id, "CSS.stopRuleUsageTracking");
+  const navigated = cssNavigated.has(tab.id);
+  cssTracking.delete(tab.id);
+  cssNavigated.delete(tab.id);
+  try { await cdp(tab.id, "CSS.disable"); } catch (_) {}
+  const used = new Map(); // styleSheetId -> used bytes
+  for (const r of ruleUsage || []) {
+    if (r.used) used.set(r.styleSheetId, (used.get(r.styleSheetId) || 0) + (r.endOffset - r.startOffset));
+  }
+  return {
+    navigated,
+    sheets: [...sheets.entries()].map(([id, sh]) => ({ ...sh, used: Math.min(used.get(id) || 0, sh.length) })),
+  };
 }
 
 // ===== page_snapshot =====

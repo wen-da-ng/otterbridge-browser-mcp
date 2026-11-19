@@ -130,8 +130,9 @@ async function main() {
       "select_option", "type_text", "use_tab", "wait_for", "get_user_tab",
       "page_snapshot", "handle_dialog", "upload_file", "wait_for_download", "set_viewport", "save_pdf",
       "list_profiles", "use_profile", "pair_browser",
+      "throttle", "perf_audit", "perf_record", "css_coverage",
     ].sort();
-    ok("tools/list has all 37 tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
+    ok("tools/list has all 41 tools", JSON.stringify(tools) === JSON.stringify(expected), `got ${JSON.stringify(tools)}`);
 
     const rp = await client.callTool({ name: "read_page", arguments: {} });
     ok("read_page returns JSON text", firstText(rp).includes("example.com"));

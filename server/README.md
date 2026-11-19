@@ -37,7 +37,7 @@ code is never shown to the AI, written to the audit log or printed to stderr.
 
 ## Tools
 
-37 tools — see the [root README](../README.md#what-your-ai-can-do). Each MCP
+41 tools — see the [root README](../README.md#what-your-ai-can-do). Each MCP
 session works in its own Chrome window + tab group, opened on its first tool
 call; the user's own tabs are read-only (`get_user_tab`).
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.0 — 2026-11-20
+
+### Added
+
+- **Measure and optimise web apps** — four new tools:
+  - `perf_audit` reloads a page (cold cache by default, optionally
+    throttled for that run only) and reports TTFB, FCP, LCP with its element,
+    CLS, Total Blocking Time, main-thread and memory figures, network totals by
+    type, third-party hosts, the largest / slowest / failed requests, the
+    longest frames with the script and function behind them, console errors,
+    and up to 15 prioritised findings. The tab is never left throttled or with
+    its cache disabled.
+  - `perf_record` measures an interaction between `start` and `stop`: the
+    slowest interactions, long frames, layout shifts, main-thread time, and the
+    change in JS heap and DOM size — repeat an action to spot a leak.
+  - `throttle` simulates slow-3g / fast-3g / fast-4g / offline and a slower
+    CPU until reset.
+  - `css_coverage` reports unused bytes per stylesheet, across reloads.
+- Report URLs drop their query strings and fragments, which can carry tokens.
+
+### Changed
+
+- The network capture buffer holds 1000 requests (was 300), so a heavy page
+  load fits; `read_network` still returns at most 300.
+- An extension too old for a tool now says so ("update the extension")
+  instead of failing with "Unknown action".
+
+### Notes
+
+- Numbers are lab data from one run on this machine — compare before and
+  after a change. Chrome doesn't let extensions use its JavaScript profiler,
+  so there is no JS coverage, CPU profile or heap snapshot; the long-frame
+  report names the script and function behind slow frames instead, and memory
+  figures are approximate.
+
 ## 0.8.0 — 2026-11-20
 
 ### Added

@@ -101,7 +101,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.8.0";
+const SERVER_VERSION = "0.9.0";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -851,7 +851,15 @@ async function sendCmd(
     pending.set(id, { resolve, reject, timer, socket });
     socket.send(JSON.stringify({ id, action, params: params ?? {} }));
   });
-  if (data.error) throw new Error(data.error);
+  if (data.error) {
+    if (data.error === `Unknown action: ${action}`) {
+      throw new Error(
+        `The Otter Chrome extension is older than this server and doesn't support ${action}. Ask the ` +
+          `user to update the extension and reload it at chrome://extensions.`,
+      );
+    }
+    throw new Error(data.error);
+  }
   return data.result;
 }
 
@@ -904,6 +912,241 @@ async function approved(
 }
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
+
+// ===== Measuring web apps: turning raw browser data into reports =====
+// The extension returns raw timings; the verdicts are made here, where they
+// are typed and testable. All numbers are lab data from one run on this
+// machine — they vary run to run, so compare before/after, not to a target.
+interface RawRequest {
+  url: string; type?: string; method?: string; status?: number; mimeType?: string; error?: string;
+  transfer?: number; decoded?: number; protocol?: string; fromCache?: boolean; fromSW?: boolean;
+  enc?: string; cache?: string; waitMs?: number; ms?: number;
+}
+type Finding = { severity: "high" | "medium" | "low"; what: string; evidence: string };
+
+// URLs in reports: no query string or fragment (they can carry tokens), short.
+function shortUrl(u: string | undefined): string {
+  if (!u) return "";
+  if (u.startsWith("data:")) return "data:…";
+  try {
+    const x = new URL(u);
+    return (x.origin + x.pathname).slice(0, 120);
+  } catch {
+    return u.split(/[?#]/)[0].slice(0, 120);
+  }
+}
+const hostOfUrl = (u: string) => {
+  try {
+    return new URL(u).hostname;
+  } catch {
+    return "";
+  }
+};
+// Registrable domain, approximately: the last two labels.
+const siteOf = (host: string) => host.split(".").slice(-2).join(".");
+const ms = (n: number | null | undefined) => (n == null ? "n/a" : n >= 1000 ? `${(n / 1000).toFixed(1)} s` : `${Math.round(n)} ms`);
+const kb = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1000)} kB`);
+const r0 = (n: number | undefined | null) => (n == null || Number.isNaN(n) ? null : Math.round(n));
+const typeOf = (r: RawRequest) => (r.type || "other").toLowerCase();
+const isText = (r: RawRequest) =>
+  ["script", "stylesheet", "document"].includes(typeOf(r)) || /json|svg|xml/.test(r.mimeType || "");
+const list3 = (rs: RawRequest[]) => rs.slice(0, 3).map((r) => shortUrl(r.url)).join(", ");
+
+function longFramesOut(frames: any[] | undefined) {
+  return (frames || []).map((f) => ({
+    ...f,
+    scripts: (f.scripts || []).map((sc: any) => ({
+      ...sc,
+      url: shortUrl(sc.url),
+      invoker: /^https?:/.test(sc.invoker || "") ? shortUrl(sc.invoker) : sc.invoker,
+    })),
+  }));
+}
+
+export function buildAuditReport(raw: any) {
+  const page = raw.page || {};
+  const reqs: RawRequest[] = raw.requests || [];
+  const unavailable: string[] = [...(raw.unavailable || [])];
+  const warnings: string[] = [];
+  if (raw.page && (page.visibility !== "visible" || page.fcp == null)) {
+    warnings.push(
+      "The tab was hidden during the audit, so paint metrics (FCP, LCP, CLS) are missing or unreliable. " +
+        "Bring the Otter window into view and run again.",
+    );
+  }
+  const metrics = {
+    ttfb: page.ttfb ?? null, fcp: page.fcp ?? null, lcp: page.lcp?.time ?? null,
+    cls: page.cls ?? null, tbt: page.tbt ?? null,
+    dom_content_loaded: page.dom_content_loaded ?? null, load: page.load ?? null,
+  };
+  const m = raw.metrics || {};
+  const pageInfo = {
+    dom_nodes: page.dom?.nodes ?? r0(m.Nodes), dom_max_depth: page.dom?.maxDepth ?? null,
+    js_heap_bytes: r0(m.JSHeapUsedSize),
+    script_ms: m.ScriptDuration != null ? r0(m.ScriptDuration * 1000) : null,
+    layout_ms: m.LayoutDuration != null ? r0(m.LayoutDuration * 1000) : null,
+    style_recalc_ms: m.RecalcStyleDuration != null ? r0(m.RecalcStyleDuration * 1000) : null,
+  };
+
+  const pageSite = siteOf(hostOfUrl(raw.url || ""));
+  const byType: Record<string, { requests: number; transfer_bytes: number }> = {};
+  const third: Record<string, { host: string; requests: number; transfer_bytes: number }> = {};
+  let transfer = 0, decoded = 0;
+  for (const r of reqs) {
+    const t = typeOf(r);
+    byType[t] ??= { requests: 0, transfer_bytes: 0 };
+    byType[t].requests++;
+    byType[t].transfer_bytes += r.transfer || 0;
+    transfer += r.transfer || 0;
+    decoded += r.decoded || 0;
+    const host = hostOfUrl(r.url);
+    if (host && pageSite && siteOf(host) !== pageSite) {
+      third[host] ??= { host, requests: 0, transfer_bytes: 0 };
+      third[host].requests++;
+      third[host].transfer_bytes += r.transfer || 0;
+    }
+  }
+  const failed = reqs.filter((r) => (r.status ?? 0) >= 400 || r.error);
+  const network = {
+    requests: reqs.length, transfer_bytes: transfer, decoded_bytes: decoded, by_type: byType,
+    third_party: Object.values(third).sort((a, b) => b.transfer_bytes - a.transfer_bytes).slice(0, 10),
+    largest: [...reqs].sort((a, b) => (b.transfer || 0) - (a.transfer || 0)).slice(0, 10)
+      .map((r) => ({ url: shortUrl(r.url), type: typeOf(r), transfer_bytes: r.transfer || 0 })),
+    slowest: reqs.filter((r) => r.ms != null).sort((a, b) => (b.ms || 0) - (a.ms || 0)).slice(0, 10)
+      .map((r) => ({ url: shortUrl(r.url), type: typeOf(r), ms: r0(r.ms), wait_ms: r0(r.waitMs) })),
+    failed: failed.slice(0, 10).map((r) => ({ url: shortUrl(r.url), status: r.status ?? null, error: r.error ?? null })),
+  };
+
+  // ----- findings -----
+  const f: Finding[] = [];
+  const band = (v: number | null, hi: number, med: number, what: string, ev: string) => {
+    if (v == null) return;
+    if (v > hi) f.push({ severity: "high", what, evidence: ev });
+    else if (v > med) f.push({ severity: "medium", what, evidence: ev });
+  };
+  band(metrics.lcp, 4000, 2500, "Slow Largest Contentful Paint",
+    `LCP ${ms(metrics.lcp)}` + (page.lcp?.element ? ` — ${page.lcp.element}` : "") + (page.lcp?.url ? ` (${shortUrl(page.lcp.url)})` : ""));
+  band(metrics.cls, 0.25, 0.1, "Layout shifts", `CLS ${metrics.cls}`);
+  band(metrics.tbt, 600, 200, "Main thread blocked", `Total Blocking Time ${ms(metrics.tbt)}`);
+  band(metrics.ttfb, 1800, 800, "Slow server response", `Time to first byte ${ms(metrics.ttfb)}`);
+  const blocking: string[] = page.render_blocking || [];
+  if (blocking.length) {
+    f.push({ severity: "medium", what: "Render-blocking resources",
+      evidence: `${blocking.length}: ${blocking.slice(0, 3).map(shortUrl).join(", ")}` });
+  }
+  const uncompressed = reqs.filter((r) => isText(r) && (r.decoded || 0) > 1400 && !r.enc && !r.fromCache);
+  if (uncompressed.length) {
+    f.push({ severity: "medium", what: "Text responses sent without compression",
+      evidence: `${uncompressed.length}: ${list3(uncompressed)}` });
+  }
+  const bigImages = reqs.filter((r) => typeOf(r) === "image" && (r.transfer || 0) > 200000);
+  if (bigImages.length) {
+    f.push({ severity: "medium", what: "Large images",
+      evidence: bigImages.slice(0, 3).map((r) => `${shortUrl(r.url)} (${kb(r.transfer || 0)})`).join(", ") });
+  }
+  const bigScripts = reqs.filter((r) => typeOf(r) === "script" && (r.transfer || 0) > 300000);
+  if (bigScripts.length) {
+    f.push({ severity: "medium", what: "Large JavaScript files",
+      evidence: bigScripts.slice(0, 3).map((r) => `${shortUrl(r.url)} (${kb(r.transfer || 0)})`).join(", ") });
+  }
+  if (failed.length) {
+    f.push({ severity: "medium", what: "Failed requests",
+      evidence: failed.slice(0, 3).map((r) => `${shortUrl(r.url)} (${r.error || r.status})`).join(", ") });
+  }
+  if (transfer > 3_000_000) f.push({ severity: "medium", what: "Heavy page", evidence: `${kb(transfer)} transferred` });
+  const nodes = pageInfo.dom_nodes;
+  if (nodes != null && nodes > 3000) f.push({ severity: "medium", what: "Very large DOM", evidence: `${nodes} elements` });
+  else if (nodes != null && nodes > 1500) f.push({ severity: "low", what: "Large DOM", evidence: `${nodes} elements` });
+  for (const fr of (page.long_frames || []).filter((x: any) => x.duration > 200 && x.scripts?.length).slice(0, 2)) {
+    const sc = fr.scripts[0];
+    f.push({ severity: "medium", what: "Long frame from a script",
+      evidence: `${ms(fr.duration)} — ${shortUrl(sc.url) || "(inline)"}${sc.fn ? ` ${sc.fn}()` : ""}` });
+  }
+  const seen = new Map<string, number>();
+  for (const r of reqs) if ((r.method || "GET") === "GET" && !r.url.startsWith("data:")) seen.set(r.url, (seen.get(r.url) || 0) + 1);
+  const dupes = [...seen.entries()].filter(([, n]) => n > 1);
+  if (dupes.length) {
+    f.push({ severity: "low", what: "Same URL requested more than once",
+      evidence: dupes.slice(0, 3).map(([u, n]) => `${shortUrl(u)} ×${n}`).join(", ") });
+  }
+  const uncached = reqs.filter(
+    (r) => ["script", "stylesheet", "image", "font"].includes(typeOf(r)) && (r.status ?? 0) < 400 &&
+      (!r.cache || /no-store|max-age=0\b/.test(r.cache)),
+  );
+  if (uncached.length) {
+    f.push({ severity: "low", what: "Static files without long-term caching",
+      evidence: `${uncached.length}: ${list3(uncached)}` });
+  }
+  const doc = reqs.find((r) => typeOf(r) === "document");
+  if (doc?.protocol === "http/1.1") f.push({ severity: "low", what: "Page served over HTTP/1.1", evidence: shortUrl(doc.url) });
+  const ce = raw.consoleErrors || { count: 0, first: [] };
+  if (ce.count > 0) f.push({ severity: "low", what: "Console errors during load", evidence: `${ce.count}: ${ce.first[0] ?? ""}`.slice(0, 200) });
+  const order = { high: 0, medium: 1, low: 2 };
+  f.sort((a, b) => order[a.severity] - order[b.severity]);
+
+  return {
+    url: shortUrl(raw.url), cold: !!raw.cold, throttle: raw.throttle || { network: "none", cpu: 1 },
+    warnings, unavailable,
+    metrics, lcp_element: page.lcp ? { element: page.lcp.element, url: shortUrl(page.lcp.url), size: page.lcp.size } : null,
+    page: pageInfo, network, long_frames: longFramesOut(page.long_frames),
+    console_errors: ce, findings: f.slice(0, 15),
+  };
+}
+
+export function buildRecordReport(raw: any) {
+  const page = raw.page || {};
+  const warnings: string[] = [];
+  if (page.navigated) {
+    warnings.push("The page navigated during the recording, so in-page timings (interactions, long frames, CLS) were lost.");
+  }
+  const b = raw.before || {}, a = raw.after || {};
+  const d = (k: string, scale = 1) => (a[k] != null && b[k] != null ? r0((a[k] - b[k]) * scale) : null);
+  const reqs: RawRequest[] = raw.requests || [];
+  return {
+    duration_ms: raw.durationMs, warnings,
+    slowest_interactions: page.slowest_interactions || [],
+    long_frames: longFramesOut(page.long_frames),
+    blocking_ms: page.blocking_ms ?? null, cls: page.cls ?? null,
+    deltas: {
+      script_ms: d("ScriptDuration", 1000), layout_ms: d("LayoutDuration", 1000),
+      style_recalc_ms: d("RecalcStyleDuration", 1000), js_heap_bytes: d("JSHeapUsedSize"), dom_nodes: d("Nodes"),
+    },
+    requests: {
+      count: reqs.length, transfer_bytes: reqs.reduce((n, r) => n + (r.transfer || 0), 0),
+      slowest: reqs.filter((r) => r.ms != null).sort((x, y) => (y.ms || 0) - (x.ms || 0)).slice(0, 5)
+        .map((r) => ({ url: shortUrl(r.url), ms: r0(r.ms) })),
+    },
+  };
+}
+
+export function buildCssReport(raw: any) {
+  const rows = new Map<string, { url: string; bytes: number; used: number }>();
+  for (const sh of raw.sheets || []) {
+    const key = sh.inline || !sh.url ? "(inline styles)" : shortUrl(sh.url);
+    const row = rows.get(key) ?? { url: key, bytes: 0, used: 0 };
+    row.bytes += sh.length || 0;
+    row.used += sh.used || 0;
+    rows.set(key, row);
+  }
+  const sheets = [...rows.values()]
+    .map((r) => ({ url: r.url, bytes: r.bytes, unused_bytes: r.bytes - r.used, unused_pct: r.bytes ? Math.round((1 - r.used / r.bytes) * 100) : 0 }))
+    .sort((x, y) => y.unused_bytes - x.unused_bytes);
+  const total = sheets.reduce((n, x) => n + x.bytes, 0);
+  const unused = sheets.reduce((n, x) => n + x.unused_bytes, 0);
+  return {
+    total_bytes: total, unused_bytes: unused, unused_pct: total ? Math.round((unused / total) * 100) : 0,
+    sheets: sheets.slice(0, 15),
+    ...(raw.navigated
+      ? { warning: "The page reloaded or navigated during coverage; only the page as it was at stop is counted." }
+      : {}),
+    note: CSS_COVERAGE_NOTE,
+  };
+}
+// From live testing: rules already in use when tracking starts count as used.
+const CSS_COVERAGE_NOTE =
+  "CSS only — JavaScript coverage isn't available to a browser extension. Counts rules the page used " +
+  "between start and stop, including what was already on screen at start; states never shown (menus, " +
+  "dialogs, other pages) count as unused.";
 const hostOf = (url: string) => {
   try {
     return new URL(url).host || url;
@@ -965,7 +1208,8 @@ function buildServer(stdio = false): McpServer {
         "result mentions a JavaScript dialog, answer it with handle_dialog. " +
         "To repeat a flow already done once, replay it in one " +
         "call with run_script. Debug web apps with read_console, read_network, " +
-        "get_network_body and evaluate_js.\n\n" +
+        "get_network_body and evaluate_js; measure them with perf_audit (page " +
+        "load), perf_record (an interaction), css_coverage and throttle.\n\n" +
         "Clicks on controls like buy, pay, delete, send or submit, and " +
         "evaluate_js, ask the user for approval unless they switched on Full " +
         "Auto in the extension. If the user denies one, stop and ask them — " +
@@ -974,7 +1218,7 @@ function buildServer(stdio = false): McpServer {
   );
 
   // Tool titles + MCP annotations, kept in one table so the risk profile of
-  // all 28 tools reads at a glance. These change client BEHAVIOUR, not just
+  // all the tools reads at a glance. These change client BEHAVIOUR, not just
   // display: Claude Code runs readOnlyHint tools in parallel and retries
   // idempotentHint tools after a dropped connection — so anything that moves
   // the page or session state must not claim either.
@@ -1019,6 +1263,10 @@ function buildServer(stdio = false): McpServer {
     list_profiles: { title: "List browser profiles", ro: true, idem: true },
     use_profile: { title: "Choose browser profile", idem: true },
     pair_browser: { title: "Pair a browser profile" },
+    throttle: { title: "Throttle network / CPU", idem: true },
+    perf_audit: { title: "Performance audit", world: true },
+    perf_record: { title: "Record interaction performance" },
+    css_coverage: { title: "CSS coverage" },
   };
   // ----- Pairing prompt -----
   // An unpaired extension is waiting: show the human the code in an approval
@@ -2442,6 +2690,98 @@ function buildServer(stdio = false): McpServer {
       }
       await writeFile(out!, Buffer.from(r.base64, "base64"));
       return text(`Saved ${r.url} as a PDF: ${out}`);
+    },
+  );
+
+  // ===== Measuring web apps =====
+  const NETWORK = z
+    .enum(["offline", "slow-3g", "fast-3g", "fast-4g", "none"])
+    .describe("Network speed to simulate: offline, slow-3g, fast-3g, fast-4g, or none.");
+  const CPU = z.number().min(1).max(20).describe("CPU slowdown multiplier (1 = none, 4 = a mid-range phone).");
+
+  tool(
+    "throttle",
+    {
+      description:
+        "Simulate a slower network and/or CPU in a Chrome tab, to see what users on weaker phones or " +
+        "connections experience. It STAYS ON for this tab until throttle(reset=true) or the tab " +
+        "closes — reset it when you're done. (perf_audit can also throttle a single run.)",
+      inputSchema: { network: NETWORK.optional(), cpu: CPU.optional(), reset: z.boolean().optional().describe("Turn throttling off."), ...TAB },
+    },
+    async ({ network, cpu, reset, tab }) => {
+      if (!reset && network == null && cpu == null) {
+        return text("Provide network and/or cpu to throttle, or reset=true to turn it off.");
+      }
+      const st = await act("throttle", tab, { network, cpu, reset });
+      if (st.network === "none" && st.cpu === 1) return text("Throttling is off for this tab.");
+      return text(
+        `Throttling this tab: network ${st.network}, CPU ${st.cpu}× slower. It stays on until ` +
+          `throttle(reset=true) or the tab closes.`,
+      );
+    },
+  );
+
+  tool(
+    "perf_audit",
+    {
+      description:
+        "Measure how fast a page loads in a Chrome tab: RELOADS it (or loads 'url'), cold cache by " +
+        "default, and reports load metrics (TTFB, FCP, LCP + its element, CLS, Total Blocking Time), " +
+        "main-thread and memory figures, network totals by type, third-party hosts (approximate), the " +
+        "largest / slowest / failed requests, the longest frames with the script behind them, console " +
+        "errors, and prioritised findings. Numbers come from one run on this machine (lab data) and " +
+        "vary run to run — run it before and after a change to compare. network/cpu throttle this " +
+        "run only.",
+      inputSchema: {
+        url: z.string().optional().describe("Page to load; omit to reload the tab's current page."),
+        cold: z.boolean().optional().describe("Bypass and disable the HTTP cache for the run (default true)."),
+        network: NETWORK.optional(),
+        cpu: CPU.optional(),
+        settle_ms: z.number().int().min(0).max(10000).optional().describe("Extra wait after the network goes quiet (default 1000)."),
+        ...TAB,
+      },
+    },
+    async ({ url, cold, network, cpu, settle_ms, tab }) => {
+      const raw = await act("perf_audit", tab, { url, cold, network, cpu, settleMs: settle_ms }, 90000);
+      return text(JSON.stringify(buildAuditReport(raw)));
+    },
+  );
+
+  tool(
+    "perf_record",
+    {
+      description:
+        "Measure an INTERACTION instead of a page load: action='start', then perform it (clicks, " +
+        "typing, scrolling...), then action='stop'. Reports the slowest interactions (input delay to " +
+        "next paint), long frames with the script behind them, layout shifts, main-thread time, and " +
+        "the change in JS heap and DOM size, plus the requests it made. Leak check: start, repeat " +
+        "the same action several times, stop — and repeat the recording: DOM nodes that keep growing " +
+        "suggest a leak (heap figures are approximate: garbage collection can't be forced).",
+      inputSchema: { action: z.enum(["start", "stop"]), ...TAB },
+    },
+    async ({ action, tab }) => {
+      const res = await act("perf_record", tab, { action });
+      if (action === "start") return text("Recording. Perform the interaction, then call perf_record(action='stop').");
+      return text(JSON.stringify(buildRecordReport(res)));
+    },
+  );
+
+  tool(
+    "css_coverage",
+    {
+      description:
+        "Find unused CSS in a Chrome tab: action='start', then reload and/or use the page (open " +
+        "menus, dialogs, other states), then action='stop' — reports, per stylesheet, how many bytes " +
+        "were never used. Rules already on screen at start count as used. CSS only: JavaScript " +
+        "coverage isn't available to a browser extension.",
+      inputSchema: { action: z.enum(["start", "stop"]), ...TAB },
+    },
+    async ({ action, tab }) => {
+      const res = await act("css_coverage", tab, { action });
+      if (action === "start") {
+        return text("CSS coverage is running. Use the page, then call css_coverage(action='stop').");
+      }
+      return text(JSON.stringify(buildCssReport(res)));
     },
   );
 
