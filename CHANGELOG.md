@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.1 — 2026-11-20
+
+### Fixed
+
+- **"Otter · …" tab groups piling up on the bookmarks bar.** Chrome saves
+  every tab group there and keeps the saved copy when a window closes, unless
+  the group is dissolved first — which OtterBridge did only for the "Close
+  agent windows" button, the (off-by-default) auto-close and an agent closing
+  its own last tab. Now:
+  - **Groups only while working:** an agent's window carries its
+    "Otter · …" group while the agent acts; the group dissolves 30 s after its
+    last action and comes back with the next one. Closing an idle agent window
+    yourself (✕) leaves nothing on the bookmarks bar.
+  - **Auto-close is on by default:** an agent's window is closed the clean way
+    5 minutes after its AI session ends. Saved settings are switched over once;
+    turn it off again in Options if you'd rather keep windows open.
+  - **Nothing slips through after a reload:** each OtterBridge server's
+    heartbeat now lists its live sessions, so after an extension reload or a
+    Chrome restart the windows of sessions that ended are still found and
+    closed, and an HTTP session that ends properly is noticed too.
+  - **"Close agent windows" also catches strays:** any open "Otter · …" group
+    OtterBridge no longer remembers (e.g. after a reinstall) is dissolved, and
+    its window closed if nothing else is in it.
+
+### Notes
+
+- Groups already saved on the bookmarks bar — and a window closed with ✕
+  while its agent is still working — can't be cleaned up by an extension
+  (Chrome has no API for saved groups): right-click the entry on the bookmarks
+  bar → **Delete group**.
+- OtterBridge now recognises its windows by window id (it forgets them when
+  Chrome restarts, which renumbers windows) rather than by their group label.
+
 ## 0.9.0 — 2026-11-20
 
 ### Added

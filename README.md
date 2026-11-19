@@ -113,13 +113,17 @@ and for the extension click the green **Code** button on the repo page →
 - **A "Connection refused" error for `ws://localhost:8765`** on the extension's
   error page just means no AI client was running at that moment. It's
   harmless and stops once one connects.
-- **Old "Otter · …" windows** are left open when a session ends, so you can see
-  what it did. The same Claude session reuses its window, even after `/mcp`
-  reconnects or an extension reload.
-- **"Otter · …" groups piling up on the bookmarks bar?** Chrome saves every tab
-  group and keeps it when the window closes. Click **Close agent windows** in
-  the extension popup (it ungroups first, so Chrome deletes them), or enable
-  auto-close in the options; delete old entries once by right-clicking them.
+- **"Otter · …" windows** stay open for 5 minutes after a session ends, so you
+  can see what it did, then close themselves (Options → *Close agent
+  windows…* turns that off). The same Claude session reuses its window, even
+  after `/mcp` reconnects or an extension reload.
+- **"Otter · …" groups on the bookmarks bar?** Chrome shows every open tab
+  group there and keeps it if its window closes with the group still in it.
+  An agent's window is grouped only while the agent works (the group dissolves
+  30 s after its last action), so closing an idle agent window yourself leaves
+  nothing behind; OtterBridge also closes agent windows 5 minutes after their
+  session ends, and **Close agent windows** in the popup does it at once.
+  Delete older leftovers once by right-clicking them → **Delete group**.
 </details>
 
 ## What your AI can do
@@ -246,8 +250,8 @@ A real recorded example lives in
 <details>
 <summary><b>Multi-tab / multi-agent</b></summary>
 
-Each MCP **session** is an agent with its **own Chrome window** holding its own
-colored, labelled **tab group** (e.g. `Otter · Claude Code 2`). The window is
+Each MCP **session** is an agent with its **own Chrome window**, labelled with a
+colored **tab group** (e.g. `Otter · Claude Code 2`) while the agent works. The window is
 opened (unfocused, so it never grabs your keyboard) on the session's first tool
 call — agents never act in the tabs you're using. Tabs a page opens inside an
 agent window are pulled into its group automatically, popups an agent's page
@@ -257,11 +261,11 @@ A client that reconnects (`/mcp`) — or an extension reload — finds the same
 window again and carries on in its current tab.
 
 **Cleaning up:** Chrome saves every tab group to the bookmarks bar and keeps
-it even after its window closes. Use **Close agent windows** in the extension
-popup — it ungroups first, so nothing is left behind — or turn on *Close agent
-windows 5 min after their AI client disconnects* in the options. Closing an
-agent window yourself? Right-click its group → **Delete group** instead of
-closing the window, or Chrome keeps the group.
+it if its window closes with the group still in it. So the group is only there
+while the agent works — it dissolves 30 s after the agent's last action — and
+closing an idle agent window yourself leaves nothing behind. Agent windows also
+close themselves 5 minutes after their session ends (Options → *Close agent
+windows…*), and **Close agent windows** in the popup closes them all at once.
 
 **Several Chrome profiles** (e.g. work and personal Google accounts): install
 the extension in each profile you want the AI to reach. Each profile tells the

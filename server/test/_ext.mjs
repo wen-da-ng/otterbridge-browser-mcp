@@ -79,6 +79,7 @@ async function connectOnce(port, opts) {
   const announced = new Set();
   const received = [];  // every message type before pairing (for assertions)
   const pairingStates = []; // the computer's "required" setting, as the server reports it
+  const pings = [];         // the live-session list of each heartbeat
   let ns, ne, settle;
   const paired = new Promise((res, rej) => { settle = { res, rej }; });
   paired.catch(() => {});
@@ -108,6 +109,7 @@ async function connectOnce(port, opts) {
     if (msg.type === "auth_failed") { settle.rej(new Error(`auth_failed ${msg.reason}`)); return; }
     if (msg.type === "bridges") { (msg.ports || []).forEach((p) => announced.add(p)); return; }
     if (msg.type === "pairing_state") { pairingStates.push(msg.required); return; }
+    if (msg.type === "ping") { pings.push(msg.agents || []); return; }
     if (msg.type) { received.push(msg.type); return; } // ping, ...
     received.push("command");
     seen.push(msg.action);
@@ -119,7 +121,7 @@ async function connectOnce(port, opts) {
   ws.on("close", () => settle.rej(new Error("closed before pairing")));
   await new Promise((res, rej) => { ws.on("open", res); ws.on("error", rej); });
   await paired;
-  return { ws, seen, msgs, announced, received, pairingStates };
+  return { ws, seen, msgs, announced, received, pairingStates, pings };
 }
 
 // Streamable-HTTP transport with the pairing code as bearer token.

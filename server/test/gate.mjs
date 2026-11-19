@@ -32,6 +32,11 @@ ok("ungated evaluate_js -> refused", r({ kind: "eval" }) === true);
 ok("gated upload / evaluate_js -> allowed", r({ kind: "upload", gated: true }) === false && r({ kind: "eval", gated: true }) === false);
 ok("gated must be exactly true (not a truthy string)", r({ kind: "eval", gated: "yes" }) === true);
 
+// Settings migration: auto-close became the default in settings v2.
+ok("new install: auto-close agent windows is on", C.normalize(undefined).autoCloseWindows === true);
+ok("settings saved before v2: auto-close switched on", C.normalize({ autoCloseWindows: false }).autoCloseWindows === true);
+ok("switched off after v2: stays off", C.normalize({ autoCloseWindows: false, settingsVersion: 2 }).autoCloseWindows === false);
+
 // page.js is one big closure: a second function with an existing name
 // silently replaces the first (this once broke read_elements).
 const pageJs = readFileSync(join(process.cwd(), "..", "extension", "page.js"), "utf-8");

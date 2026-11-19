@@ -45,8 +45,12 @@
     // --- Agent windows ---
     // Close (ungroup first, so Chrome doesn't keep the tab group on the
     // bookmarks bar) an agent's window once its AI client has been gone for
-    // 5 minutes. Off by default: you may want to look at what it left.
-    autoCloseWindows: false,
+    // 5 minutes. On by default since 0.9.1: windows left open — or closed by
+    // hand — are what made "Otter · ..." groups pile up on the bookmarks bar.
+    autoCloseWindows: true,
+
+    // Bumped when a default changes for everyone (see normalize).
+    settingsVersion: 2,
 
     // --- Approvals ---
     // "ask": destructive clicks and evaluate_js prompt for approval in the AI
@@ -100,7 +104,14 @@
 
   // Merge stored (possibly partial / older) settings over DEFAULTS.
   function normalize(stored) {
-    return { ...DEFAULTS, ...(stored || {}) };
+    const s = { ...DEFAULTS, ...(stored || {}) };
+    // v2 (0.9.1): auto-close agent windows became the default. Settings saved
+    // earlier stored `false` only because it was the old default.
+    if (stored && (stored.settingsVersion || 1) < 2) {
+      s.autoCloseWindows = true;
+      s.settingsVersion = 2;
+    }
+    return s;
   }
 
   // ---- Derived motion values (kept here so content/background agree) ----

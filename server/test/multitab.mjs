@@ -58,10 +58,12 @@ async function mkClient() {
 const call = async (c, name, args = {}) => firstText(await c.callTool({ name, arguments: args }));
 
 async function main() {
-  const proc = spawn("node", ["dist/index.js"], { cwd: process.cwd(), stdio: ["ignore", "ignore", "ignore"] });
+  const proc = spawn("node", ["dist/index.js"], {
+    cwd: process.cwd(), env: { ...process.env, OTTERBRIDGE_HEARTBEAT_MS: "300" }, stdio: ["ignore", "ignore", "ignore"],
+  });
   try {
     await sleep(1200);
-    await connectFakeExtension(WS_PORT, { onCommand: handleExt });
+    const ext = await connectFakeExtension(WS_PORT, { onCommand: handleExt });
 
     // Two independent MCP sessions (= two agents).
     const A = await mkClient();
@@ -101,7 +103,19 @@ async function main() {
     await call(A, "close_tab", { tab: a2 });
     ok("close_tab removes a tab", JSON.parse(await call(A, "list_tabs")).length === 1);
 
-    await A.close(); await B.close();
+    // The heartbeat lists live sessions, so the extension can tidy away the
+    // windows of sessions that ended.
+    const agentOf = (n) => ext.msgs.filter((m) => m.action === "open_tab")[n]?.params.agentId;
+    const idA = agentOf(0), idB = ext.msgs.find((m) => m.action === "open_tab" && m.params.agentId !== idA)?.params.agentId;
+    await sleep(500);
+    const last = () => ext.pings[ext.pings.length - 1] || [];
+    ok("heartbeat lists both live sessions", last().includes(idA) && last().includes(idB), JSON.stringify([idA, idB, last()]));
+    await A.transport.terminateSession(); // a client ending its session properly
+    await A.close();
+    await sleep(700);
+    ok("a closed session drops out of the heartbeat", !last().includes(idA) && last().includes(idB), JSON.stringify(last()));
+
+    await B.close();
     console.log(`\n[test] ${pass} passed, ${fail} failed`);
   } finally {
     proc.kill();

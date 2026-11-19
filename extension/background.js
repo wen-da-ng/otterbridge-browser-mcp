@@ -343,7 +343,10 @@ function connectPort(port) {
   const onMessage = async (data) => {
     let msg;
     try { msg = JSON.parse(data); } catch (_) { return; }
-    if (msg.type === "ping") return; // server heartbeat: keeps this worker awake
+    if (msg.type === "ping") { // server heartbeat: keeps this worker awake
+      if (Array.isArray(msg.agents)) noteLiveAgents(msg.agents, sock);
+      return;
+    }
     if (msg.type === "bridges") {
       for (const p of msg.ports || []) {
         const s = sockets.get(p);
@@ -608,16 +611,18 @@ const agentsReady = chrome.storage.local.get(["agents", "agentSeq", "adoptedTabs
   agents = r.agents || {};
   agentSeq = r.agentSeq || 0;
   adoptedTabs = r.adoptedTabs || {};
-  // Window ids don't survive a browser restart (and may be reused), so an
-  // entry only stands if its window still holds a group with its label.
+  // Window ids are unique within a browser session (never reused), so after
+  // an extension reload or a worker restart an entry stands while its window
+  // exists — with or without its group, which comes and goes (see "Groups only
+  // while working"). A browser restart renumbers windows: onStartup below
+  // wipes the registry then, so an old id can't point at a user's window.
   for (const [id, ag] of Object.entries(agents)) {
-    let ok = false;
+    if (!(await windowAlive(ag.windowId))) { delete agents[id]; continue; }
+    ag.groupId = null;
     try {
-      const groups = await chrome.tabGroups.query({ windowId: ag.windowId });
-      const g = groups.find((x) => x.title === ag.label);
-      if (g) { ag.groupId = g.id; ok = true; }
+      const g = (await chrome.tabGroups.query({ windowId: ag.windowId })).find((x) => x.title === ag.label);
+      if (g) ag.groupId = g.id;
     } catch (_) {}
-    if (!ok) delete agents[id];
   }
   for (const id of Object.keys(adoptedTabs)) {
     try { await chrome.tabs.get(Number(id)); } catch (_) { delete adoptedTabs[id]; }
@@ -628,6 +633,14 @@ const agentsReady = chrome.storage.local.get(["agents", "agentSeq", "adoptedTabs
 });
 const saveAgents = () =>
   chrome.storage.local.set({ agents, agentSeq, adoptedTabs }).catch(() => {});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await agentsReady;
+  agents = {};
+  adoptedTabs = {};
+  agentSeq = 0;
+  await saveAgents();
+});
 
 // Serialize window/group work per agent: two concurrent open_tab calls must not
 // each create a window.
@@ -679,9 +692,11 @@ async function groupIntoAgent(ag, tabId) {
       if (ag.groupId != null) {
         await chrome.tabs.group({ groupId: ag.groupId, tabIds: [tabId] });
       } else {
-        ag.groupId = await chrome.tabs.group({
-          tabIds: [tabId], createProperties: { windowId: ag.windowId },
-        });
+        // A fresh group (the agent was idle, or Chrome dropped it) takes every
+        // tab in the agent's window, not just this one.
+        const inWindow = await chrome.tabs.query({ windowId: ag.windowId });
+        const ids = [...new Set([tabId, ...inWindow.map((t) => t.id)])];
+        ag.groupId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId: ag.windowId } });
       }
       await chrome.tabGroups.update(ag.groupId, { title: ag.label, color: ag.color });
       const t = await chrome.tabs.get(tabId);
@@ -753,6 +768,66 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (adoptedTabs[tabId]) { delete adoptedTabs[tabId]; saveAgents(); }
 });
 
+// ===== Groups only while working =====
+// Chrome saves every tab group to the bookmarks bar, and KEEPS the saved copy
+// when a window is closed with its group still there — e.g. with the window's
+// close button. Extensions get no warning before a window closes and can't
+// delete saved groups. So an agent's window is labelled ("Otter · …") only
+// while the agent works: the group dissolves 30 s after its last action, and
+// closing an idle window leaves nothing behind. Its next action regroups it.
+const IDLE_UNGROUP_MS = 30000;
+const idleTimers = new Map(); // agentId -> timeout
+const inflight = new Map();   // agentId -> commands in progress
+
+async function agentWorking(agentId) {
+  const ag = agents[agentId];
+  clearTimeout(idleTimers.get(agentId));
+  idleTimers.delete(agentId);
+  inflight.set(agentId, (inflight.get(agentId) || 0) + 1);
+  if (!ag || !(await windowAlive(ag.windowId))) return;
+  if (ag.groupId != null) {
+    try { await chrome.tabGroups.get(ag.groupId); return; } catch (_) { ag.groupId = null; }
+  }
+  try {
+    const [first] = await chrome.tabs.query({ windowId: ag.windowId });
+    if (first) await withAgentLock(agentId, () => groupIntoAgent(ag, first.id).then(saveAgents));
+  } catch (_) { /* only the label: acting works without it */ }
+}
+
+function agentDone(agentId) {
+  const n = (inflight.get(agentId) || 1) - 1;
+  if (n > 0) inflight.set(agentId, n); else inflight.delete(agentId);
+  agentIdleSoon(agentId);
+}
+
+function agentIdleSoon(agentId) {
+  clearTimeout(idleTimers.get(agentId));
+  idleTimers.set(agentId, setTimeout(() => dissolveAgentGroup(agentId), IDLE_UNGROUP_MS));
+}
+
+async function dissolveAgentGroup(agentId) {
+  idleTimers.delete(agentId);
+  if (inflight.get(agentId)) return agentIdleSoon(agentId); // still working
+  const ag = agents[agentId];
+  if (!ag || ag.groupId == null) return;
+  await withAgentLock(agentId, async () => {
+    try {
+      const tabs = await chrome.tabs.query({ groupId: ag.groupId });
+      if (tabs.length) await chrome.tabs.ungroup(tabs.map((t) => t.id));
+      ag.groupId = null;
+      await saveAgents();
+    } catch (_) {
+      agentIdleSoon(agentId); // e.g. the user is dragging a tab: try again later
+    }
+  });
+}
+
+// Groups still standing when the worker (re)starts belong to agents that
+// aren't acting right now: dissolve them after the usual idle time.
+agentsReady.then(() => {
+  for (const [id, ag] of Object.entries(agents)) if (ag.groupId != null) agentIdleSoon(id);
+});
+
 // Tabs the PAGE opens in an agent window (target=_blank, window.open) join the
 // agent's group too, so nothing in the window is left ungrouped.
 async function adoptIntoAgentGroup(tabId, windowId) {
@@ -760,6 +835,7 @@ async function adoptIntoAgentGroup(tabId, windowId) {
   const entry = Object.entries(agents).find(([, ag]) => ag.windowId === windowId);
   if (!entry) return;
   const [agentId, ag] = entry;
+  if (ag.groupId == null) return; // idle: no group right now (see below)
   await sleep(100); // let Chrome's own opener-grouping settle first
   try {
     const t = await chrome.tabs.get(tabId);
@@ -828,8 +904,30 @@ async function closeAgentWindows() {
   await agentsReady;
   let closed = 0;
   for (const id of Object.keys(agents)) if (await closeAgent(id)) closed++;
+  closed += await closeStrayAgentGroups();
   agentSeq = 0;
   await saveAgents();
+  return closed;
+}
+
+// Agent groups OtterBridge no longer remembers (e.g. after the extension was
+// reinstalled): any open group titled "Otter · ...". Dissolve it so Chrome
+// drops its saved copy, and close its window if nothing else is in it.
+async function closeStrayAgentGroups() {
+  let closed = 0;
+  const groups = await chrome.tabGroups.query({}).catch(() => []);
+  for (const g of groups) {
+    if (!/^Otter · /.test(g.title || "")) continue;
+    try {
+      const inGroup = await chrome.tabs.query({ groupId: g.id });
+      const inWindow = await chrome.tabs.query({ windowId: g.windowId });
+      await chrome.tabs.ungroup(inGroup.map((t) => t.id));
+      if (inWindow.every((t) => t.groupId === g.id)) {
+        await chrome.windows.remove(g.windowId);
+        closed++;
+      }
+    } catch (_) {}
+  }
   return closed;
 }
 
@@ -846,15 +944,45 @@ function noteAgentActive(agentId, sock) {
   chrome.alarms.clear(cleanupAlarm(agentId)).catch(() => {});
 }
 
+function scheduleClose(agentId) {
+  if (S.autoCloseWindows) chrome.alarms.create(cleanupAlarm(agentId), { delayInMinutes: AUTO_CLOSE_MINUTES });
+}
+
 function onBridgeClosed(sock) {
   for (const [agentId, s] of agentSocket) {
     if (s !== sock) continue;
     agentSocket.delete(agentId);
-    if (S.autoCloseWindows) {
-      chrome.alarms.create(cleanupAlarm(agentId), { delayInMinutes: AUTO_CLOSE_MINUTES });
+    scheduleClose(agentId);
+  }
+}
+
+// A server's heartbeat lists its live sessions: those stay; one that was
+// served on this socket but is no longer listed has ended (e.g. an HTTP
+// server outliving its client), so its window is scheduled for clean-up.
+function noteLiveAgents(ids, sock) {
+  const live = new Set(ids);
+  for (const id of live) if (agents[id]) noteAgentActive(id, sock);
+  for (const [agentId, s] of agentSocket) {
+    if (s === sock && !live.has(agentId)) {
+      agentSocket.delete(agentId);
+      scheduleClose(agentId);
     }
   }
 }
+
+// After an extension reload or a Chrome restart nothing is known about which
+// sessions are still alive: schedule every agent window for clean-up; the
+// first heartbeat listing a session (every 20 s) cancels its alarm.
+(async () => {
+  await agentsReady;
+  await settingsReady;
+  for (const id of Object.keys(agents)) {
+    if (!agentSocket.has(id)) {
+      const existing = await chrome.alarms.get(cleanupAlarm(id));
+      if (!existing) scheduleClose(id);
+    }
+  }
+})();
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (!alarm.name.startsWith("close-agent:")) return;
@@ -1381,6 +1509,7 @@ async function handle(action, p) {
   // ----- Multi-tab management (no pre-existing active tab required) -----
   if (action === "open_tab") {
     const { tab: created, ag } = await openAgentTab(p.agentId, p.clientName, p.url, p.reuse, p.sessionNo);
+    agentIdleSoon(p.agentId);
     // Attach CDP immediately (not lazily on first click) so console/network
     // capture covers the page load. Best-effort: chrome:// pages can't attach.
     try { await ensureDebugger(created.id); } catch (_) {}
@@ -1444,6 +1573,17 @@ async function handle(action, p) {
     p = { ...p, scroll: false, readOnly: true };
   }
 
+  // The agent's window carries its group while it works (see above).
+  const working = owned && p.agentId && agents[p.agentId] ? p.agentId : null;
+  if (working) await agentWorking(working);
+  try {
+    return await handleTab(action, p, tab, owned);
+  } finally {
+    if (working) agentDone(working);
+  }
+}
+
+async function handleTab(action, p, tab, owned) {
   // A JS dialog freezes the page: refuse page work until it's answered.
   const openDialog = dialogs.get(tab.id);
   if (openDialog && !DIALOG_OK.has(action)) throw new Error(dialogNote(openDialog, false));

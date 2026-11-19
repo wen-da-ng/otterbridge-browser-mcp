@@ -101,7 +101,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.9.0";
+const SERVER_VERSION = "0.9.1";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -368,12 +368,16 @@ async function sessionNumber(agentId: string): Promise<number | undefined> {
 
 // Heartbeat: a ping every 20 s keeps Chrome from suspending an idle
 // extension (which would make an open profile look closed), and surfaces a
-// dead connection quickly.
+// dead connection quickly. It lists this server's live sessions, so the
+// extension can tidy away the windows of sessions that ended — even ones it
+// lost track of across an extension reload or a Chrome restart.
+const liveAgents = new Set<string>(); // agent ids of open MCP sessions
+const pingFrame = () => JSON.stringify({ type: "ping", agents: [...liveAgents] });
 setInterval(() => {
   for (const ws of extSockets) {
-    if (ws.readyState === WebSocket.OPEN) ws.send('{"type":"ping"}');
+    if (ws.readyState === WebSocket.OPEN) ws.send(pingFrame());
   }
-}, 20000).unref();
+}, Number(process.env.OTTERBRIDGE_HEARTBEAT_MS) || 20000).unref();
 const extSockets = new Set<WebSocket>(); // every extension connection (registry fan-out)
 
 const profileLabel = (pr: Profile) =>
@@ -612,6 +616,7 @@ function refuseOpen(): void {
 // paired: it proved the code — only then may it change the pairing setting.
 function attachExtension(ws: WebSocket, paired = true): void {
   extSockets.add(ws);
+  ws.send(pingFrame()); // the live sessions, right away
   void pairingRequired().then((required) => {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "pairing_state", required }));
   });
@@ -1439,6 +1444,10 @@ function buildServer(stdio = false): McpServer {
   // must find the same window again, not open another. HTTP: many sessions
   // share this process, so each gets a random id.
   const agentId = stdio ? `p${process.ppid}` : randomUUID().slice(0, 8);
+  liveAgents.add(agentId);
+  server.server.onclose = () => {
+    liveAgents.delete(agentId);
+  };
   const clientName = () => {
     const n = server.server.getClientVersion()?.name;
     return n ? (CLIENT_NAMES[n] ?? n) : undefined;
