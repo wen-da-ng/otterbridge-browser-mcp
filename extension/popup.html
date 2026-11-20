@@ -100,6 +100,18 @@
     .speed-head .stack-label { margin: 0; }
     .custom-tag { font-size: 12px; color: var(--accent); font-weight: 550; }
 
+    /* Flows */
+    .rec-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--danger); margin-right: 6px; vertical-align: 1px; }
+    .save-row { display: flex; gap: 6px; margin-top: 8px; }
+    .save-row .btn { flex: 1; }
+    .flow-list { list-style: none; margin: 8px 0 0; padding: 0; }
+    .flow-list:empty { display: none; }
+    .flow-list li { display: flex; align-items: center; gap: 6px; min-height: 24px; font-size: 12px; }
+    .flow-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+    .flow-steps { color: var(--muted); white-space: nowrap; }
+    .flow-del { padding: 2px 5px; border: 0; border-radius: 4px; background: none; color: var(--muted); cursor: pointer; }
+    .flow-del:hover { color: var(--danger); }
+
     /* Footer */
     .actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
     .actions .btn { font-size: 12px; padding: 7px 12px; white-space: nowrap; }
@@ -154,6 +166,30 @@
       <button data-preset="fast" aria-pressed="false">Fast</button>
       <button data-preset="instant" aria-pressed="false">Instant</button>
     </div>
+  </section>
+
+  <section aria-label="Flows">
+    <div class="row" id="recIdle">
+      <span class="row-label" id="flowsLabel"
+            title="Records your clicks, typing, dropdown choices and Enter / Tab / Escape in this tab, so Claude can replay them. Not recorded: scrolling, hovering, drag and drop, file uploads, JavaScript dialogs. Passwords and codes are never kept.">Flows</span>
+      <span id="recStartWrap"><button class="btn" id="recStart">Record this tab</button></span>
+    </div>
+    <div class="row" id="recLive" hidden>
+      <span class="row-label" role="status"><span class="rec-dot"></span><span id="recText">Recording</span></span>
+      <button class="btn" id="recStop">Stop</button>
+    </div>
+    <div id="recSave" hidden>
+      <label class="stack-label" for="recName">Name this flow</label>
+      <input id="recName" class="field" type="text" maxlength="60" spellcheck="false" />
+      <div class="save-row">
+        <button class="btn primary" id="recSaveBtn">Save</button>
+        <button class="btn" id="recDiscard">Discard</button>
+      </div>
+    </div>
+    <div class="sub" id="recWhere" hidden></div>
+    <ul class="flow-list" id="flowList" aria-label="Saved flows"></ul>
+    <div class="sub" id="flowMore" hidden></div>
+    <div class="sub" id="flowHint" hidden>Ask Claude to run a flow by name.</div>
   </section>
 
   <section aria-label="Behaviour">

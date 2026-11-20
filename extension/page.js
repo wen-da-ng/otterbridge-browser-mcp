@@ -16,7 +16,7 @@
 //
 // Re-injection is cheap: a frame that already has this version returns early.
 (() => {
-  const VERSION = 8;
+  const VERSION = 9;
   if (window.__otter && window.__otter.v === VERSION) return;
 
   // What counts as interactive without looking at styles. ARIA menu/option
@@ -253,6 +253,139 @@
       cands = hits;
     }
     return { matches: cands };
+  }
+
+  // ---- durable targets for the flow recorder (recorder.js) ----
+  // A target that resolves back to the element through match() above, the
+  // way run_script will look for it. Never built from what was typed: a text
+  // field's label comes from its <label>, aria-label, placeholder or name —
+  // labelOf() would return its value.
+  const NON_TEXT_INPUT = /^(checkbox|radio|submit|button|reset|image|file|range|color|hidden)$/i;
+  function isTextField(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.tagName === "TEXTAREA") return true;
+    if (el.tagName === "INPUT") return !NON_TEXT_INPUT.test(el.type || "text");
+    return !!el.isContentEditable;
+  }
+
+  function fieldLabel(el) {
+    const tidy = (s) => String(s || "").trim().replace(/\s+/g, " ");
+    let t = tidy(el.getAttribute("aria-label"));
+    const ids = el.getAttribute("aria-labelledby");
+    if (!t && ids) {
+      const root = el.getRootNode && el.getRootNode().getElementById ? el.getRootNode() : document;
+      t = tidy(ids.split(/\s+/).map((id) => {
+        const n = root.getElementById(id);
+        return n ? n.textContent : "";
+      }).join(" "));
+    }
+    if (!t && el.labels && el.labels.length) {
+      // The label's own words — not the control inside it (a <select> in a
+      // <label> would otherwise add every option).
+      const lab = el.labels[0];
+      const tw = document.createTreeWalker(lab, NodeFilter.SHOW_TEXT);
+      let s = "", n;
+      while ((n = tw.nextNode())) {
+        const p = n.parentElement;
+        if (el.contains(n) || (p && p.closest("select, textarea, option"))) continue;
+        s += n.textContent + " ";
+      }
+      t = tidy(s);
+    }
+    if (!t) t = tidy(el.placeholder) || tidy(el.title) || tidy(el.getAttribute("name")) || tidy(el.id);
+    return t.slice(0, 80);
+  }
+
+  const UNSTABLE_ID = /^(:r|ember|react-|mui-|radix-)/i;
+  const stableId = (id) => !!id && id.length <= 40 && !/\d{4,}/.test(id) && !UNSTABLE_ID.test(id);
+  const attrValue = (v) => `"${String(v).replace(/["\\]/g, "\\$&").replace(/\n/g, "\\a ")}"`;
+
+  // tag:nth-of-type path up to the nearest ancestor with a stable id; with
+  // maxLevels, at most that many steps (then unanchored).
+  function cssPath(el, maxLevels) {
+    const parts = [];
+    let n = el;
+    for (let lvl = 0; n && n.nodeType === 1 && (maxLevels == null || lvl < maxLevels); lvl++) {
+      if (lvl > 0 && stableId(n.id)) {
+        parts.unshift(`#${CSS.escape(n.id)}`);
+        break;
+      }
+      const tag = n.tagName.toLowerCase();
+      const up = n.parentNode;
+      const sibs = up && up.children ? [...up.children].filter((c) => c.tagName === n.tagName) : [];
+      parts.unshift(sibs.length > 1 ? `${tag}:nth-of-type(${sibs.indexOf(n) + 1})` : tag);
+      if (!n.parentElement) break; // <html>, or the top of a shadow root
+      n = n.parentElement;
+    }
+    return parts.join(" > ");
+  }
+
+  // { el, target } for an event's target, or null when it isn't inside
+  // anything interactive (a click on plain text).
+  function durable(raw) {
+    const els = (collect(), window.__otterEls || []);
+    let el = null;
+    for (let n = raw; n; n = parentAcross(n)) {
+      if (els.indexOf(n) !== -1) { el = n; break; }
+    }
+    if (!el) return null;
+    const i = els.indexOf(el);
+    const tag = el.tagName.toLowerCase();
+    const typed = isTextField(el) || el.tagName === "SELECT";
+    const choice = el.tagName === "INPUT" && /^(checkbox|radio)$/i.test(el.type || "");
+    const label = (typed ? fieldLabel(el) : choice ? fieldLabel(el) || labelOf(el) : labelOf(el))
+      .trim().replace(/\s+/g, " ").slice(0, 80);
+
+    const cands = [];
+    for (const a of ["data-testid", "data-test", "data-qa", "data-cy"]) {
+      const v = el.getAttribute(a);
+      if (v) cands.push({ selector: `[${a}=${attrValue(v)}]` });
+    }
+    if (stableId(el.id)) cands.push({ selector: `#${CSS.escape(el.id)}` });
+    const name = el.getAttribute("name");
+    if (name && /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(el.tagName)) {
+      cands.push({ selector: `${tag}[name=${attrValue(name)}]` });
+    }
+    const aria = el.getAttribute("aria-label");
+    if (aria) cands.push({ selector: `[aria-label=${attrValue(aria)}]` });
+    // Visible text only where it isn't a typed value (and stays the same
+    // while the user types, so a click and its fill name the same target).
+    if (!typed) {
+      const t = labelOf(el).trim().slice(0, 80);
+      if (t) cands.push({ text: t, tag });
+    }
+    cands.push({ selector: cssPath(el, 5) });
+    cands.push({ selector: cssPath(el) }); // full path: always finds it
+
+    const hits = cands.map((c) => {
+      const r = match(c.selector || null, c.text == null ? null : c.text, c.tag || null);
+      return r && Array.isArray(r.matches) ? [...r.matches].sort((a, b) => a - b) : [];
+    });
+    let pick = cands.findIndex((c, k) => hits[k].length === 1 && hits[k][0] === i);
+    let nth = 0;
+    if (pick === -1) {
+      pick = cands.findIndex((c, k) => hits[k].includes(i));
+      if (pick === -1) return null;
+      nth = hits[pick].indexOf(i);
+    }
+    const target = { ...cands[pick], label };
+    if (nth) target.nth = nth;
+    return { el, target };
+  }
+
+  function durableTarget(raw) {
+    const d = durable(raw);
+    return d ? d.target : null;
+  }
+
+  // run_flow, for a step that needed a password: did the browser (or the
+  // user) fill it in? Never says what's in it.
+  function fieldFilled(i) {
+    const el = elAt(i);
+    if (!el) return { gone: true };
+    if (el.tagName === "SELECT") return { filled: el.selectedIndex > 0 };
+    const v = valueOf(el);
+    return { filled: typeof v === "string" && v.length > 0 };
   }
 
   // ---- text ----
@@ -740,5 +873,6 @@
     snapshot, watchMutations, mutationCount,
     broadcast, frameInfo,
     perfCollect, perfRecStart, perfRecStop,
+    durable, durableTarget, isTextField, fieldFilled,
   };
 })();

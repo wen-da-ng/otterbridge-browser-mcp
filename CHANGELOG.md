@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.10.0 — 2026-11-21
+
+### Added
+
+- **Flow recorder: do a task once yourself, let the AI repeat it.** In the
+  Otter popup, **Record this tab** records what you do in your own tab —
+  clicks, typed text, dropdown choices, ticked boxes, Enter / Tab / Escape, and
+  navigations you make yourself — with a red **REC** on the toolbar icon while
+  it runs. **Stop**, name it and **Save**: it's a *flow*, listed in the popup.
+  Every value you typed becomes a variable whose default is what you typed.
+- **`run_flow(name, vars?, from_step?)`** replays a saved flow in the AI's own
+  window (never your tab), in one call, through the same engine and approval
+  gate as `run_script` — a "Submit order" click still asks you. `vars` replace
+  the recorded values; a variable with no value fails before anything runs.
+- **`record_flow(action)`** lets the AI start a recording of your current tab
+  (after you approve it), check its progress, and save or discard it.
+- **`flows(action)`** lists, reads, saves and deletes saved flows — e.g. to fix
+  a step that stopped matching the page. Replacing or deleting a flow asks you.
+- `run_script` steps accept two optional fields used by recorded flows:
+  `target.label` (a description, ignored when finding the element) and
+  `sensitive: true` on a `fill` (see below).
+
+### Fixed
+
+- **`get_user_tab` could pick the wrong window.** The extension remembered
+  the window you last used only while its background worker was awake; after
+  Chrome suspended it, and while you were typing in the AI app (no Chrome
+  window focused), it fell back to whichever window Chrome listed first. It
+  now keeps that window across suspensions, and otherwise picks your window
+  with the most recently used tab. `record_flow` relies on the same lookup.
+
+### Security & privacy
+
+- **Passwords and codes are never recorded.** A password field, a one-time
+  code or a card field (by type, `autocomplete`, or a name / id / label such as
+  *password*, *otp*, *cvv*, *card number*) is recorded as a "sensitive" step
+  with no value — the value never leaves the page. On replay the flow carries
+  on if Chrome's password manager filled the field, and otherwise stops there
+  and asks you to type it in the Otter window (the AI then resumes with
+  `from_step`). The AI is never given, and never asks for, the value.
+- Recorded values stay out of the audit log: a saved flow is logged by name and
+  step count only, a replay by flow name and variable names.
+- A recording only ever covers one of your own tabs on a website, and starts
+  only from the popup or after you approve the AI's request.
+
+### Limitations
+
+- Not recorded: scrolling (replay scrolls to each target by itself), hovering,
+  drag and drop, file uploads, and JavaScript dialogs.
+- Inside an **iframe**, an element that isn't unique is remembered by its
+  position among matches in that frame, but replay counts matches across all
+  frames, so it can pick the wrong frame's element. Unique targets (tried
+  first) aren't affected.
+- The values you typed (except passwords and codes) are stored with the flow in
+  the browser profile, as its variable defaults. Delete a flow to remove them.
+- A navigation more than 1.5 s after the click or Enter that caused it (a slow
+  server) can be recorded as an extra "navigate" step; remove it with `flows`
+  if a replay trips over it.
+
 ## 0.9.3 — 2026-11-21
 
 ### Security

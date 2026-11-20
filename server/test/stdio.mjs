@@ -40,7 +40,7 @@ async function main() {
   }); // `announced`: ports the registry told us about
 
   const tools = (await client.listTools()).tools;
-  ok("stdio: tools/list returns 41 tools", tools.length === 41, `got ${tools.length}`);
+  ok("stdio: tools/list returns 44 tools", tools.length === 44, `got ${tools.length}`);
   const rp = await client.callTool({ name: "read_page", arguments: {} });
   ok("stdio: read_page round-trips through bridge", rp.content[0].text.includes("ok.test"));
 

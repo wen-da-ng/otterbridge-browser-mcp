@@ -90,6 +90,11 @@ function redact(params?: Record<string, unknown>): Record<string, unknown> {
   for (const k of ["text", "code"]) {
     if (typeof out[k] === "string") out[k] = `[${(out[k] as string).length} chars]`;
   }
+  // A saved flow carries what was typed while recording (its vars).
+  if (out.flow && typeof out.flow === "object") {
+    const f = out.flow as { name?: unknown; steps?: unknown };
+    out.flow = `[flow "${String(f.name ?? "")}": ${Array.isArray(f.steps) ? f.steps.length : 0} steps]`;
+  }
   return out;
 }
 
@@ -112,7 +117,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.9.3";
+const SERVER_VERSION = "0.10.0";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -1223,7 +1228,9 @@ function buildServer(stdio = false): McpServer {
         "just to check. Call wait_for after anything that loads content. If a " +
         "result mentions a JavaScript dialog, answer it with handle_dialog. " +
         "To repeat a flow already done once, replay it in one " +
-        "call with run_script. Debug web apps with read_console, read_network, " +
+        "call with run_script. To repeat something the user does by hand, " +
+        "record it with record_flow (or the user can record in the Otter " +
+        "popup) and replay it with run_flow. Debug web apps with read_console, read_network, " +
         "get_network_body and evaluate_js; measure them with perf_audit (page " +
         "load), perf_record (an interaction), css_coverage and throttle.\n\n" +
         "Clicks on controls like buy, pay, delete, send or submit, and " +
@@ -1283,6 +1290,9 @@ function buildServer(stdio = false): McpServer {
     perf_audit: { title: "Performance audit", world: true },
     perf_record: { title: "Record interaction performance" },
     css_coverage: { title: "CSS coverage" },
+    record_flow: { title: "Record a browser flow" },
+    flows: { title: "Saved browser flows" },
+    run_flow: { title: "Run a saved flow", destructive: true, world: true },
   };
   // ----- Pairing prompt -----
   // An unpaired extension is waiting: show the human the code in an approval
@@ -2270,6 +2280,7 @@ function buildServer(stdio = false): McpServer {
     text: z.string().optional().describe("Visible text / label / placeholder / aria-label. Exact match wins over prefix over substring."),
     tag: z.string().optional().describe("Restrict to a tag, e.g. 'button', 'input', 'a'."),
     nth: z.number().int().min(0).optional().describe("Which match to use when several remain (default 0)."),
+    label: z.string().optional().describe("Human-readable description of the element (recorded flows); ignored when resolving."),
   });
   const Step = z.object({
     action: z.enum(["navigate", "click", "fill", "select", "type_text", "press_key", "scroll", "wait_for", "drag", "dialog"]),
@@ -2293,7 +2304,290 @@ function buildServer(stdio = false): McpServer {
     timeout_ms: z.number().int().min(100).max(60000).optional().describe("wait_for: max wait (default 10000). click/fill/select: how long to wait for the target element to appear (default 8000)."),
     pause_ms: z.number().int().min(0).max(30000).optional().describe("Fixed pause AFTER this step (animations, debounced saves)."),
     optional: z.boolean().optional().describe("Continue with the next step even if this one fails."),
+    sensitive: z
+      .boolean()
+      .optional()
+      .describe(
+        "fill / select (recorded flows): a password or code the recording didn't keep — no 'text'. " +
+          "Replay only checks the browser filled it in (e.g. its password manager) and stops otherwise.",
+      ),
   });
+  type StepIn = z.infer<typeof Step>;
+
+  // The replay engine behind run_script and run_flow. fromStep is literal:
+  // the steps before it are skipped, the opening navigate included — it
+  // resumes in the page where a replay stopped.
+  type RunOpts = {
+    fast?: boolean;
+    background?: boolean;
+    tab?: number;
+    fromStep?: number;
+    audit?: { action: string; params: Record<string, unknown> };
+  };
+  const runSteps = async (steps: StepIn[], vars: Record<string, string> | undefined, opts: RunOpts = {}) => {
+    const { fast, background, tab } = opts;
+    const from = opts.fromStep ?? 0;
+    if (from >= steps.length) {
+      return { ok: false, error: `from_step ${from} is past the last step (${steps.length - 1}).` };
+    }
+    const v = vars ?? {};
+    const speed = fast !== false;
+    const bg = background === true;
+    const missing = new Set<string>();
+    const sub = (s: string | undefined): string | undefined =>
+      s == null
+        ? undefined
+        : s.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (m, name: string) => {
+            if (v[name] === undefined) {
+              missing.add(name);
+              return m;
+            }
+            return v[name];
+          });
+    // Only the steps that will run need their placeholders filled.
+    const resolved = steps.map((st, i) => i < from ? st : ({
+      ...st,
+      url: sub(st.url),
+      text: sub(st.text),
+      key: sub(st.key),
+      value: sub(st.value),
+      label: sub(st.label),
+      selector: sub(st.selector),
+      target: st.target
+        ? { ...st.target, selector: sub(st.target.selector), text: sub(st.target.text) }
+        : undefined,
+    }));
+    if (missing.size) {
+      return {
+        ok: false,
+        error: `Unresolved placeholders: ${[...missing].join(", ")}. Pass values for them in 'vars'.`,
+      };
+    }
+
+    // Get the session tab before the loop: each step catches its own errors,
+    // which would swallow "not paired yet" instead of prompting for pairing.
+    if (tab == null) {
+      try {
+        await ensureTab();
+      } catch (e) {
+        if (e instanceof PairingNeededError) throw e; // anything else: the first step reports it
+      }
+    }
+    await audit(
+      opts.audit?.action ?? "run_script",
+      opts.audit?.params ?? {
+        steps: resolved.length,
+        vars: Object.keys(v),
+        fast: speed,
+        background: bg,
+      },
+    );
+    // Every dispatched command carries the background flag so the extension
+    // never activates the tab mid-script.
+    const ap = (action: string, params: Record<string, unknown>, timeoutMs?: number) =>
+      act(action, tab, { ...params, background: bg, noReport: true }, timeoutMs);
+
+    // Implicit wait on element resolution (Selenium's implicit-wait
+    // semantics). Single-page apps routinely satisfy a wait_for on a
+    // heading one frame before the controls below it mount, so a target
+    // that resolves on the very first try is the exception, not the rule.
+    // Poll until the element appears rather than failing on a race.
+    const resolveTarget = async (
+      t: { selector?: string; text?: string; tag?: string; nth?: number },
+      timeoutMs: number,
+    ): Promise<any> => {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const el = await ap(
+          "resolve_element",
+          { selector: t.selector, text: t.text, tag: t.tag, nth: t.nth },
+        );
+        if (el && el.found) return el;
+        if (Date.now() >= deadline) return el;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    };
+    type StepResult = {
+      step: number;
+      action: string;
+      ok: boolean;
+      ms: number;
+      result?: unknown;
+      error?: string;
+    };
+    const results: StepResult[] = [];
+    const t0 = Date.now();
+    let failed: number | null = null;
+
+    for (let i = from; i < resolved.length; i++) {
+      const st = resolved[i];
+      const s0 = Date.now();
+      try {
+        let out: unknown;
+        switch (st.action) {
+          case "navigate": {
+            if (!st.url) throw new Error("navigate needs 'url'.");
+            out = await ap("navigate", { url: st.url });
+            break;
+          }
+          case "wait_for": {
+            if (st.text == null && st.selector == null && st.url == null) {
+              throw new Error("wait_for needs 'text', 'selector' and/or 'url'.");
+            }
+            const r = await ap(
+              "wait_for",
+              { text: st.text, selector: st.selector, url: st.url, timeoutMs: st.timeout_ms },
+              (st.timeout_ms ?? 10000) + 15000,
+            );
+            if (!r.found) throw new Error(`wait_for timed out after ${r.elapsed_ms}ms.`);
+            out = `found after ${r.elapsed_ms}ms`;
+            break;
+          }
+          case "drag": {
+            if (st.from_x == null || st.from_y == null || st.to_x == null || st.to_y == null) {
+              throw new Error("drag needs from_x, from_y, to_x, to_y.");
+            }
+            out = await ap(
+              "drag",
+              { fromX: st.from_x, fromY: st.from_y, toX: st.to_x, toY: st.to_y, fast: speed },
+            );
+            break;
+          }
+          case "click":
+          case "fill":
+          case "select": {
+            if (st.action === "click" && !st.target && st.x != null && st.y != null) {
+              // Coordinate click for elements with no durable descriptor
+              // (icon-only buttons). Same gate as interactive click: hit-test
+              // the live element so the danger check still applies.
+              let targetText = "";
+              try {
+                const hit = await ap("hit_test", { x: st.x, y: st.y });
+                targetText = (hit?.text as string) ?? "";
+              } catch (_) { /* proceed ungated-texted; gatedClick re-checks */ }
+              const r = await gatedClick(tab, { x: st.x, y: st.y }, targetText, {
+                fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
+              });
+              if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
+              out = r;
+              break;
+            }
+            if (!st.target || (st.target.selector == null && st.target.text == null)) {
+              throw new Error(`${st.action} needs a 'target' with selector and/or text (or x/y for click).`);
+            }
+            const el = await resolveTarget(st.target, st.timeout_ms ?? 8000);
+            if (!el || !el.found) {
+              throw new Error(
+                `No element matches target ${JSON.stringify(st.target)} ` +
+                  `after waiting ${st.timeout_ms ?? 8000}ms.`,
+              );
+            }
+            if (st.sensitive && st.action !== "click") {
+              // A password or code the recording didn't keep: never asked
+              // for here (not through the model, not by elicitation —
+              // MCP forbids eliciting secrets). Fine if the browser filled it.
+              const f = await ap("field_filled", { index: el.index });
+              if (!f || f.filled !== true) {
+                throw new Error(
+                  "This step needs a password or code the recording didn't keep. Ask the user to type " +
+                    `it in the Otter window, then call run_flow again with from_step = ${i + 1}.`,
+                );
+              }
+              out = "already filled";
+            } else if (st.action === "click") {
+              const r = await gatedClick(tab, { index: el.index }, el.text ?? "", {
+                fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
+              });
+              if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
+              out = r;
+            } else if (st.action === "fill") {
+              if (st.text == null) throw new Error("fill needs 'text'.");
+              const g = HAS_NEWLINE.test(st.text) ? await enterGate(tab, el.index) : {};
+              if (typeof g === "string") throw new Error(g);
+              out = await ap(
+                "fill_element",
+                { index: el.index, text: st.text, fast: speed, ...g },
+              );
+            } else {
+              if (st.value == null && st.label == null) {
+                throw new Error("select needs 'value' or 'label'.");
+              }
+              out = await ap(
+                "select_option",
+                { index: el.index, value: st.value, label: st.label },
+              );
+            }
+            break;
+          }
+          case "type_text": {
+            if (st.text == null) throw new Error("type_text needs 'text'.");
+            const g = HAS_NEWLINE.test(st.text) ? await enterGate(tab) : {};
+            if (typeof g === "string") throw new Error(g);
+            out = await ap("type_text", { text: st.text, fast: speed, ...g });
+            break;
+          }
+          case "press_key": {
+            if (!st.key) throw new Error("press_key needs 'key'.");
+            const g = isEnterCombo(st.key) ? await enterGate(tab) : {};
+            if (typeof g === "string") throw new Error(g);
+            out = await ap("press_key", { key: st.key, ...g });
+            break;
+          }
+          case "scroll": {
+            out = await ap("scroll", { deltaY: st.delta_y });
+            break;
+          }
+          case "dialog": {
+            if (st.accept == null) throw new Error("dialog needs 'accept' (true = OK, false = Cancel).");
+            out = await answerDialog(tab, st.accept, st.text);
+            if (/^(Action denied|No JavaScript dialog)/.test(out as string)) throw new Error(out as string);
+            break;
+          }
+        }
+        if (st.pause_ms) await new Promise((r) => setTimeout(r, st.pause_ms));
+        results.push({ step: i, action: st.action, ok: true, ms: Date.now() - s0, result: out });
+      } catch (e) {
+        results.push({
+          step: i,
+          action: st.action,
+          ok: false,
+          ms: Date.now() - s0,
+          error: (e as Error).message,
+        });
+        if (!st.optional) {
+          failed = i;
+          break;
+        }
+      }
+    }
+
+    return {
+      ok: failed == null,
+      steps_run: results.length,
+      total_steps: resolved.length,
+      ...(from ? { from_step: from } : {}),
+      elapsed_ms: Date.now() - t0,
+      ...(failed != null
+        ? {
+            failed_step: failed,
+            hint:
+              "Script stopped at the failed step. Take over with the interactive tools " +
+              "(screenshot / read_elements) from the current page state, finish the task, " +
+              "then update the saved script so the next replay succeeds.",
+          }
+        : {}),
+      results,
+    };
+  };
+
+  const FAST = z.boolean().optional().describe("Skip cursor animation and typing delays (default true).");
+  const BACKGROUND = z
+    .boolean()
+    .optional()
+    .describe(
+      "Run silently: never bring the target tab to the front, so the user " +
+        "can keep working in other tabs, windows, or apps (default false).",
+    );
 
   tool(
     "run_script",
@@ -2319,256 +2613,255 @@ function buildServer(stdio = false): McpServer {
           .record(z.string(), z.string())
           .optional()
           .describe("Values substituted into {{placeholders}} in url / text / value / label / key / selector fields."),
-        fast: z
-          .boolean()
-          .optional()
-          .describe("Skip cursor animation and typing delays (default true)."),
-        background: z
-          .boolean()
-          .optional()
-          .describe(
-            "Run silently: never bring the target tab to the front, so the user " +
-              "can keep working in other tabs, windows, or apps (default false).",
-          ),
+        fast: FAST,
+        background: BACKGROUND,
         ...TAB,
       },
     },
-    async ({ steps, vars, fast, background, tab }) => {
-      const v = vars ?? {};
-      const speed = fast !== false;
-      const bg = background === true;
-      const missing = new Set<string>();
-      const sub = (s: string | undefined): string | undefined =>
-        s == null
-          ? undefined
-          : s.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (m, name: string) => {
-              if (v[name] === undefined) {
-                missing.add(name);
-                return m;
-              }
-              return v[name];
-            });
-      const resolved = steps.map((st) => ({
-        ...st,
-        url: sub(st.url),
-        text: sub(st.text),
-        key: sub(st.key),
-        value: sub(st.value),
-        label: sub(st.label),
-        selector: sub(st.selector),
-        target: st.target
-          ? { ...st.target, selector: sub(st.target.selector), text: sub(st.target.text) }
-          : undefined,
-      }));
-      if (missing.size) {
+    async ({ steps, vars, fast, background, tab }) =>
+      text(JSON.stringify(await runSteps(steps, vars, { fast, background, tab }))),
+  );
+
+  // ===== Flow recorder: record what the user does, replay it by name =====
+  // The recording and the saved flows live in the extension (per browser
+  // profile, surviving server restarts); these tools reach them through the
+  // session's profile. Recorded typed values are a flow's variable defaults:
+  // they reach the model only through flows(get), never the audit log.
+  tool(
+    "record_flow",
+    {
+      description:
+        "Record something the USER does by hand in their own Chrome tab, to save it as a flow " +
+        "you can replay with run_flow. action='start' records the tab the user is looking at " +
+        "(the user is asked first); they then do the task there. 'status' shows how many steps " +
+        "were recorded; 'stop' saves it under 'name' and returns its steps; 'discard' throws it " +
+        "away. Every typed value becomes a variable of the flow (the recorded value is its " +
+        "default; pass new values to run_flow). Passwords and codes are never recorded. Not " +
+        "recorded: scrolling, hovering, drag and drop, file uploads, JavaScript dialogs. The " +
+        "user can also record and save flows in the Otter popup.",
+      inputSchema: {
+        action: z.enum(["start", "status", "stop", "discard"]),
+        name: z
+          .string()
+          .min(1)
+          .max(60)
+          .optional()
+          .describe("stop: the flow's name (default: the page title and today's date). An existing name gets a ' (2)'."),
+      },
+    },
+    async ({ action, name }) => {
+      const pid = await profileFor();
+      if (action === "start") {
+        const st = await cmd("rec_status", {}, undefined, pid);
+        if (st?.recording) {
+          return text(
+            `Already recording (on ${st.host}, ${st.steps} steps so far). Call record_flow with ` +
+              `action='stop' or 'discard' first.`,
+          );
+        }
+        if (st?.stopped) {
+          return text(
+            `A finished recording (from ${st.host}) is waiting to be saved or discarded: call ` +
+              `record_flow with action='stop' (and a name) or 'discard'.`,
+          );
+        }
+        const ut = await cmd("user_tab", { agentId }, undefined, pid);
+        const url = String(ut?.url ?? "");
+        if (!/^https?:/i.test(url)) {
+          return text(
+            "Record in one of your own tabs on a website: the user's current tab isn't a web page. " +
+              "Ask them to open the site they want to record first.",
+          );
+        }
+        const host = hostOfUrl(url);
+        const title = String(ut.title || host).slice(0, 80);
+        if (
+          !(await approved(
+            server,
+            pid,
+            `Record what you do in "${title}" (${host}) as a reusable flow? Typed text is saved with it (never passwords).`,
+          ))
+        ) {
+          return text("Action denied by user: recording a flow.");
+        }
+        await cmd("rec_start", { tabId: ut.tabId }, undefined, pid);
+        return text(
+          `Recording "${title}" (${host}). Ask the user to do the task in that tab, then call ` +
+            `record_flow with action='stop' and a name — or they can stop and save it in the Otter popup.`,
+        );
+      }
+      if (action === "status") {
+        const st = await cmd("rec_status", {}, undefined, pid);
+        return text(
+          JSON.stringify(
+            st?.recording || st?.stopped
+              ? { recording: !!st.recording, ...(st.stopped ? { stopped: true } : {}), host: st.host, steps: st.steps }
+              : { recording: false },
+          ),
+        );
+      }
+      if (action === "discard") {
+        const r = await cmd("rec_discard", {}, undefined, pid);
+        return text(r?.discarded ? "Discarded the recording." : "Nothing was being recorded.");
+      }
+      // stop: save it. Typed values stay in the flow (its vars) — not echoed here.
+      const { flow, warnings } = await cmd("rec_stop", { name }, undefined, pid);
+      const steps = (flow.steps ?? []) as StepIn[];
+      return text(
+        JSON.stringify({
+          name: flow.name,
+          steps: steps.length,
+          vars: Object.keys(flow.vars ?? {}),
+          sensitive_steps: steps.filter((s) => s.sensitive).length,
+          ...(warnings?.length ? { warnings } : {}),
+          note:
+            `Saved. Replay it with run_flow(name="${flow.name}", vars={...}); the recorded values are ` +
+            `the defaults (flows get shows them).`,
+          recorded_steps: steps,
+        }),
+      );
+    },
+  );
+
+  // A flow as the model saves it: run_script steps + variable defaults.
+  const FlowIn = z.object({
+    name: z.string().min(1).max(60).optional(),
+    steps: z.array(Step).min(1).max(300),
+    vars: z.record(z.string(), z.string().nullable()).optional(),
+    startUrl: z.string().optional(),
+    createdAt: z.string().optional(),
+    v: z.number().optional(),
+  });
+
+  tool(
+    "flows",
+    {
+      description:
+        "The user's saved browser flows (recorded with record_flow or in the Otter popup), " +
+        "stored in the session's browser profile. action='list' names them (with step counts " +
+        "and variable names); 'get' returns one in full, including the recorded values of its " +
+        "variables; 'save' stores a flow — e.g. after a replay failed: get it, fix the steps, " +
+        "save it back (replacing an existing flow asks the user); 'delete' removes one (asks " +
+        "the user). Replay one with run_flow.",
+      inputSchema: {
+        action: z.enum(["list", "get", "save", "delete"]),
+        name: z.string().min(1).max(60).optional().describe("get / delete: the flow's name. save: overrides flow.name."),
+        flow: FlowIn.optional().describe(
+          "save: { name, steps (run_script steps), vars: { variable: default value or null } }.",
+        ),
+      },
+    },
+    async ({ action, name, flow }) => {
+      const pid = await profileFor();
+      if (action === "list") {
+        const list = await cmd("flows_list", {}, undefined, pid);
+        return text(
+          Array.isArray(list) && list.length
+            ? JSON.stringify(list)
+            : "No saved flows in this browser profile yet. Record one with record_flow, or the user can in the Otter popup.",
+        );
+      }
+      if (action === "get") {
+        if (!name) return text("Provide 'name' (see flows with action='list').");
+        return text(JSON.stringify(await cmd("flows_get", { name }, undefined, pid)));
+      }
+      if (action === "save") {
+        if (!flow) return text("Provide 'flow' to save: { name, steps, vars }.");
+        const n = String(name ?? flow.name ?? "").trim();
+        if (!n || n.length > 60) return text("Give the flow a name of 1-60 characters (flow.name or 'name').");
+        const toSave = { ...flow, name: n };
+        let r = await cmd("flows_save", { flow: toSave }, undefined, pid);
+        if (r?.exists) {
+          if (!(await approved(server, pid, `Replace the saved flow "${n}"?`))) {
+            return text(`Action denied by user: replacing the saved flow "${n}".`);
+          }
+          r = await cmd("flows_save", { flow: toSave, replace: true }, undefined, pid);
+        }
+        return text(
+          `${r?.replaced ? "Replaced" : "Saved"} the flow "${n}" (${toSave.steps.length} steps). Run it with run_flow.`,
+        );
+      }
+      // delete
+      if (!name) return text("Provide 'name' (see flows with action='list').");
+      const list = (await cmd("flows_list", {}, undefined, pid)) as { name: string }[];
+      if (!list.some((f) => f.name === name)) {
+        throw new Error(`No saved flow named "${name}". Call flows(action='list') to see them.`);
+      }
+      if (!(await approved(server, pid, `Delete the saved flow "${name}"?`))) {
+        return text(`Action denied by user: deleting the saved flow "${name}".`);
+      }
+      await cmd("flows_delete", { name }, undefined, pid);
+      return text(`Deleted the saved flow "${name}".`);
+    },
+  );
+
+  tool(
+    "run_flow",
+    {
+      description:
+        "Replay a saved flow (see flows) in ONE call, in this session's own Chrome tab — never " +
+        "the user's tab. 'vars' override the values recorded with it; a {{placeholder}} left " +
+        "without a value fails before anything runs. Works like run_script: stops at the first " +
+        "failed step with per-step results, and destructive clicks (buy, pay, send, delete, " +
+        "submit, ...) still ask the user. A step needing a password or code the recording didn't " +
+        "keep stops the replay unless the browser filled it in: ask the user to type it in the " +
+        "Otter window, then call run_flow again with from_step.",
+      inputSchema: {
+        name: z.string().min(1).max(60).describe("The flow's name (flows with action='list')."),
+        vars: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe("Values for the flow's variables; the ones left out use the recorded values."),
+        from_step: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Resume at this step (0-based), skipping every step before it — the opening navigate " +
+              "included — in the page as it is now.",
+          ),
+        fast: FAST,
+        background: BACKGROUND,
+        ...TAB,
+      },
+    },
+    async ({ name, vars, from_step, fast, background, tab }) => {
+      const flow = await cmd("flows_get", { name });
+      const parsed = z.array(Step).min(1).safeParse(flow?.steps);
+      if (!parsed.success) {
         return text(
           JSON.stringify({
             ok: false,
-            error: `Unresolved placeholders: ${[...missing].join(", ")}. Pass values for them in 'vars'.`,
+            error:
+              `The saved flow "${name}" has invalid steps (${parsed.error.issues[0]?.message ?? "bad shape"}). ` +
+              `Fix it with flows get / save.`,
           }),
         );
       }
-
-      // Get the session tab before the loop: each step catches its own errors,
-      // which would swallow "not paired yet" instead of prompting for pairing.
-      if (tab == null) {
-        try {
-          await ensureTab();
-        } catch (e) {
-          if (e instanceof PairingNeededError) throw e; // anything else: the first step reports it
-        }
+      const defaults: Record<string, string> = {};
+      for (const [k, val] of Object.entries((flow.vars ?? {}) as Record<string, unknown>)) {
+        if (typeof val === "string") defaults[k] = val;
       }
-      await audit("run_script", {
-        steps: resolved.length,
-        vars: Object.keys(v),
-        fast: speed,
-        background: bg,
+      const merged = { ...defaults, ...(vars ?? {}) };
+      const res = await runSteps(parsed.data, merged, {
+        fast,
+        background,
+        tab,
+        fromStep: from_step,
+        audit: {
+          action: "run_flow",
+          params: {
+            name,
+            steps: parsed.data.length,
+            vars: Object.keys(merged),
+            from_step: from_step ?? 0,
+            fast: fast !== false,
+            background: background === true,
+          },
+        },
       });
-      // Every dispatched command carries the background flag so the extension
-      // never activates the tab mid-script.
-      const ap = (action: string, params: Record<string, unknown>, timeoutMs?: number) =>
-        act(action, tab, { ...params, background: bg, noReport: true }, timeoutMs);
-
-      // Implicit wait on element resolution (Selenium's implicit-wait
-      // semantics). Single-page apps routinely satisfy a wait_for on a
-      // heading one frame before the controls below it mount, so a target
-      // that resolves on the very first try is the exception, not the rule.
-      // Poll until the element appears rather than failing on a race.
-      const resolveTarget = async (
-        t: { selector?: string; text?: string; tag?: string; nth?: number },
-        timeoutMs: number,
-      ): Promise<any> => {
-        const deadline = Date.now() + timeoutMs;
-        for (;;) {
-          const el = await ap(
-            "resolve_element",
-            { selector: t.selector, text: t.text, tag: t.tag, nth: t.nth },
-          );
-          if (el && el.found) return el;
-          if (Date.now() >= deadline) return el;
-          await new Promise((r) => setTimeout(r, 200));
-        }
-      };
-      type StepResult = {
-        step: number;
-        action: string;
-        ok: boolean;
-        ms: number;
-        result?: unknown;
-        error?: string;
-      };
-      const results: StepResult[] = [];
-      const t0 = Date.now();
-      let failed: number | null = null;
-
-      for (let i = 0; i < resolved.length; i++) {
-        const st = resolved[i];
-        const s0 = Date.now();
-        try {
-          let out: unknown;
-          switch (st.action) {
-            case "navigate": {
-              if (!st.url) throw new Error("navigate needs 'url'.");
-              out = await ap("navigate", { url: st.url });
-              break;
-            }
-            case "wait_for": {
-              if (st.text == null && st.selector == null && st.url == null) {
-                throw new Error("wait_for needs 'text', 'selector' and/or 'url'.");
-              }
-              const r = await ap(
-                "wait_for",
-                { text: st.text, selector: st.selector, url: st.url, timeoutMs: st.timeout_ms },
-                (st.timeout_ms ?? 10000) + 15000,
-              );
-              if (!r.found) throw new Error(`wait_for timed out after ${r.elapsed_ms}ms.`);
-              out = `found after ${r.elapsed_ms}ms`;
-              break;
-            }
-            case "drag": {
-              if (st.from_x == null || st.from_y == null || st.to_x == null || st.to_y == null) {
-                throw new Error("drag needs from_x, from_y, to_x, to_y.");
-              }
-              out = await ap(
-                "drag",
-                { fromX: st.from_x, fromY: st.from_y, toX: st.to_x, toY: st.to_y, fast: speed },
-              );
-              break;
-            }
-            case "click":
-            case "fill":
-            case "select": {
-              if (st.action === "click" && !st.target && st.x != null && st.y != null) {
-                // Coordinate click for elements with no durable descriptor
-                // (icon-only buttons). Same gate as interactive click: hit-test
-                // the live element so the danger check still applies.
-                let targetText = "";
-                try {
-                  const hit = await ap("hit_test", { x: st.x, y: st.y });
-                  targetText = (hit?.text as string) ?? "";
-                } catch (_) { /* proceed ungated-texted; gatedClick re-checks */ }
-                const r = await gatedClick(tab, { x: st.x, y: st.y }, targetText, {
-                  fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
-                });
-                if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
-                out = r;
-                break;
-              }
-              if (!st.target || (st.target.selector == null && st.target.text == null)) {
-                throw new Error(`${st.action} needs a 'target' with selector and/or text (or x/y for click).`);
-              }
-              const el = await resolveTarget(st.target, st.timeout_ms ?? 8000);
-              if (!el || !el.found) {
-                throw new Error(
-                  `No element matches target ${JSON.stringify(st.target)} ` +
-                    `after waiting ${st.timeout_ms ?? 8000}ms.`,
-                );
-              }
-              if (st.action === "click") {
-                const r = await gatedClick(tab, { index: el.index }, el.text ?? "", {
-                  fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
-                });
-                if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
-                out = r;
-              } else if (st.action === "fill") {
-                if (st.text == null) throw new Error("fill needs 'text'.");
-                const g = HAS_NEWLINE.test(st.text) ? await enterGate(tab, el.index) : {};
-                if (typeof g === "string") throw new Error(g);
-                out = await ap(
-                  "fill_element",
-                  { index: el.index, text: st.text, fast: speed, ...g },
-                );
-              } else {
-                if (st.value == null && st.label == null) {
-                  throw new Error("select needs 'value' or 'label'.");
-                }
-                out = await ap(
-                  "select_option",
-                  { index: el.index, value: st.value, label: st.label },
-                );
-              }
-              break;
-            }
-            case "type_text": {
-              if (st.text == null) throw new Error("type_text needs 'text'.");
-              const g = HAS_NEWLINE.test(st.text) ? await enterGate(tab) : {};
-              if (typeof g === "string") throw new Error(g);
-              out = await ap("type_text", { text: st.text, fast: speed, ...g });
-              break;
-            }
-            case "press_key": {
-              if (!st.key) throw new Error("press_key needs 'key'.");
-              const g = isEnterCombo(st.key) ? await enterGate(tab) : {};
-              if (typeof g === "string") throw new Error(g);
-              out = await ap("press_key", { key: st.key, ...g });
-              break;
-            }
-            case "scroll": {
-              out = await ap("scroll", { deltaY: st.delta_y });
-              break;
-            }
-            case "dialog": {
-              if (st.accept == null) throw new Error("dialog needs 'accept' (true = OK, false = Cancel).");
-              out = await answerDialog(tab, st.accept, st.text);
-              if (/^(Action denied|No JavaScript dialog)/.test(out as string)) throw new Error(out as string);
-              break;
-            }
-          }
-          if (st.pause_ms) await new Promise((r) => setTimeout(r, st.pause_ms));
-          results.push({ step: i, action: st.action, ok: true, ms: Date.now() - s0, result: out });
-        } catch (e) {
-          results.push({
-            step: i,
-            action: st.action,
-            ok: false,
-            ms: Date.now() - s0,
-            error: (e as Error).message,
-          });
-          if (!st.optional) {
-            failed = i;
-            break;
-          }
-        }
-      }
-
-      return text(
-        JSON.stringify({
-          ok: failed == null,
-          steps_run: results.length,
-          total_steps: resolved.length,
-          elapsed_ms: Date.now() - t0,
-          ...(failed != null
-            ? {
-                failed_step: failed,
-                hint:
-                  "Script stopped at the failed step. Take over with the interactive tools " +
-                  "(screenshot / read_elements) from the current page state, finish the task, " +
-                  "then update the saved script so the next replay succeeds.",
-              }
-            : {}),
-          results,
-        }),
-      );
+      return text(JSON.stringify({ flow: name, ...res }));
     },
   );
 

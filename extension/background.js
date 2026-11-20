@@ -1,6 +1,7 @@
 // config.js defines OtterConfig (shared DEFAULTS / PRESETS / helpers). Must be
-// imported before anything reads settings.
-importScripts("config.js");
+// imported before anything reads settings. recorder-core.js defines
+// OtterRecorder (recorded events -> run_script steps; see "Flow recorder").
+importScripts("config.js", "recorder-core.js");
 
 // Live settings from chrome.storage.sync, refreshed whenever they change.
 let S = OtterConfig.DEFAULTS;
@@ -50,6 +51,9 @@ async function drawAutoIcon() {
 }
 
 let autoBadgeFallback = false; // Full Auto mark couldn't be drawn: shown as a badge
+// The flow recording in progress (see "Flow recorder"); declared up here
+// because the badge reads it.
+let recording = null;
 
 async function reflectApprovalMode() {
   const auto = S.approvalMode === "auto";
@@ -73,11 +77,15 @@ Full Auto is ON — no approval prompts` : ACTION_TITLE,
 }
 
 // The one owner of the toolbar badge: pairing trouble wins ("!" — open the
-// popup), otherwise the Full Auto fallback badge, otherwise nothing.
+// popup), then a running flow recording ("REC"), then the Full Auto fallback
+// badge, otherwise nothing.
 function refreshBadge() {
   const st = pairingStatus().state;
   if (["unpaired", "mismatch", "refused", "waiting"].includes(st)) {
     chrome.action.setBadgeText({ text: "!" });
+    chrome.action.setBadgeBackgroundColor({ color: "#D93025" });
+  } else if (recording && !recording.stopped) {
+    chrome.action.setBadgeText({ text: "REC" });
     chrome.action.setBadgeBackgroundColor({ color: "#D93025" });
   } else if (autoBadgeFallback && S.approvalMode === "auto") {
     chrome.action.setBadgeText({ text: "▶▶" });
@@ -1015,22 +1023,36 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
-// The window the user last focused that ISN'T an agent's — get_user_tab's answer.
+// The window the user last focused that ISN'T an agent's — get_user_tab's
+// (and record_flow's) answer. Kept in storage.session too: MV3 suspends this
+// worker when idle, and a restarted worker must not forget it (window ids
+// stay valid until the browser restarts, which also clears storage.session).
 let lastUserWindowId = null;
+const lastUserWindowReady = chrome.storage.session.get("lastUserWindowId").then((r) => {
+  if (lastUserWindowId == null && r.lastUserWindowId != null) lastUserWindowId = r.lastUserWindowId;
+}).catch(() => {});
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) return;
   await agentsReady;
-  if (!Object.values(agents).some((ag) => ag.windowId === windowId)) lastUserWindowId = windowId;
+  if (!Object.values(agents).some((ag) => ag.windowId === windowId)) {
+    lastUserWindowId = windowId;
+    chrome.storage.session.set({ lastUserWindowId: windowId }).catch(() => {});
+  }
 });
 
 async function userTab() {
   await agentsReady;
+  await lastUserWindowReady;
   const isAgentWin = (id) => Object.values(agents).some((ag) => ag.windowId === id);
   let winId = lastUserWindowId;
   if (winId == null || isAgentWin(winId) || !(await windowAlive(winId))) {
-    const wins = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    // Unknown (or gone): the focused window of the user's, else the one whose
+    // tab they used most recently — not just the first window Chrome lists
+    // (while they type in the AI app, no Chrome window has focus).
+    const wins = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
     const mine = wins.filter((w) => !isAgentWin(w.id));
-    const pick = mine.find((w) => w.focused) || mine[0];
+    const used = (w) => Math.max(0, ...(w.tabs || []).map((t) => t.lastAccessed || 0));
+    const pick = mine.find((w) => w.focused) || [...mine].sort((a, b) => used(b) - used(a))[0];
     if (!pick) throw new Error("No user browser window found.");
     winId = pick.id;
   }
@@ -1049,6 +1071,358 @@ async function resolveTab(p) {
   }
   return activeTab();
 }
+
+// ===== Flow recorder =====
+// The user records what they do in one of their OWN tabs (never an agent's);
+// the steps become a named flow, stored in this profile (storage.local
+// "flows", keyed by name), which an AI replays with run_flow through the same
+// engine and approval gate as run_script. recorder.js captures the events in
+// the page, recorder-core.js turns them into steps. A recording starts from
+// the popup, or from record_flow once the user approved it there.
+//
+// recording (declared at the top): { tabId, windowId, startUrl, url, title,
+// startedAt, events, lastActionAt?, loadingAt?, stopped? } or null — mirrored
+// to storage.local "recording" so a worker restart picks it up. stopped:
+// capture has ended and it waits for a name (Save) or Discard.
+const REC_SCRIPT_ID = "otter-recorder";
+const REC_REFUSE = "Record in one of your own tabs on a website.";
+const REC_KINDS = new Set(["click", "fill", "select", "key", "submit"]);
+const REC_MAX_EVENTS = 3000;
+const REC_CAUSE_MS = 1500; // a navigation this soon after a click / Enter / submit is its result
+
+const recordingReady = chrome.storage.local.get("recording").then(async (r) => {
+  recording = r.recording || null;
+  if (recording && !recording.stopped) {
+    // The recorded tab is gone (closed while the worker slept): keep what
+    // was recorded for saving.
+    try { await chrome.tabs.get(recording.tabId); }
+    catch (_) { recording.stopped = true; await stopCapture(false); await saveRecording(true); }
+  }
+  refreshBadge();
+}).catch(() => {});
+
+// A browser restart renumbers tabs: a recording can't carry on, but what it
+// captured can still be saved.
+chrome.runtime.onStartup.addListener(async () => {
+  await recordingReady;
+  if (recording && !recording.stopped) {
+    recording.stopped = true;
+    await saveRecording(true);
+    refreshBadge();
+  }
+});
+
+let recSaveTimer = null;
+function saveRecording(now = false) {
+  clearTimeout(recSaveTimer);
+  const write = () => (recording
+    ? chrome.storage.local.set({ recording })
+    : chrome.storage.local.remove("recording")).catch(() => {});
+  if (now) return write();
+  recSaveTimer = setTimeout(write, 300);
+  return Promise.resolve();
+}
+
+const recordable = (tab) => !ownerOf(tab) && /^https?:/i.test(tab.url || "");
+
+function recStatus() {
+  if (!recording) return { recording: false };
+  return {
+    recording: !recording.stopped,
+    stopped: !!recording.stopped,
+    host: hostOf(recording.url || recording.startUrl),
+    title: recording.title,
+    tabId: recording.tabId,
+    steps: OtterRecorder.toSteps(recording.events, recording.startUrl).steps.length,
+    startedAt: recording.startedAt,
+  };
+}
+
+function defaultFlowName(rec) {
+  const d = new Date(rec.startedAt || Date.now());
+  const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const base = (rec.title || hostOf(rec.startUrl) || "Flow").trim().replace(/\s+/g, " ");
+  return `${base.slice(0, 60 - date.length - 1)} ${date}`;
+}
+
+async function startRecording(tabId) {
+  await recordingReady;
+  await agentsReady;
+  if (recording) {
+    throw new Error(recording.stopped
+      ? "A finished recording is waiting to be saved or discarded (in the Otter popup, or record_flow stop / discard)."
+      : `Already recording (in ${hostOf(recording.url || recording.startUrl)}). Stop it first.`);
+  }
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); }
+  catch (_) { throw new Error(`Tab ${tabId} not found (was it closed?).`); }
+  if (!recordable(tab)) throw new Error(REC_REFUSE);
+  recording = {
+    tabId: tab.id, windowId: tab.windowId, startUrl: tab.url, url: tab.url,
+    title: tab.title || "", startedAt: Date.now(), events: [],
+  };
+  await saveRecording(true);
+  // Registered in every tab (so the recorder follows navigations and late
+  // iframes); recorder.js stays inert outside the recorded tab.
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [REC_SCRIPT_ID] }).catch(() => {});
+    const script = {
+      id: REC_SCRIPT_ID, matches: ["<all_urls>"], js: ["page.js", "recorder.js"],
+      allFrames: true, runAt: "document_idle", persistAcrossSessions: false,
+    };
+    // matchOriginAsFallback: also frames without a URL of their own
+    // (about:blank / srcdoc frames a page writes into, e.g. try-it editors).
+    try {
+      await chrome.scripting.registerContentScripts([{ ...script, matchOriginAsFallback: true }]);
+    } catch (_) {
+      await chrome.scripting.registerContentScripts([script]); // an older Chrome without that option
+    }
+  } catch (e) {
+    recording = null;
+    await saveRecording(true);
+    throw new Error(`Couldn't start recording: ${e.message}`);
+  }
+  await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ["page.js", "recorder.js"] })
+    .catch(() => {});
+  refreshBadge();
+  return recStatus();
+}
+
+// End capture in the page. flush: let it send what's still being typed first.
+async function stopCapture(flush = true) {
+  const tabId = recording ? recording.tabId : null;
+  if (tabId != null) {
+    // Not awaited: a busy or frozen page must not hold up stopping.
+    try { chrome.tabs.sendMessage(tabId, { type: "rec:off" }).catch(() => {}); } catch (_) {}
+    if (flush) await sleep(250);
+  }
+  await chrome.scripting.unregisterContentScripts({ ids: [REC_SCRIPT_ID] }).catch(() => {});
+}
+
+// Stop capturing but keep the recording for Save / Discard.
+async function pauseRecording() {
+  await recordingReady;
+  if (!recording) throw new Error("Nothing is being recorded.");
+  if (!recording.stopped) {
+    await stopCapture(true);
+    if (!recording) return { recording: false }; // discarded meanwhile
+    recording.stopped = true;
+    await saveRecording(true);
+    refreshBadge();
+  }
+  return recStatus();
+}
+
+async function discardRecording() {
+  await recordingReady;
+  if (!recording) return { discarded: false };
+  if (!recording.stopped) await stopCapture(false);
+  recording = null;
+  await saveRecording(true);
+  refreshBadge();
+  return { discarded: true };
+}
+
+// Save the recording as a flow. A name in use: { exists } (the popup asks),
+// or with uniquify a free "Name (2)" (record_flow never replaces silently).
+async function finishRecording(name, { replace = false, uniquify = false } = {}) {
+  await recordingReady;
+  if (!recording) throw new Error("Nothing is being recorded.");
+  if (!recording.stopped) {
+    await stopCapture(true);
+    if (!recording) throw new Error("Nothing is being recorded.");
+    recording.stopped = true;
+    await saveRecording(true);
+    refreshBadge();
+  }
+  const rec = recording;
+  let n = String(name || "").trim().replace(/\s+/g, " ").slice(0, 60) || defaultFlowName(rec);
+  const flows = await loadFlows();
+  if (flows[n] && !replace) {
+    if (!uniquify) return { exists: true, name: n };
+    for (let k = 2; flows[n]; k++) {
+      const suffix = ` (${k})`;
+      n = `${n.replace(/ \(\d+\)$/, "").slice(0, 60 - suffix.length)}${suffix}`;
+    }
+  }
+  if (!flows[n] && Object.keys(flows).length >= OtterRecorder.MAX_FLOWS) {
+    throw new Error(`${OtterRecorder.MAX_FLOWS} flows are saved in this profile already — delete some first.`);
+  }
+  const { steps, vars, warnings } = OtterRecorder.toSteps(rec.events, rec.startUrl);
+  const flow = { v: 1, name: n, createdAt: new Date(rec.startedAt).toISOString(), startUrl: rec.startUrl, steps, vars };
+  const err = OtterRecorder.validateFlow(flow);
+  if (err) throw new Error(err);
+  flows[n] = flow;
+  await chrome.storage.local.set({ flows });
+  recording = null;
+  await saveRecording(true);
+  refreshBadge();
+  return { flow, warnings };
+}
+
+// One user action from recorder.js. Only from the recorded tab, and only the
+// fields a step can use — clipped.
+const cleanRecTarget = (t) => {
+  const out = {};
+  for (const k of ["selector", "text", "tag", "label"]) {
+    if (typeof t[k] === "string" && t[k]) out[k] = t[k].slice(0, k === "selector" ? 1000 : 200);
+  }
+  if (Number.isInteger(t.nth) && t.nth > 0) out.nth = t.nth;
+  return out.selector || out.text ? out : null;
+};
+
+async function onRecEvent(msg, sender) {
+  await recordingReady;
+  if (!recording || recording.stopped || !sender.tab || sender.tab.id !== recording.tabId) return;
+  if (!REC_KINDS.has(msg.kind) || recording.events.length >= REC_MAX_EVENTS) return;
+  const ev = { kind: msg.kind, ts: Date.now(), top: sender.frameId === 0, frameUrl: String(sender.url || "").slice(0, 2000) };
+  if (msg.target && typeof msg.target === "object") ev.target = cleanRecTarget(msg.target);
+  if (["click", "fill", "select"].includes(msg.kind) && !ev.target) return;
+  if (msg.kind === "key") ev.key = String(msg.key || "").slice(0, 40);
+  if (msg.sensitive === true) ev.sensitive = true; // never a value
+  else if ((msg.kind === "fill" || msg.kind === "select") && typeof msg.value === "string") ev.value = msg.value.slice(0, 10000);
+  recording.events.push(ev);
+  if (msg.kind === "click" || msg.kind === "submit" || (msg.kind === "key" && /Enter$/.test(ev.key))) {
+    recording.lastActionAt = ev.ts;
+  }
+  saveRecording();
+}
+
+// Navigations of the recorded tab that no recorded click / Enter / submit
+// caused (typed in the address bar, a bookmark, back / forward) become steps.
+chrome.tabs.onUpdated.addListener(async (tabId, info) => {
+  if (!info.url && !info.status) return;
+  await recordingReady;
+  if (!recording || recording.stopped || tabId !== recording.tabId) return;
+  const now = Date.now();
+  if (!info.url) {
+    if (info.status === "loading") recording.loadingAt = now; // the URL follows when it commits
+    else if (info.status === "complete") recording.loadingAt = null;
+    return;
+  }
+  const started = recording.loadingAt && now - recording.loadingAt < 30000 ? recording.loadingAt : now;
+  recording.loadingAt = null;
+  recording.url = info.url;
+  const last = recording.lastActionAt || 0;
+  const caused = last && started >= last - 50 && started - last <= REC_CAUSE_MS;
+  if (!caused && /^https?:/i.test(info.url) && recording.events.length < REC_MAX_EVENTS) {
+    recording.events.push({ kind: "navigate", url: info.url, ts: now });
+  }
+  saveRecording();
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await recordingReady;
+  if (recording && !recording.stopped && recording.tabId === tabId) {
+    recording.stopped = true; // kept for saving
+    await stopCapture(false);
+    await saveRecording(true);
+    refreshBadge();
+  }
+});
+
+// ----- Saved flows -----
+async function loadFlows() {
+  const { flows } = await chrome.storage.local.get("flows");
+  return flows && typeof flows === "object" && !Array.isArray(flows) ? flows : {};
+}
+
+const flowSummary = (f) => ({
+  name: f.name,
+  steps: Array.isArray(f.steps) ? f.steps.length : 0,
+  startUrl: f.startUrl ? hostOf(f.startUrl) : "",
+  vars: Object.keys(f.vars || {}),
+  createdAt: f.createdAt || null,
+});
+
+async function listFlows() {
+  return Object.values(await loadFlows())
+    .map(flowSummary)
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+}
+
+const noFlow = (name) => new Error(`No saved flow named "${name}". Call flows(action='list') to see them.`);
+
+async function getFlow(name) {
+  const f = (await loadFlows())[name];
+  if (!f) throw noFlow(name);
+  return f;
+}
+
+// Saved by the AI (e.g. after fixing a step). replace: the user approved
+// overwriting a flow of that name; without it an existing name answers
+// { exists } and nothing is written.
+async function saveFlow(input, replace) {
+  const err = OtterRecorder.validateFlow(input);
+  if (err) throw new Error(err);
+  const name = input.name.trim();
+  const flows = await loadFlows();
+  if (flows[name] && replace !== true) return { exists: true, name };
+  if (!flows[name] && Object.keys(flows).length >= OtterRecorder.MAX_FLOWS) {
+    throw new Error(`${OtterRecorder.MAX_FLOWS} flows are saved in this profile already — delete some first.`);
+  }
+  const firstNav = input.steps.find((s) => s.action === "navigate" && s.url);
+  flows[name] = {
+    v: 1, name,
+    createdAt: typeof input.createdAt === "string" ? input.createdAt : new Date().toISOString(),
+    startUrl: typeof input.startUrl === "string" ? input.startUrl : (firstNav ? firstNav.url : ""),
+    steps: input.steps,
+    vars: input.vars || {},
+  };
+  await chrome.storage.local.set({ flows });
+  return { saved: name, replaced: !!replace };
+}
+
+async function deleteFlow(name) {
+  const flows = await loadFlows();
+  if (!flows[name]) throw noFlow(name);
+  delete flows[name];
+  await chrome.storage.local.set({ flows });
+  return { deleted: name };
+}
+
+// Messages from recorder.js (content script, in the recorded tab) and from
+// the popup (an extension page: it alone may start, stop or save from here).
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg.type !== "string" || sender.id !== chrome.runtime.id) return;
+  if (msg.type === "rec:hello") {
+    recordingReady.then(() => sendResponse({
+      recording: !!(recording && !recording.stopped && sender.tab && sender.tab.id === recording.tabId),
+    }));
+    return true;
+  }
+  if (msg.type === "rec:event") {
+    onRecEvent(msg, sender);
+    return;
+  }
+  const fromPopup = !sender.tab && String(sender.url || "").startsWith(chrome.runtime.getURL(""));
+  if (!fromPopup || !/^(rec|flows):/.test(msg.type)) return;
+  const reply = (fn) => {
+    Promise.resolve().then(fn).then((r) => sendResponse(r), (e) => sendResponse({ error: e.message || String(e) }));
+    return true;
+  };
+  switch (msg.type) {
+    case "rec:popup":
+      return reply(async () => {
+        await recordingReady;
+        await agentsReady;
+        let here = null;
+        try { here = msg.tabId != null ? await chrome.tabs.get(msg.tabId) : null; } catch (_) {}
+        return {
+          rec: { ...recStatus(), here: !!(recording && here && recording.tabId === here.id) },
+          canRecord: !!(here && recordable(here)),
+          reason: here && recordable(here) ? "" : REC_REFUSE,
+          defaultName: recording ? (recording.title || defaultFlowName(recording)).trim().slice(0, 60) : "",
+          flows: await listFlows(),
+        };
+      });
+    case "rec:start": return reply(() => startRecording(msg.tabId));
+    case "rec:stop": return reply(() => pauseRecording());
+    case "rec:save": return reply(() => finishRecording(msg.name, { replace: msg.replace === true }));
+    case "rec:discard": return reply(() => discardRecording());
+    case "flows:delete": return reply(() => deleteFlow(msg.name));
+  }
+});
 
 // ===== Cursor orchestration =====
 // Animate the fake cursor (content script) while firing real CDP mouseMoved
@@ -1592,6 +1966,17 @@ async function handle(action, p) {
     return waitForDownload(p);
   }
 
+  // ----- Flow recorder + saved flows (this profile; not tab-scoped) -----
+  // rec_start comes from record_flow only after the user approved it there.
+  if (action === "rec_start") return startRecording(p.tabId);
+  if (action === "rec_status") { await recordingReady; return recStatus(); }
+  if (action === "rec_stop") return finishRecording(p.name, { uniquify: true });
+  if (action === "rec_discard") return discardRecording();
+  if (action === "flows_list") return listFlows();
+  if (action === "flows_get") return getFlow(String(p.name || ""));
+  if (action === "flows_save") return saveFlow(p.flow, p.replace === true);
+  if (action === "flows_delete") return deleteFlow(String(p.name || ""));
+
   lastAgentActivity = Date.now();
   await agentsReady;
   await settingsReady;
@@ -1775,6 +2160,17 @@ async function perform(action, p, tab, fast) {
       const pick = cands[Math.min(p.nth || 0, cands.length - 1)];
       const e = list[pick];
       return { found: true, index: pick, matches: cands.length, text: e.text, tag: e.tag, x: e.x, y: e.y };
+    }
+
+    case "field_filled": {
+      // run_flow, at a step whose password the recording didn't keep: did
+      // the browser autofill it? Answers yes / no, never the value.
+      await ensureLib(tab.id);
+      const ref = await resolveRef(tab.id, p.index);
+      const r = ref && (await inFrame(tab.id, ref.frameId,
+        (i) => (window.__otter && window.__otter.fieldFilled ? window.__otter.fieldFilled(i) : null), [ref.local]));
+      if (!r || r.gone) throw new Error(`No element with index ${p.index}. Call read_elements first.`);
+      return { filled: r.filled === true };
     }
 
     case "click": {

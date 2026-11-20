@@ -115,6 +115,117 @@ function render(st) {
 async function refresh() {
   lastStatus = await getStatus();
   render(lastStatus);
+  refreshFlows();
+}
+
+// ---- Flows: record this tab, saved flows ----
+// The recording itself lives in the background (it outlives the popup); this
+// shows its state on the same live refresh as the connection.
+let popupTabId = null;
+let nameTouched = false; // the user edited the name: the refresh mustn't overwrite it
+let flowsKey = "";
+let recBusy = false;
+
+const flowMsg = async (type, extra = {}) => {
+  try {
+    return (await chrome.runtime.sendMessage({ type, ...extra })) || {};
+  } catch (e) {
+    return { error: e.message };
+  }
+};
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+async function refreshFlows() {
+  if (popupTabId == null || recBusy) return;
+  const st = await flowMsg("rec:popup", { tabId: popupTabId });
+  if (st.error || !st.rec) return;
+  const rec = st.rec;
+  $("recIdle").hidden = rec.recording || rec.stopped;
+  $("recLive").hidden = !rec.recording;
+  $("recSave").hidden = !rec.stopped;
+  $("recStart").disabled = !st.canRecord;
+  $("recStartWrap").title = st.canRecord ? "" : st.reason;
+  if (rec.recording) {
+    $("recText").textContent = `Recording · ${plural(rec.steps, "step")}`;
+    setSub($("recWhere"), rec.here ? ["", ""] : ["", `On ${rec.host}`]);
+  } else if (rec.stopped) {
+    if (!nameTouched && !$("recName").value) $("recName").value = st.defaultName || "";
+    setSub($("recWhere"), ["", `${plural(rec.steps, "step")} from ${rec.host}`]);
+  } else {
+    nameTouched = false;
+    $("recName").value = "";
+    setSub($("recWhere"), ["", ""]);
+  }
+  if (recError && Date.now() < recError.until) setSub($("recWhere"), ["danger", recError.text]);
+  renderFlowList(st.flows || []);
+}
+
+function renderFlowList(flows) {
+  const key = JSON.stringify(flows.map((f) => [f.name, f.steps]));
+  if (key === flowsKey) return;
+  flowsKey = key;
+  const ul = $("flowList");
+  ul.textContent = "";
+  for (const f of flows.slice(0, 5)) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "flow-name";
+    name.textContent = f.name;
+    name.title = f.startUrl ? `${f.name} — ${f.startUrl}` : f.name;
+    const steps = document.createElement("span");
+    steps.className = "flow-steps";
+    steps.textContent = `· ${plural(f.steps, "step")}`;
+    const del = document.createElement("button");
+    del.className = "flow-del";
+    del.textContent = "✕";
+    del.title = "Delete";
+    del.setAttribute("aria-label", `Delete the flow ${f.name}`);
+    del.addEventListener("click", async () => {
+      if (!confirm(`Delete the saved flow "${f.name}"?`)) return;
+      await flowMsg("flows:delete", { name: f.name });
+      refreshFlows();
+    });
+    li.append(name, steps, del);
+    ul.append(li);
+  }
+  setSub($("flowMore"), ["", flows.length > 5 ? `and ${flows.length - 5} more` : ""]);
+  $("flowHint").hidden = flows.length === 0;
+}
+
+let recError = null; // { text, until }: kept on screen through the live refresh
+async function flowAction(fn) {
+  recBusy = true;
+  try {
+    const res = await fn();
+    recError = res && res.error ? { text: res.error, until: Date.now() + 5000 } : null;
+  } finally {
+    recBusy = false;
+  }
+  refreshFlows();
+}
+
+async function initFlows() {
+  try {
+    const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+    popupTabId = t ? t.id : null;
+  } catch (_) {}
+  $("recStart").addEventListener("click", () => flowAction(() => flowMsg("rec:start", { tabId: popupTabId })));
+  $("recStop").addEventListener("click", () => flowAction(() => flowMsg("rec:stop")));
+  $("recDiscard").addEventListener("click", () => flowAction(() => flowMsg("rec:discard")));
+  $("recName").addEventListener("input", () => { nameTouched = true; });
+  const save = () => flowAction(async () => {
+    const name = $("recName").value.trim();
+    let res = await flowMsg("rec:save", { name });
+    if (res.exists) {
+      if (!confirm(`Replace the saved flow "${res.name}"?`)) return {};
+      res = await flowMsg("rec:save", { name, replace: true });
+    }
+    if (!res.error) { nameTouched = false; $("recName").value = ""; }
+    return res;
+  });
+  $("recSaveBtn").addEventListener("click", save);
+  $("recName").addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+  refreshFlows();
 }
 
 // Wait (up to 5 s) for the connection to settle after a change.
@@ -209,6 +320,7 @@ async function init() {
   state = await C.load();
   reflect();
   initProfile();
+  initFlows();
   initPairing();
 
   document.querySelectorAll("#presets button").forEach((b) => {

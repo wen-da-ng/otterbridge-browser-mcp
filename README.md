@@ -128,7 +128,7 @@ and for the extension click the green **Code** button on the repo page →
 
 ## What your AI can do
 
-Forty-one tools, each taking an optional `tab` id — plus multi-tab,
+Forty-four tools, each taking an optional `tab` id — plus multi-tab,
 multi-agent control where every MCP session works in its own Chrome window and
 colored tab group. Everything that reads or acts on a page also works **inside
 iframes** (payment forms, embedded editors, nested frames) and **shadow DOM**
@@ -248,6 +248,50 @@ A real recorded example lives in
 </details>
 
 <details>
+<summary><b>Record &amp; replay flows (3): <code>record_flow</code>, <code>flows</code>, <code>run_flow</code></b></summary>
+
+Do a task **yourself, once**, and let the AI repeat it with new values.
+
+1. **Record.** In the Otter popup press **Record this tab** — the toolbar icon
+   shows a red **REC** — and do the task in that tab: fill the form, pick
+   options, click through. Reopen the popup to see `Recording · N steps`, then
+   **Stop**, name the flow and **Save** (or **Discard**). The AI can start the
+   same thing with `record_flow(action="start")` — you're asked to approve it
+   first — and save it with `record_flow(action="stop", name=…)`.
+2. **Replay.** Ask Claude to run it by name: `run_flow(name, vars?)` replays it
+   in the AI's own window (never your tab), in one call, through the same
+   engine as `run_script`. Every value you typed became a variable — the
+   recorded value is its default, and `vars` replaces it:
+   `run_flow("Order lunch", {"email": "someone@example.com"})`. Destructive
+   clicks (Submit, Pay, Send, …) still ask you, exactly as when the AI clicks
+   them itself.
+3. **Manage.** Saved flows are listed in the popup (✕ deletes one). The AI uses
+   `flows(action="list" | "get" | "save" | "delete")` — e.g. to fix a step
+   that stopped matching the page and save the flow back. Replacing or deleting
+   a flow asks you first.
+
+**Passwords and codes are never recorded.** Password fields, one-time codes
+and card fields (by type, `autocomplete`, or a name like *password*, *otp*,
+*cvv*) are kept as a "sensitive" step with no value — the value never leaves
+the page. On replay, if Chrome's password manager has filled the field the
+flow carries on; otherwise it stops there and asks you to type it in the Otter
+window, then resumes with `run_flow(…, from_step=N)`.
+
+Flows are stored in the browser profile they were recorded in (up to 200
+flows × 300 steps), survive server restarts, and keep the values you typed
+(other than passwords) as their defaults.
+
+**Not recorded:** scrolling (replay scrolls to each target by itself),
+hovering, drag and drop, file uploads, and JavaScript dialogs. Elements are
+remembered by a stable attribute (`data-testid`, a stable `id`, `name`,
+`aria-label`), their visible text, or as a last resort their position in the
+page. A target that isn't unique inside an **iframe** is remembered by its
+position among matches in that frame, but replay counts matches across all
+frames — so it can pick the wrong frame's element; unique targets (the usual
+case) aren't affected.
+</details>
+
+<details>
 <summary><b>Multi-tab / multi-agent</b></summary>
 
 Each MCP **session** is an agent with its **own Chrome window**, labelled with a
@@ -332,9 +376,14 @@ and everything binds to **localhost only** — nothing is exposed to the network
 
 - **Audit log:** every dispatched action is appended to `server/agent_actions.log`.
   What gets typed (`fill_element`, `type_text`, prompt answers) and JavaScript
-  run via `evaluate_js` are logged only as their length, never their content.
+  run via `evaluate_js` are logged only as their length, never their content;
+  a saved flow is logged by name and step count, never its recorded values.
 - **Passwords stay hidden:** password fields never report their value — not in
-  `read_elements`, `page_snapshot` or the approval gate.
+  `read_elements`, `page_snapshot` or the approval gate — and the flow
+  recorder never records them (nor one-time codes or card numbers).
+- **Recording needs you:** a flow is recorded only in your own tab, started by
+  you in the popup or by the AI after you approve it, with a red **REC** on the
+  toolbar icon the whole time.
 - **Dialogs and uploads are gated too:** OK on a `confirm()` that reads
   destructive ("Delete 3 files?") needs approval like a destructive click, and
   every `upload_file` asks first, since it sends your files to the website.
@@ -544,6 +593,7 @@ setup scripts (`bootstrap` + `start`) and docs. It's single-tab only. See
 - [x] Multi-tab / multi-agent — per-session windows + tab groups, parallel control
 - [x] Several AI clients at once (Claude Code + Claude Desktop + background sessions)
 - [x] Script replay (`run_script`) — recorded flows in one call
+- [x] Flow recorder — record a task in your own tab, replay it by name (`record_flow`, `flows`, `run_flow`)
 - [x] Iframes, shadow DOM, JS dialogs, file upload/download, key combinations
 - [x] Page snapshot + "what changed" reports — fewer screenshots and round trips
 - [x] Rookie-friendly releases — prebuilt `.mcpb` + extension zip on every release

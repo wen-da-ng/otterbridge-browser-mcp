@@ -39,10 +39,13 @@ ok("switched off after v2: stays off", C.normalize({ autoCloseWindows: false, se
 
 // page.js is one big closure: a second function with an existing name
 // silently replaces the first (this once broke read_elements).
-const pageJs = readFileSync(join(process.cwd(), "..", "extension", "page.js"), "utf-8");
-const names = [...pageJs.matchAll(/^  (?:async )?function ([A-Za-z0-9_]+)|^  (?:const|let) ([A-Za-z0-9_]+)/gm)].map((x) => x[1] || x[2]);
-const dupes = names.filter((n, i) => names.indexOf(n) !== i);
-ok("page.js defines every top-level name once", names.length > 20 && dupes.length === 0, dupes.join(", ") || `${names.length} names`);
+// recorder.js is built the same way.
+for (const [file, min] of [["page.js", 20], ["recorder.js", 5]]) {
+  const src = readFileSync(join(process.cwd(), "..", "extension", file), "utf-8");
+  const names = [...src.matchAll(/^  (?:async )?function ([A-Za-z0-9_]+)|^  (?:const|let) ([A-Za-z0-9_]+)/gm)].map((x) => x[1] || x[2]);
+  const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+  ok(`${file} defines every top-level name once`, names.length > min && dupes.length === 0, dupes.join(", ") || `${names.length} names`);
+}
 
 console.log(`\n[test] ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
