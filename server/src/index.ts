@@ -112,7 +112,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.9.2";
+const SERVER_VERSION = "0.9.3";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove

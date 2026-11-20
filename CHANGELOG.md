@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.3 — 2026-11-21
+
+### Security
+
+- Updated `hono` (4.13.19) and `@hono/node-server` (2.1.11), which the MCP SDK
+  uses for the HTTP transport and which ship inside the `.mcpb`. Clears 7
+  Dependabot alerts (6 moderate, 1 low). None was reachable in OtterBridge —
+  its HTTP endpoint is localhost-only, routes `/mcp` itself and uses no hono
+  middleware, validators or WebSocket upgrades — but the bundled code is now
+  current.
+
 ## 0.9.2 — 2026-11-21
 
 ### Fixed
