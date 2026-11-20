@@ -1146,6 +1146,43 @@ function keyInfo(name) {
 const MAC_COMMANDS = { a: "selectAll", c: "copy", v: "paste", x: "cut", z: "undo" };
 
 // "Enter", "a", "Control+A", "Shift+Tab", "Control+Shift+P", "Meta+K"...
+// ===== Enter submits =====
+// Enter in a form field submits the form — the same commitment as clicking
+// its submit button — and chat boxes send on Enter. The server asks the user
+// first when what Enter would trigger looks destructive, and marks the command
+// gated; like for clicks, we refuse an unmarked one ourselves.
+// Shift+Enter alone is left alone: in chat boxes it's the newline key.
+function isEnterCombo(combo) {
+  const parts = String(combo).split("+");
+  const main = parts.pop().toLowerCase();
+  const mods = parts.map((m) => m.toLowerCase());
+  return (main === "enter" || main === "return") && !(mods.length === 1 && mods[0] === "shift");
+}
+const hasNewline = (text) => /[\r\n]/.test(text || "");
+
+// What Enter would trigger: labels from the focused element (or element
+// `index`), in whichever frame has the focus.
+async function enterLabels(tabId, index) {
+  await ensureLib(tabId);
+  if (index != null) {
+    const ref = await resolveRef(tabId, index);
+    if (!ref) return [];
+    const r = await inFrame(tabId, ref.frameId, (i) => (window.__otter ? window.__otter.enterTarget(i) : null), [ref.local]);
+    return (r && r.labels) || [];
+  }
+  const res = await inFrames(tabId, () => (window.__otter ? window.__otter.enterTarget(null) : null));
+  const hit = res.find((r) => r.result && r.result.labels);
+  return hit ? hit.result.labels : [];
+}
+
+async function refuseUngatedEnter(tabId, p, index) {
+  const labels = await enterLabels(tabId, index);
+  const bad = labels.find((l) => OtterConfig.refuseUngated({ kind: "click", text: l, gated: p.gated, approvalMode: S.approvalMode }));
+  if (bad) {
+    throw new Error(`Refused: Enter here would trigger '${clip(bad, 60)}', which needs the user's approval.`);
+  }
+}
+
 async function pressKey(tabId, combo) {
   const parts = combo === "+" ? ["+"] : combo.split("+").filter((s, i, a) => s !== "" || i === a.length - 1);
   const mainName = parts.pop() || "+";
@@ -1830,6 +1867,7 @@ async function perform(action, p, tab, fast) {
 
     case "type_text": {
       const text = p.text || "";
+      if (hasNewline(text)) await refuseUngatedEnter(tab.id, p, null);
       await typeChars(tab.id, text, fast);
       return `Typed ${text.length} chars`;
     }
@@ -1855,6 +1893,7 @@ async function perform(action, p, tab, fast) {
         (i) => window.__otter && window.__otter.fieldState(i), [ref.local]);
       const escapeKey = { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 };
       const text = p.text || "";
+      if (hasNewline(text)) await refuseUngatedEnter(tab.id, p, p.index);
       let lastProblem = "";
       for (let attempt = 0; attempt < 3; attempt++) {
         let info = await focusSel();
@@ -2071,7 +2110,11 @@ async function perform(action, p, tab, fast) {
       }
     }
 
+    case "enter_target":
+      return { labels: await enterLabels(tab.id, p.index) };
+
     case "press_key": {
+      if (isEnterCombo(p.key)) await refuseUngatedEnter(tab.id, p, null);
       await pressKey(tab.id, p.key);
       return `Pressed ${p.key}`;
     }

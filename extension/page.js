@@ -16,7 +16,7 @@
 //
 // Re-injection is cheap: a frame that already has this version returns early.
 (() => {
-  const VERSION = 7;
+  const VERSION = 8;
   if (window.__otter && window.__otter.v === VERSION) return;
 
   // What counts as interactive without looking at styles. ARIA menu/option
@@ -350,6 +350,52 @@
     let a = document.activeElement;
     while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
     return document.hasFocus() && (a === el || (a != null && containsDeep(el, a)));
+  }
+
+  // What pressing Enter would trigger, for the approval gate (Enter submits a
+  // form just like clicking its submit button). Returns { labels } — the
+  // candidates the gate checks — or null when the focus isn't in this frame.
+  //   - a focused button / link: itself;
+  //   - a field in a form: the form's submit button;
+  //   - a text box outside any form (chat composers send on Enter): the
+  //     buttons close around it, e.g. "Send".
+  // i: an element index (fill_element, before it focuses); else the focus.
+  function enterTarget(i) {
+    let el;
+    if (i != null) {
+      el = elAt(i);
+    } else {
+      if (!document.hasFocus()) return null;
+      el = document.activeElement;
+      while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+      if (el && /^(IFRAME|FRAME)$/.test(el.tagName)) return null; // the frame answers for itself
+    }
+    if (!el || el === document.body || el === document.documentElement) return { labels: [] };
+    const clip = (s) => String(s || "").trim().slice(0, 200);
+    const tag = el.tagName;
+    if (tag === "BUTTON" || tag === "A" || el.getAttribute("role") === "button" ||
+        (tag === "INPUT" && /^(submit|button|image|reset)$/i.test(el.type || ""))) {
+      return { labels: [clip(labelOf(el))] };
+    }
+    const form = el.form || (el.closest && el.closest("form"));
+    if (form) {
+      const btn = form.querySelector('button[type="submit"], input[type="submit"], input[type="image"], button:not([type])');
+      return { labels: btn ? [clip(labelOf(btn))] : [] };
+    }
+    const editable = tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+    if (!editable) return { labels: [] };
+    // Walk up a few levels; stop once a container is too broad to be "the
+    // composer" (lots of buttons = a whole toolbar or page section).
+    const labels = [];
+    let node = el;
+    for (let up = 0; up < 4 && node; up++) {
+      node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+      if (!node || !node.querySelectorAll) break;
+      const buttons = node.querySelectorAll('button, [role="button"], input[type="submit"]');
+      if (buttons.length > 12) break;
+      for (const b of buttons) labels.push(clip(labelOf(b)));
+    }
+    return { labels: [...new Set(labels.filter(Boolean))].slice(0, 12) };
   }
 
   function fieldState(i) {
@@ -690,7 +736,7 @@
     v: VERSION,
     collect, rect, scrollTo, hitIs, hitTest, hitTestTop, match, labelAt: (i) => (elAt(i) ? labelOf(elAt(i)).slice(0, 80) : null),
     pageText, findText, scrollToFind, waitCheck,
-    focusSelect, fieldState, selectOption, markFileInput, unmarkFileInput,
+    focusSelect, fieldState, enterTarget, selectOption, markFileInput, unmarkFileInput,
     snapshot, watchMutations, mutationCount,
     broadcast, frameInfo,
     perfCollect, perfRecStart, perfRecStop,

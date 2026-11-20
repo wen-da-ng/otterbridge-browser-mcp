@@ -345,7 +345,8 @@ and everything binds to **localhost only** — nothing is exposed to the network
   (hover the icon for "Full Auto is ON"). It is deliberately a
   browser-side switch: no MCP tool can change it, so a prompt-injected agent
   can't turn its own approvals off. Auto-approvals are still audit-logged.
-- **Destructive-action gate:** a `click` whose target text matches danger words
+- **Destructive-action gate:** a `click` (or an Enter that would trigger one —
+  see below) whose target text matches danger words
   (`buy/pay/delete/send/submit/checkout/confirm/transfer/…`) is hit-tested at
   dispatch and requires human approval via MCP elicitation. Works for every
   click — vision-mode, `read_elements`, raw coordinates, scripted, or inside an
@@ -379,9 +380,12 @@ and everything binds to **localhost only** — nothing is exposed to the network
   and the extension itself refuses a destructive-looking click, an OK on a
   destructive dialog, an upload or `evaluate_js` that arrives unmarked (unless
   Full Auto is on). Approval prompts still appear in your AI app, as before.
-- **Known gap:** pressing Enter in a form field (or typing into a field that
-  submits on its own) submits the form without an approval prompt — only
-  clicks, dialogs, uploads and `evaluate_js` are gated.
+- **Enter is gated too:** pressing Enter (or typing a line break) submits a
+  form just like its submit button, and chat boxes send on Enter. Before it,
+  OtterBridge checks what Enter would trigger — the form's submit button, the
+  focused button, or the buttons around a chat box — and asks you first when
+  that looks destructive ("Send", "Pay", "Submit order"…). Shift+Enter, the
+  newline key in chat boxes, isn't gated.
 - Servers bind to **localhost only**. Never expose them on the network.
 - **Bridge & endpoint are origin/host-locked** (defense against local-page
   attacks): the `ws://localhost:8765–8774` bridge only accepts the extension

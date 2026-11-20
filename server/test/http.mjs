@@ -40,6 +40,9 @@ const ELEMENTS = [
   { index: 4, tag: "button", text: "Weird", x: 50, y: 50 },  // refused with the SAME text
 ];
 const clicks = [];          // params of every click command
+let enterLabels = [];       // what the page says Enter would trigger
+const enterProbes = [];     // params of every enter_target call
+const keyParams = [];       // params of press_key / type_text / fill_element
 let evalParams = null;
 let dialog = { open: false };
 let approvalMode = "ask"; // the extension popup's Full Auto switch
@@ -74,10 +77,11 @@ function handleExtension(action, p) {
       const verb = p.button === "right" ? "Right-clicked" : p.double ? "Double-clicked" : "Clicked";
       return `${verb} at (${el ? el.x : p.x}, ${el ? el.y : p.y})`;
     }
-    case "type_text": return `Typed ${(p.text || "").length} chars`;
-    case "press_key": return `Pressed ${p.key}`;
+    case "enter_target": enterProbes.push(p); return { labels: enterLabels };
+    case "type_text": keyParams.push(p); return `Typed ${(p.text || "").length} chars`;
+    case "press_key": keyParams.push(p); return `Pressed ${p.key}`;
     case "scroll": return "Scrolled";
-    case "fill_element": return `Filled element ${p.index} with ${(p.text || "").length} chars`;
+    case "fill_element": keyParams.push(p); return `Filled element ${p.index} with ${(p.text || "").length} chars`;
     case "upload_file": return p.dryRun ? { ok: true, url: "https://upload.example/form", multiple: false } : "Attached 1 file(s) to the file input.";
     case "dialog_info": return dialog;
     case "handle_dialog": dialog = { open: false }; return `${p.accept ? "Accepted" : "Dismissed"} the dialog.`;
@@ -173,6 +177,13 @@ async function main() {
     await client.callTool({ name: "evaluate_js", arguments: { code: "1+1" } });
     ok("approved evaluate_js carries gated: true", evalParams?.gated === true, JSON.stringify(evalParams));
 
+    // Enter that would trigger something destructive: asked, then marked gated.
+    enterLabels = ["Send"];
+    keyParams.length = 0;
+    const enterOk = await client.callTool({ name: "press_key", arguments: { key: "Enter" } });
+    ok("Enter that would 'Send' + approval -> pressed, marked gated", firstText(enterOk).startsWith("Pressed Enter") && keyParams[0]?.gated === true, `${firstText(enterOk)} ${JSON.stringify(keyParams[0])}`);
+    enterLabels = [];
+
     const typed = await client.callTool({ name: "type_text", arguments: { text: "hello" } });
     ok("type_text", firstText(typed) === "Typed 5 chars");
 
@@ -209,6 +220,27 @@ async function main() {
     await sleep(100);
     const log = await readFile(join(process.cwd(), "agent_actions.log"), "utf-8").catch(() => "");
     ok("audit log redacts typed text", log.includes('"text":"[14 chars]"') && !log.includes("s3cret-PW-4711"));
+
+    // Enter submits forms and sends chat messages: gated like a click.
+    enterLabels = ["Send"];
+    const enterNo = await noElicit.callTool({ name: "press_key", arguments: { key: "Enter" } });
+    ok("Enter that would 'Send', no approval -> DENIED", firstText(enterNo) === "Action denied by user: Enter would trigger 'Send'.", `got "${firstText(enterNo)}"`);
+    const ctrlEnter = await noElicit.callTool({ name: "press_key", arguments: { key: "Control+Enter" } });
+    ok("Control+Enter is gated too", firstText(ctrlEnter).startsWith("Action denied by user"), `got "${firstText(ctrlEnter)}"`);
+    enterProbes.length = 0;
+    const shiftEnter = await noElicit.callTool({ name: "press_key", arguments: { key: "Shift+Enter" } });
+    ok("Shift+Enter (newline in chat boxes) isn't gated", firstText(shiftEnter) === "Pressed Shift+Enter" && enterProbes.length === 0, `got "${firstText(shiftEnter)}"`);
+    const letter = await noElicit.callTool({ name: "press_key", arguments: { key: "a" } });
+    ok("other keys aren't probed or gated", firstText(letter) === "Pressed a" && enterProbes.length === 0);
+    const typedNl = await noElicit.callTool({ name: "type_text", arguments: { text: "hello\n" } });
+    ok("type_text with a line break is gated like Enter", firstText(typedNl).startsWith("Action denied by user: Enter"), `got "${firstText(typedNl)}"`);
+    const fillNl = await noElicit.callTool({ name: "fill_element", arguments: { index: 0, text: "a\nb" } });
+    ok("fill_element with a line break asks about THAT field's Enter", firstText(fillNl).startsWith("Action denied by user: Enter") && enterProbes.at(-1)?.index === 0, `got "${firstText(fillNl)}" ${JSON.stringify(enterProbes.at(-1))}`);
+    enterLabels = ["Search"];
+    keyParams.length = 0;
+    const search = await noElicit.callTool({ name: "press_key", arguments: { key: "Enter" } });
+    ok("Enter that would 'Search' -> pressed without asking, not marked gated", firstText(search) === "Pressed Enter" && !("gated" in (keyParams[0] || {})), `got "${firstText(search)}"`);
+    enterLabels = [];
 
     // Right-click only opens a context menu: never gated, even on a danger word.
     const rc = await noElicit.callTool({ name: "click_element", arguments: { index: 1, button: "right" } });

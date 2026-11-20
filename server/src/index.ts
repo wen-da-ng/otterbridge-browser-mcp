@@ -52,6 +52,17 @@ const AUDIT_LOG = join(__dirname, "..", "agent_actions.log");
 const DANGER_RE =
   /\b(buy|purchase|pay|checkout|order|place\s+order|delete|remove|send|submit|confirm|transfer|withdraw|post|publish|unsubscribe)\b/i;
 
+// Enter (any combination but Shift+Enter alone — the newline key in chat
+// boxes) and typed line breaks can submit a form: see enterGate.
+// Must match isEnterCombo / hasNewline in extension/background.js.
+function isEnterCombo(combo: string): boolean {
+  const parts = String(combo).split("+");
+  const main = (parts.pop() ?? "").toLowerCase();
+  const mods = parts.map((m) => m.toLowerCase());
+  return (main === "enter" || main === "return") && !(mods.length === 1 && mods[0] === "shift");
+}
+const HAS_NEWLINE = /[\r\n]/;
+
 // Gate behavior, tunable via env. Both a human-readable form and a boolean-ish
 // form are accepted, so the same server works from a shell (elicit/off,
 // deny/allow) and from the .mcpb manifest, where user_config booleans
@@ -101,7 +112,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.9.1";
+const SERVER_VERSION = "0.9.2";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -1696,6 +1707,29 @@ function buildServer(stdio = false): McpServer {
     return "Click aborted: the target element kept changing under the pointer. Re-read elements and retry.";
   };
 
+  // Enter submits a form exactly like clicking its submit button, and chat
+  // boxes send on Enter. Before an Enter (press_key, or a line break typed by
+  // type_text / fill_element), ask the extension what it would trigger — the
+  // form's submit button, the focused button, or the buttons around a chat box
+  // — and gate it like a click when that looks destructive. Shift+Enter alone
+  // isn't gated: in chat boxes it's the newline key.
+  // Returns params to send (gated when approved) or the denial text.
+  const enterGate = async (tab: number | undefined, index?: number): Promise<{ gated?: true } | string> => {
+    let labels: string[] = [];
+    try {
+      labels = (await act("enter_target", tab, { index }))?.labels ?? [];
+    } catch (e) {
+      await audit("enter_target", { index }, `failed (${(e as Error).message}); proceeding`);
+    }
+    const hit = labels.find((l) => DANGER_RE.test(l));
+    if (!hit) return {};
+    const label = hit.trim().slice(0, 60);
+    if (!(await approved(server, profileOfTab(tab) ?? null, `Approve pressing Enter? It would trigger '${label}', which looks destructive.`))) {
+      return `Action denied by user: Enter would trigger '${label}'.`;
+    }
+    return { gated: true };
+  };
+
   // Answer a JS dialog. Saying OK to a confirm that reads destructive ("Delete
   // 3 files?", "Send payment?") is the same commitment as clicking a "Delete"
   // button, so it goes through the same gate.
@@ -1894,7 +1928,10 @@ function buildServer(stdio = false): McpServer {
       },
     },
     async ({ index, text: t, tab }) =>
-      text(await act("fill_element", tab, { index, text: t })),
+      text(await (async () => {
+        const g = HAS_NEWLINE.test(t) ? await enterGate(tab, index) : {};
+        return typeof g === "string" ? g : act("fill_element", tab, { index, text: t, ...g });
+      })()),
   );
 
   tool(
@@ -2035,7 +2072,10 @@ function buildServer(stdio = false): McpServer {
         "right field first.",
       inputSchema: { text: z.string(), ...TAB },
     },
-    async ({ text: t, tab }) => text(await act("type_text", tab, { text: t })),
+    async ({ text: t, tab }) => {
+      const g = HAS_NEWLINE.test(t) ? await enterGate(tab) : {};
+      return text(typeof g === "string" ? g : await act("type_text", tab, { text: t, ...g }));
+    },
   );
 
   tool(
@@ -2048,7 +2088,10 @@ function buildServer(stdio = false): McpServer {
         "'Control+Enter', 'Control+Shift+P', 'Meta+K'.",
       inputSchema: { key: z.string(), ...TAB },
     },
-    async ({ key, tab }) => text(await act("press_key", tab, { key })),
+    async ({ key, tab }) => {
+      const g = isEnterCombo(key) ? await enterGate(tab) : {};
+      return text(typeof g === "string" ? g : await act("press_key", tab, { key, ...g }));
+    },
   );
 
   tool(
@@ -2449,9 +2492,11 @@ function buildServer(stdio = false): McpServer {
                 out = r;
               } else if (st.action === "fill") {
                 if (st.text == null) throw new Error("fill needs 'text'.");
+                const g = HAS_NEWLINE.test(st.text) ? await enterGate(tab, el.index) : {};
+                if (typeof g === "string") throw new Error(g);
                 out = await ap(
                   "fill_element",
-                  { index: el.index, text: st.text, fast: speed },
+                  { index: el.index, text: st.text, fast: speed, ...g },
                 );
               } else {
                 if (st.value == null && st.label == null) {
@@ -2466,12 +2511,16 @@ function buildServer(stdio = false): McpServer {
             }
             case "type_text": {
               if (st.text == null) throw new Error("type_text needs 'text'.");
-              out = await ap("type_text", { text: st.text, fast: speed });
+              const g = HAS_NEWLINE.test(st.text) ? await enterGate(tab) : {};
+              if (typeof g === "string") throw new Error(g);
+              out = await ap("type_text", { text: st.text, fast: speed, ...g });
               break;
             }
             case "press_key": {
               if (!st.key) throw new Error("press_key needs 'key'.");
-              out = await ap("press_key", { key: st.key });
+              const g = isEnterCombo(st.key) ? await enterGate(tab) : {};
+              if (typeof g === "string") throw new Error(g);
+              out = await ap("press_key", { key: st.key, ...g });
               break;
             }
             case "scroll": {

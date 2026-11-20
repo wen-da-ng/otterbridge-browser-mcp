@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.2 — 2026-11-21
+
+### Fixed
+
+- **Enter no longer bypasses the approval gate.** Pressing Enter in a form
+  field submits the form just like clicking its submit button, and chat boxes
+  send on Enter — until now without an approval prompt. Before `press_key`
+  Enter (any combination except Shift+Enter, the newline key in chat boxes),
+  and before `type_text` / `fill_element` text containing a line break,
+  OtterBridge now checks what Enter would trigger: the field's form's submit
+  button, the focused button or link, or — for a text box outside any form —
+  the buttons around it (e.g. "Send"). When that looks destructive it asks you
+  first, exactly like a click; `run_script` steps included. The extension
+  refuses an Enter that would trigger something destructive without your
+  approval, as it does for clicks.
+
 ## 0.9.1 — 2026-11-20
 
 ### Fixed
