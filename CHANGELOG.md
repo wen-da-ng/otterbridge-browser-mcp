@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.13.0 — 2026-11-22
+
+### Added
+
+- **Actions say what changed, as data.** `click`, `click_element`,
+  `select_option`, `hover`, `press_key`, `navigate`, `go_back`,
+  `go_forward` and `reload` declare an output schema and return
+  `structuredContent: { message, changed }`. `changed.navigated` is always
+  there; `url`, `title`, `same_url`, `new_tabs` (`{ tab, url, popup }`),
+  `dialog` (`{ type, message }`; `type: "unknown"` when the page froze on a
+  dialog Chrome didn't report), `downloads`, `page_changed` and
+  `tab_closed` appear when they apply. A report line the server doesn't
+  recognise is kept in `changed.other`. The text result is unchanged, byte for
+  byte, and failures stay plain errors with no typed content.
+
+### Changed
+
+- The server instructions' script paragraph is shorter and matches what
+  Claude Code's Code Mode hands a script: results arrive as JSON text to
+  parse, and actions return `{ message, changed }`.
+- A stale `click_element` index and `select_option` / `hover` called
+  without what they need now return errors directly (they were already
+  flagged as errors; same text).
+
+### Notes
+
+- Parsed on the server from the report the extension already writes, so every
+  extension version works and no extension reload is needed.
+
 ## 0.12.1 — 2026-11-22
 
 ### Fixed

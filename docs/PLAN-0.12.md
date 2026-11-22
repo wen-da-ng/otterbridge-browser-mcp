@@ -44,6 +44,15 @@ Claude Code's docs don't say how a tool result appears inside script code. Find 
 
 Write the findings into this file under F.0 before continuing. If `isError` neither throws nor is visible to code, F.1 still ships (it's correct MCP and helps every client), but F.4's guidance changes from "errors throw" to "check `isError`".
 
+**Findings (22 Nov 2026, Claude Code 2.1.330 with Code Mode on, against 0.12.1, one run each):**
+
+- **`isError` throws** inside the script (an `Error` whose message is the tool's text), so a script stops at the first failure — F.4's "errors throw" guidance stands.
+- **The script receives `structuredContent` as a JSON string** when the tool returns it, otherwise the text block — never the raw result object. Proof: `list_tabs` came back as `{"tabs":[…]}` though its text is a bare array. Scripts `JSON.parse`; the README sketch was corrected (it read `.structuredContent`).
+- **No double tokens:** the model is sent only the text block (one `read_page` of 20k chars ≈ 7k tokens) — F.2 stays on all 12 tools.
+- **Screenshots reach Claude:** an image block plus a text note with the saved file's path, shown with the script's result.
+- **Declined approval inside a script:** the prompt appears mid-script (the script waits), the decline throws with the full don't-retry hint, nothing is clicked.
+- Still open: in a fresh session, does the model stop after a decline, or retry?
+
 ---
 
 ## F.1 Failures are errors

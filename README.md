@@ -304,12 +304,23 @@ and return only the answer. OtterBridge's tools are built to be called that way:
 - **Failures are errors.** A declined approval, a click that was aborted (an
   overlay in the way) or refused, an element that isn't there, a missing
   argument — all come back as `isError` results, so a script stops instead of
-  carrying on. A denial also says not to retry it.
+  carrying on (in Claude Code's Code Mode the call throws). A denial also says
+  not to retry it.
 - **Typed results.** The reading tools (`read_page`, `read_elements`,
   `find_text`, `wait_for`, `read_console`, `read_network`, `get_network_body`,
   `list_tabs`, `get_user_tab`, `list_profiles`) and the replays (`run_script`,
-  `run_flow`) declare an output schema and return `structuredContent`, so
-  script code gets objects instead of parsing text. The text is unchanged.
+  `run_flow`) declare an output schema and return `structuredContent` (lists
+  wrapped as `{ elements }` / `{ tabs }`). How a script sees it depends on
+  the client: Claude Code's Code Mode hands the script the structured result
+  **as a JSON string** — `JSON.parse` it — while a client that passes the raw
+  MCP result exposes it as `.structuredContent`. The text is unchanged.
+- **Actions say what changed, as data.** `click`, `click_element`,
+  `select_option`, `hover`, `press_key`, `navigate`, `go_back`,
+  `go_forward` and `reload` also return `{ message, changed }`, where
+  `changed` has `navigated` (always), `url`, `title`, `same_url`,
+  `new_tabs`, `dialog`, `downloads`, `page_changed` and `tab_closed`
+  when they apply — so a script can branch on "did that open a dialog?"
+  without reading prose.
 - **Elements by description.** `click_element`, `fill_element`,
   `select_option`, `hover` and `screenshot` take `target: { selector?, text?,
   tag?, nth? }` instead of an index and wait for the element to appear — one
@@ -321,16 +332,18 @@ and return only the answer. OtterBridge's tools are built to be called that way:
   is what still checks every click.)
 
 The pattern that works: **explore interactively first, then script the
-repetitive part**, passing `tab` on every call. A sketch (how a client exposes
-tools to code varies):
+repetitive part**, passing `tab` on every call. A sketch for Claude Code's
+Code Mode, where each call returns its result as JSON text (tool names are
+shortened here; other clients expose tools to code differently):
 
 ```js
 const titles = [];
 for (let page = 1; page <= 3; page++) {
-  const { elements } = (await read_elements({ query: "pricing", tab })).structuredContent;
+  const { elements } = JSON.parse(await read_elements({ query: "pricing", tab }));
   titles.push(...elements.map((e) => e.text));
   if (page < 3) {
-    await click_element({ target: { text: "Next" }, tab });
+    const { changed } = JSON.parse(await click_element({ target: { text: "Next" }, tab }));
+    if (changed.dialog) break;                 // a dialog needs a look first
     await wait_for({ selector: ".results", tab });
   }
 }

@@ -117,7 +117,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.12.1";
+const SERVER_VERSION = "0.13.0";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -1014,6 +1014,17 @@ const OUT = {
   list_profiles: loose({ session_profile: os, profiles: listOf({ id: os, name: os, email: os, browser: os, in_use_by_this_session: ob }) }),
   run_script: REPLAY_OUT,
   run_flow: REPLAY_OUT.extend({ flow: os }),
+  action: loose({
+    message: os,
+    changed: loose({
+      navigated: ob, same_url: ob, url: os, title: os,
+      new_tabs: listOf({ tab: on, url: os, popup: ob }),
+      dialog: loose({ type: os, message: os }).nullish(),
+      downloads: z.array(z.string()).nullish(),
+      page_changed: ob, tab_closed: ob,
+      other: z.array(z.string()).nullish(),
+    }).nullish(),
+  }),
 };
 
 // ===== Failures are errors =====
@@ -1034,6 +1045,102 @@ const DENIED_HINT =
 // The gate's own outcomes as runSteps sees them (strings from gatedClick /
 // answerDialog): a step that ends in one of these failed.
 const STEP_REFUSED_RE = /^(Action denied|Click aborted|Click refused)/;
+
+// ===== What an action changed =====
+// The extension describes an action's effect in "→ …" lines (afterReport and
+// dialogNote in extension/background.js), and the navigation tools in their
+// first line. parseChanges turns that prose into an object a script can branch
+// on (did it navigate, open a tab or a dialog, start a download?). The text
+// itself is never changed. The strings are a contract: change both sides
+// together. An "→" line this parser doesn't know is kept in `other`, never
+// dropped. Parsing on the server keeps every extension version working.
+type Changes = {
+  navigated: boolean;
+  same_url?: boolean;
+  url?: string;
+  title?: string;
+  new_tabs?: { tab: number; url?: string; popup: boolean }[];
+  dialog?: { type: string; message?: string }; // type "unknown": a page frozen by a dialog Chrome didn't report
+  downloads?: string[];
+  page_changed?: boolean;
+  tab_closed?: boolean;
+  other?: string[];
+};
+const CHANGE_RE = {
+  // dialogNote(d, true); the message may span lines, so it is matched first
+  // over the whole text and cut out before the line-by-line pass. Not
+  // anchored: after a 'target' click it follows the "Matched […]. " prefix.
+  dialog: /→ The action opened a JavaScript (\w+) dialog: "([\s\S]*?)"\. The page is paused until it's answered — call handle_dialog\([^)]*\)\./,
+  // raceDialog's watchdog: "→ " + FROZEN_NOTE (a dialog Chrome didn't report).
+  frozen: /→ The page stopped responding — most likely a JavaScript dialog \(alert \/ confirm \/ prompt\) is open, which pauses the page\. Answer it with handle_dialog\(accept=true\|false\) \(its text couldn't be read\)\./,
+  // a note right after pickElement's "Matched [i] "label". " prefix
+  afterMatch: /^Matched \[\d+\] .*?\. (→ .*)$/,
+  navigated: /^→ Navigated to (\S+)(?: \("(.*)"\))?$/,
+  sameUrl: /^→ A new page loaded at the same URL \(form submitted or page reloaded\)(?:: "(.*)")?\.$/,
+  title: /^→ The page title is now "(.*)"\.$/,
+  opened: /^→ Opened (a popup window|a new tab) \(tab (\d+)(?:: (.*))?\) — use_tab \d+ to work in it\.$/,
+  download: /^→ A download started: (.*) \(wait_for_download to get the file\)\.$/,
+  updated: /^→ The page updated\.$/,
+  unchanged: /^→ No visible change on the page\.$/,
+  closed: /^→ The tab was closed\.$/,
+  // the first line of navigate / go_back / go_forward / reload (perform())
+  navFirst: /^(?:Navigated to|Went back to|Went forward to) (\S+)$/,
+  reloaded: /^(?:Hard-reloaded \(cache bypassed\)|Reloaded)$/,
+};
+const parseChanges = (s: string): Changes => {
+  const c: Changes = { navigated: false };
+  const d = CHANGE_RE.dialog.exec(s);
+  if (d) {
+    c.dialog = { type: d[1], message: d[2] };
+    s = s.slice(0, d.index) + s.slice(d.index + d[0].length);
+  }
+  const f = CHANGE_RE.frozen.exec(s);
+  if (f) {
+    c.dialog ??= { type: "unknown" };
+    s = s.slice(0, f.index) + s.slice(f.index + f[0].length);
+  }
+  for (let line of s.split("\n")) {
+    let m: RegExpExecArray | null;
+    if ((m = CHANGE_RE.afterMatch.exec(line))) line = m[1];
+    if ((m = CHANGE_RE.navFirst.exec(line))) {
+      c.navigated = true;
+      c.url = m[1];
+    } else if (CHANGE_RE.reloaded.test(line)) {
+      c.navigated = true;
+      c.same_url = true;
+    } else if (!line.startsWith("→ ")) {
+      continue; // the action's own message
+    } else if ((m = CHANGE_RE.navigated.exec(line))) {
+      c.navigated = true;
+      c.url = m[1];
+      if (m[2] != null) c.title = m[2];
+    } else if ((m = CHANGE_RE.sameUrl.exec(line))) {
+      c.navigated = true;
+      c.same_url = true;
+      if (m[1] != null) c.title = m[1];
+    } else if ((m = CHANGE_RE.title.exec(line))) {
+      c.title = m[1];
+    } else if ((m = CHANGE_RE.opened.exec(line))) {
+      (c.new_tabs ??= []).push({ tab: Number(m[2]), ...(m[3] ? { url: m[3] } : {}), popup: m[1] === "a popup window" });
+    } else if ((m = CHANGE_RE.download.exec(line))) {
+      (c.downloads ??= []).push(m[1]);
+    } else if (CHANGE_RE.updated.test(line)) {
+      c.page_changed = true;
+    } else if (CHANGE_RE.unchanged.test(line)) {
+      c.page_changed = false;
+    } else if (CHANGE_RE.closed.test(line)) {
+      c.tab_closed = true;
+    } else {
+      (c.other ??= []).push(line);
+    }
+  }
+  return c;
+};
+// An action's result: the text as before, plus { message, changed } as
+// structuredContent. A known failure stays plain text, so withFailures flags
+// it isError and the SDK doesn't ask it for typed content.
+const report = (s: string) =>
+  SOFT_FAIL_RE.test(s) ? text(s) : { ...text(s), structuredContent: { message: s, changed: parseChanges(s) } };
 
 type ToolResult = { content?: { type: string; text?: string }[]; isError?: boolean };
 const withFailures =
@@ -1357,12 +1464,10 @@ function buildServer(stdio = false): McpServer {
         "popup) and replay it with run_flow. Debug web apps with read_console, read_network, " +
         "get_network_body and evaluate_js; measure them with perf_audit (page " +
         "load), perf_record (an interaction), css_coverage and throttle.\n\n" +
-        "In a script that calls these tools (e.g. Claude Code's Code Mode): " +
-        "explore a page interactively first, then script the repetitive part. " +
-        "Find elements with 'target' rather than indices, pass 'tab' on every " +
-        "call, stop at the first error, and return only what you need — not " +
-        "whole pages. Reading tools also return typed results " +
-        "(structuredContent).\n\n" +
+        "In a script (e.g. Claude Code's Code Mode): explore first, then script " +
+        "the repetitive part; use 'target', pass 'tab' on every call, return only " +
+        "what you need. Results reach a script as JSON text: parse it. Actions " +
+        "return { message, changed } (navigated, url, new_tabs, dialog, downloads).\n\n" +
         "Clicks on controls like buy, pay, delete, send or submit, and " +
         "evaluate_js, ask the user for approval unless they switched on Full " +
         "Auto in the extension. If the user denies one, stop and ask them — " +
@@ -2025,8 +2130,9 @@ function buildServer(stdio = false): McpServer {
         "wait for the page to load. Works for any website, including ones the " +
         "user is signed in to.",
       inputSchema: { url: z.string(), ...TAB },
+      outputSchema: OUT.action,
     },
-    async ({ url, tab }) => text(await act("navigate", tab, { url })),
+    async ({ url, tab }) => report(await act("navigate", tab, { url })),
   );
 
   tool(
@@ -2034,8 +2140,9 @@ function buildServer(stdio = false): McpServer {
     {
       description: "Go back one page in a Chrome tab's history, like the browser's Back button.",
       inputSchema: { ...TAB },
+      outputSchema: OUT.action,
     },
-    async ({ tab }) => text(await act("go_back", tab)),
+    async ({ tab }) => report(await act("go_back", tab)),
   );
 
   tool(
@@ -2043,8 +2150,9 @@ function buildServer(stdio = false): McpServer {
     {
       description: "Go forward one page in a Chrome tab's history, like the browser's Forward button.",
       inputSchema: { ...TAB },
+      outputSchema: OUT.action,
     },
-    async ({ tab }) => text(await act("go_forward", tab)),
+    async ({ tab }) => report(await act("go_forward", tab)),
   );
 
   tool(
@@ -2055,8 +2163,9 @@ function buildServer(stdio = false): McpServer {
         hard: z.boolean().optional().describe("Bypass the cache (like Ctrl+Shift+R)."),
         ...TAB,
       },
+      outputSchema: OUT.action,
     },
-    async ({ hard, tab }) => text(await act("reload", tab, { hard })),
+    async ({ hard, tab }) => report(await act("reload", tab, { hard })),
   );
 
   tool(
@@ -2129,6 +2238,7 @@ function buildServer(stdio = false): McpServer {
         "Destructive targets (buy, pay, delete, send, submit, ...) require " +
         "human approval before a left click.",
       inputSchema: { x: z.number().int(), y: z.number().int(), ...BUTTON, ...TAB },
+      outputSchema: OUT.action,
     },
     async ({ x, y, button, double, tab }) => {
       // Hit-test the actual element at (x, y) so the gate works for every
@@ -2140,7 +2250,7 @@ function buildServer(stdio = false): McpServer {
       } catch (e) {
         await audit("hit_test", { x, y }, `failed (${(e as Error).message}); proceeding`);
       }
-      return text(await gatedClick(tab, { x, y }, targetText, { button, double }));
+      return report(await gatedClick(tab, { x, y }, targetText, { button, double }));
     },
   );
 
@@ -2164,6 +2274,7 @@ function buildServer(stdio = false): McpServer {
         ...BUTTON,
         ...TAB,
       },
+      outputSchema: OUT.action,
     },
     async ({ index, target, timeout_ms, button, double, tab }) => {
       const p = await pickElement(tab, index, target, timeout_ms);
@@ -2172,7 +2283,7 @@ function buildServer(stdio = false): McpServer {
       if (target == null) {
         const info = await act("locate_element", tab, { index: p.index });
         if (!info || !info.found) {
-          return text(
+          return fail(
             `No interactive element with index ${p.index}. ` +
               `Call read_elements to refresh the list first.`,
           );
@@ -2183,7 +2294,7 @@ function buildServer(stdio = false): McpServer {
       // the live position right before pressing (immune to reflow during the
       // cursor animation) and re-gates via `expectText` if it changed. A
       // target-found element goes through exactly the same gate.
-      return text(noteMatch(p, await gatedClick(tab, { index: p.index }, label ?? "", { button, double })));
+      return report(noteMatch(p, await gatedClick(tab, { index: p.index }, label ?? "", { button, double })));
     },
   );
 
@@ -2226,14 +2337,15 @@ function buildServer(stdio = false): McpServer {
         ...TARGET,
         ...TAB,
       },
+      outputSchema: OUT.action,
     },
     async ({ index, value, label, target, timeout_ms, tab }) => {
       if (value == null && label == null) {
-        return text("Provide 'value' or 'label' to pick an option.");
+        return fail("Provide 'value' or 'label' to pick an option.");
       }
       const p = await pickElement(tab, index, target, timeout_ms);
       if ("error" in p) return fail(p.error);
-      return text(noteMatch(p, await act("select_option", tab, { index: p.index, value, label })));
+      return report(noteMatch(p, await act("select_option", tab, { index: p.index, value, label })));
     },
   );
 
@@ -2251,17 +2363,18 @@ function buildServer(stdio = false): McpServer {
         ...TARGET,
         ...TAB,
       },
+      outputSchema: OUT.action,
     },
     async ({ index, x, y, target, timeout_ms, tab }) => {
       if (target != null || index != null) {
         const p = await pickElement(tab, index, target, timeout_ms);
         if ("error" in p) return fail(p.error);
-        return text(noteMatch(p, await act("hover", tab, { index: p.index })));
+        return report(noteMatch(p, await act("hover", tab, { index: p.index })));
       }
       if (x == null || y == null) {
-        return text("Provide 'index', 'target', or both 'x' and 'y'.");
+        return fail("Provide 'index', 'target', or both 'x' and 'y'.");
       }
-      return text(await act("hover", tab, { x, y }));
+      return report(await act("hover", tab, { x, y }));
     },
   );
 
@@ -2375,10 +2488,11 @@ function buildServer(stdio = false): McpServer {
         "'a', or a combination joined with '+': 'Control+A', 'Shift+Tab', " +
         "'Control+Enter', 'Control+Shift+P', 'Meta+K'.",
       inputSchema: { key: z.string(), ...TAB },
+      outputSchema: OUT.action,
     },
     async ({ key, tab }) => {
       const g = isEnterCombo(key) ? await enterGate(tab) : {};
-      return text(typeof g === "string" ? g : await act("press_key", tab, { key, ...g }));
+      return report(typeof g === "string" ? g : await act("press_key", tab, { key, ...g }));
     },
   );
 

@@ -1625,6 +1625,7 @@ async function pageResponsive(tabId, ms = 1000) {
   return Promise.race([probe, sleep(ms).then(() => false)]);
 }
 
+// Also parsed by parseChanges in server/src/index.ts (as "→ " + this): change both together.
 const FROZEN_NOTE =
   "The page stopped responding — most likely a JavaScript dialog (alert / confirm / prompt) " +
   "is open, which pauses the page. Answer it with handle_dialog(accept=true|false) " +
@@ -1754,6 +1755,7 @@ async function hitTestAll(tabId, x, y) {
 }
 
 // ===== Dialog race + "what changed" report =====
+// The triggered form is parsed by parseChanges in server/src/index.ts: change both together.
 function dialogNote(d, triggered) {
   const what = `a JavaScript ${d.type} dialog: "${clip(d.message, 200)}"`;
   return (triggered ? `→ The action opened ${what}.` : `There is ${what}.`) +
@@ -1810,6 +1812,8 @@ async function beforeState(tab) {
 
 // Let the page settle (navigation finished, DOM quiet for ~200 ms, max
 // ~1.5 s), then describe the difference.
+// The → lines are parsed by parseChanges in server/src/index.ts (typed
+// "what changed" results): change both together.
 async function afterReport(tab, before) {
   const t0 = Date.now();
   let last = -2, quiet = 0, navigated = false;

@@ -29,10 +29,27 @@ const ELEMENTS = [
   { text: "Continue", tag: "button" },   // 4: covered by a cookie banner
   { text: "Archive", tag: "button" },    // 5: the extension refuses it as ungated
   { text: "", tag: "input", label: "Send to" }, // 6: an empty field whose <label> has a danger word
+  { text: "Show dialog", tag: "button" }, // 7: opens a JS dialog (dialogNote)
+  { text: "Freeze", tag: "button" },     // 8: a dialog Chrome didn't report (the watchdog's note)
 ];
 const ASK_TAB = 777; // a tab on an "always ask" site
 let nextTab = 100;
 const sent = []; // { action, p }
+
+// What the real extension appends after an action (afterReport / dialogNote),
+// keyed by the x of a click(x, y) — for the typed "what changed" results.
+const DIALOG = '→ The action opened a JavaScript confirm dialog: "Leave this page?\nChanges are lost". The page is paused until it\'s answered — call handle_dialog(accept=true|false).';
+const REPORTS = {
+  901: 'Clicked at (901, 1)\n→ Navigated to https://shop.example/b ("Shop (B)")',
+  902: 'Clicked at (902, 1)\n→ A new page loaded at the same URL (form submitted or page reloaded): "Thanks".',
+  903: 'Clicked at (903, 1)\n→ Opened a new tab (tab 321: https://pay.example/?a=(1)) — use_tab 321 to work in it.\n→ Opened a popup window (tab 322) — use_tab 322 to work in it.\n→ A download started: C:\\Users\\me\\Downloads\\invoice 7.pdf (wait_for_download to get the file).',
+  904: DIALOG,
+  905: 'Clicked at (905, 1)\n→ No visible change on the page.',
+  906: 'Clicked at (906, 1)\n→ The page updated.\n→ Something new this server has never seen.',
+  907: 'Clicked at (907, 1)\n→ The page title is now "Cart (2)".',
+  908: 'Clicked at (908, 1)\n→ The tab was closed.',
+};
+const FROZEN = "→ The page stopped responding — most likely a JavaScript dialog (alert / confirm / prompt) is open, which pauses the page. Answer it with handle_dialog(accept=true|false) (its text couldn't be read).";
 
 function ext(action, p) {
   sent.push({ action, p });
@@ -53,10 +70,16 @@ function ext(action, p) {
     case "click": {
       if (p.index === 4) return { changed: true, covered: true, actualText: "Accept cookies", x: 1, y: 1 };
       if (p.index === 5 && p.gated !== true) return { changed: true, ungated: true, actualText: "Archive", x: 1, y: 1 };
+      if (REPORTS[p.x]) return REPORTS[p.x];
+      if (p.index === 7) return DIALOG;
+      if (p.index === 8) return FROZEN;
       return "Clicked at (1, 1)";
     }
     case "navigate": return `Navigated to ${p.url}`;
     case "go_back": return "Cannot go back: no earlier history entry.";
+    case "go_forward": return "Went forward to https://shop.example/c";
+    case "reload": return p.hard ? "Hard-reloaded (cache bypassed)" : "Reloaded";
+    case "press_key": return `Pressed ${p.key}\n→ Navigated to https://shop.example/done`;
     case "read_page": return { url: "https://shop.example/", title: "Shop", text: "Welcome", total_chars: 7, extra: { nested: [1, 2] } };
     case "read_elements": {
       const all = ELEMENTS.map((e, i) => ({ index: i, ...e, x: 1, y: 1 }));
@@ -231,7 +254,7 @@ async function main() {
     // ===== Typed results: structuredContent + outputSchema =====
     const TYPED = ["read_page", "read_elements", "find_text", "wait_for", "read_console", "read_network", "get_network_body", "list_tabs", "get_user_tab", "list_profiles", "run_script", "run_flow"];
     ok("the typed tools declare an outputSchema", TYPED.every((n) => tools.find((t) => t.name === n)?.outputSchema?.type === "object"), J(TYPED.filter((n) => !tools.find((t) => t.name === n)?.outputSchema)));
-    ok("...and prose tools don't", ["navigate", "click_element", "page_snapshot", "screenshot"].every((n) => !tools.find((t) => t.name === n)?.outputSchema));
+    ok("...and prose tools don't", ["page_snapshot", "screenshot", "fill_element", "type_text", "scroll", "drag"].every((n) => !tools.find((t) => t.name === n)?.outputSchema));
     ok("tools/list is still 44 tools", tools.length === 44, String(tools.length));
 
     // structured == the text's JSON, for the tools whose text is an object
@@ -264,6 +287,72 @@ async function main() {
     // a soft failure on a typed tool is an error, not a schema violation
     r = await call("wait_for", {});
     ok("wait_for with nothing to wait for -> isError (no schema error)", r.isError && firstText(r).startsWith("Provide 'text', 'selector' and/or 'url'"), firstText(r));
+
+    // ===== Actions: typed "what changed" (0.13.0) =====
+    const ACTIONS = ["click", "click_element", "select_option", "hover", "press_key", "navigate", "go_back", "go_forward", "reload"];
+    ok("the action tools declare an outputSchema", ACTIONS.every((n) => tools.find((t) => t.name === n)?.outputSchema?.type === "object"), J(ACTIONS.filter((n) => !tools.find((t) => t.name === n)?.outputSchema)));
+
+    const typedAction = async (name, args) => {
+      const r = await call(name, args);
+      return { r, t: firstText(r), sc: r.structuredContent, ch: r.structuredContent?.changed };
+    };
+    let a = await typedAction("click", { x: 901, y: 1 });
+    ok("click -> text byte-for-byte what the extension said", !a.r.isError && a.t === REPORTS[901], a.t);
+    ok("...message is the same text", a.sc?.message === a.t, J(a.sc));
+    ok("...navigated with url and title (parentheses in the title)", a.ch?.navigated === true && a.ch.url === "https://shop.example/b" && a.ch.title === "Shop (B)", J(a.ch));
+    a = await typedAction("click", { x: 902, y: 1 });
+    ok("form submitted at the same URL -> navigated, same_url, title", a.ch?.navigated === true && a.ch.same_url === true && a.ch.title === "Thanks", J(a.ch));
+    a = await typedAction("click", { x: 903, y: 1 });
+    ok("new tab + popup + download, all kept", J(a.ch?.new_tabs) === J([{ tab: 321, url: "https://pay.example/?a=(1)", popup: false }, { tab: 322, popup: true }]) && J(a.ch.downloads) === J(["C:\\Users\\me\\Downloads\\invoice 7.pdf"]) && a.ch.navigated === false, J(a.ch));
+    a = await typedAction("click", { x: 904, y: 1 });
+    ok("a dialog opened by the action (multi-line message)", !a.r.isError && a.ch?.dialog?.type === "confirm" && a.ch.dialog.message === "Leave this page?\nChanges are lost" && !a.ch.other, J(a.ch));
+    a = await typedAction("click", { x: 905, y: 1 });
+    ok("no visible change -> page_changed false, navigated false", a.ch?.page_changed === false && a.ch.navigated === false, J(a.ch));
+    a = await typedAction("click", { x: 906, y: 1 });
+    ok("page updated + an unknown line kept in 'other'", a.ch?.page_changed === true && J(a.ch.other) === J(["→ Something new this server has never seen."]), J(a.ch));
+    a = await typedAction("click", { x: 907, y: 1 });
+    ok("title changed without navigating", a.ch?.title === "Cart (2)" && a.ch.navigated === false, J(a.ch));
+    a = await typedAction("click", { x: 908, y: 1 });
+    ok("tab closed", a.ch?.tab_closed === true, J(a.ch));
+
+    a = await typedAction("click_element", { target: { text: "Show dialog" } });
+    ok("a dialog after a 'target' click (behind the Matched prefix) -> dialog", a.t === 'Matched [7] "Show dialog". ' + DIALOG && a.ch?.dialog?.type === "confirm" && !a.ch.other, J(a.ch));
+    a = await typedAction("click_element", { target: { text: "Freeze" } });
+    ok("the watchdog's frozen-page note after a 'target' click -> dialog type unknown", a.ch?.dialog?.type === "unknown" && a.ch.dialog.message === undefined && !a.ch.other, J(a.ch));
+    a = await typedAction("click_element", { index: 8 });
+    ok("...and without the prefix", a.ch?.dialog?.type === "unknown" && !a.ch.other, J(a.ch));
+    a = await typedAction("click_element", { target: { text: "Home" } });
+    ok("click_element by target -> typed, the match note kept in message", !a.r.isError && a.sc?.message.startsWith('Matched [0] "Home". Clicked') && a.ch?.navigated === false, J(a.sc));
+    a = await typedAction("navigate", { url: "https://shop.example/x" });
+    ok("navigate -> navigated + url", a.ch?.navigated === true && a.ch.url === "https://shop.example/x" && a.t === "Navigated to https://shop.example/x", J(a.sc));
+    a = await typedAction("go_forward", {});
+    ok("go_forward -> navigated + url", a.ch?.navigated === true && a.ch.url === "https://shop.example/c", J(a.sc));
+    a = await typedAction("reload", { hard: true });
+    ok("reload -> navigated, same_url", a.ch?.navigated === true && a.ch.same_url === true, J(a.sc));
+    a = await typedAction("press_key", { key: "Enter" });
+    ok("press_key -> typed (navigated)", !a.r.isError && a.ch?.navigated === true && a.ch.url === "https://shop.example/done", J(a.sc));
+    a = await typedAction("select_option", { index: 3, label: "M" });
+    ok("select_option -> typed", !a.r.isError && a.sc?.message === "Selected M" && a.ch?.navigated === false, J(a.sc));
+    a = await typedAction("hover", { x: 5, y: 5 });
+    ok("hover by coordinates -> typed", !a.r.isError && a.sc?.message === "Hovered", J(a.sc));
+
+    // errors stay errors, with no typed content (and no schema error)
+    answer = "decline";
+    a = await typedAction("click_element", { index: 1 });
+    answer = "accept";
+    ok("a declined click -> isError, no structuredContent", a.r.isError && a.sc === undefined && a.t.endsWith(HINT), J(a.r));
+    for (const [name, args, start] of [
+      ["click_element", { index: 4 }, "Click aborted"], ["click_element", { index: 5 }, "Click refused"],
+      ["click_element", { index: 99 }, "No interactive element"], ["go_back", {}, "Cannot go back"],
+      ["select_option", { index: 3 }, "Provide 'value'"], ["hover", {}, "Provide 'index'"],
+    ]) {
+      a = await typedAction(name, args);
+      ok(`${name} '${start}' -> isError, no structuredContent`, a.r.isError && a.sc === undefined && a.t.startsWith(start), J(a.r));
+    }
+
+    // the server instructions match what Claude Code hands a script
+    const instr = c.getInstructions() ?? "";
+    ok("instructions: results reach a script as JSON text; actions return { message, changed }", /Results reach a script as JSON text: parse it\./.test(instr) && /\{ message, changed \}/.test(instr) && !/Reading tools also return typed results/.test(instr), instr.slice(-900));
 
     // profile notes: an extra text block AND structured `notes`
     const e2 = await connectFakeExtension(WS_PORT, { onCommand: ext, hello: { id: "p2", name: "Second", email: "second@example.com", browser: "Chrome" } });
