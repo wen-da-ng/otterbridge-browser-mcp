@@ -2235,7 +2235,8 @@ async function perform(action, p, tab, fast) {
       if (!cands.length) return { found: false };
       const pick = cands[Math.min(p.nth || 0, cands.length - 1)];
       const e = list[pick];
-      return { found: true, index: pick, matches: cands.length, text: e.text, tag: e.tag, x: e.x, y: e.y };
+      // label: a form control's own <label> (for display; the gate checks text).
+      return { found: true, index: pick, matches: cands.length, text: e.text, label: e.label, tag: e.tag, x: e.x, y: e.y };
     }
 
     case "field_filled": {

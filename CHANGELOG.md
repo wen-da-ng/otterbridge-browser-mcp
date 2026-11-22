@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.12.1 — 2026-11-22
+
+### Fixed
+
+- **Form fields are found by their label.** A `target: { text: … }` (and a
+  `run_script` / `run_flow` text target) now also matches a field's own label
+  — a wrapping `<label>`, `<label for>`, `aria-label` or `aria-labelledby` — so
+  `fill_element({ target: { text: "Customer name" }, … })` finds the field
+  labelled that, even when it's empty or shows its value. Exact still beats
+  prefix beats substring.
+- `read_elements` entries and `page_snapshot` lines show that label
+  (`textbox "" label "Customer name:"`) when it says something the element's
+  own name doesn't — empty fields, radios and checkboxes named by their value.
+- A target's result names a field by its label (`Matched [0] "Customer
+  name:"`), not by its empty or typed-in content.
+
+### Notes
+
+- The name the approval gate checks is unchanged: a field labelled "Send to"
+  or "Order notes" doesn't make clicking into it a destructive click.
+- Reload the extension (chrome://extensions) — `page.js` changed.
+
 ## 0.12.0 — 2026-11-22
 
 Tools a script can rely on — for clients where the AI writes code that calls

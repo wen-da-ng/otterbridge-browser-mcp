@@ -28,6 +28,7 @@ const ELEMENTS = [
   { text: "Size", tag: "select" },       // 3
   { text: "Continue", tag: "button" },   // 4: covered by a cookie banner
   { text: "Archive", tag: "button" },    // 5: the extension refuses it as ungated
+  { text: "", tag: "input", label: "Send to" }, // 6: an empty field whose <label> has a danger word
 ];
 const ASK_TAB = 777; // a tab on an "always ask" site
 let nextTab = 100;
@@ -44,7 +45,7 @@ function ext(action, p) {
     case "locate_element": { const el = ELEMENTS[p.index]; return el ? { found: true, ...el, x: 1, y: 1 } : { found: false }; }
     case "resolve_element": {
       if (p.text === "Item") return { found: true, index: 0, matches: 3, text: "Item", tag: "li", x: 1, y: 1 };
-      const i = ELEMENTS.findIndex((e) => (p.text != null && e.text === p.text) || (p.selector != null && p.selector === `#el${ELEMENTS.indexOf(e)}`));
+      const i = ELEMENTS.findIndex((e) => (p.text != null && (e.text === p.text || e.label === p.text)) || (p.selector != null && p.selector === `#el${ELEMENTS.indexOf(e)}`));
       return i >= 0 ? { found: true, index: i, matches: 1, ...ELEMENTS[i], x: 1, y: 1 } : { found: false };
     }
     case "hit_test": return { text: "Home", tag: "a" };
@@ -220,6 +221,12 @@ async function main() {
 
     r = await call("click_element", { index: 0 });
     ok("click_element by index still works as before", !r.isError && firstText(r).startsWith("Clicked"), firstText(r));
+
+    // a field found by its <label>: reported by the label, gated by its own (empty) name
+    n0 = prompts.length;
+    r = await call("click_element", { target: { text: "Send to" } });
+    ok("a field found by its label is reported by the label", !r.isError && firstText(r).startsWith('Matched [6] "Send to". Clicked'), firstText(r));
+    ok("...and a danger word in a field's label doesn't make clicking into it ask", prompts.length === n0 && clicks(6).length === 1 && clicks(6)[0].p.expectText === "" && !clicks(6)[0].p.gated, J(clicks(6).map((s) => s.p)));
 
     // ===== Typed results: structuredContent + outputSchema =====
     const TYPED = ["read_page", "read_elements", "find_text", "wait_for", "read_console", "read_network", "get_network_body", "list_tabs", "get_user_tab", "list_profiles", "run_script", "run_flow"];

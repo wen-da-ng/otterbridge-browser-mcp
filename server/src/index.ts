@@ -117,7 +117,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.12.0";
+const SERVER_VERSION = "0.12.1";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -1001,7 +1001,7 @@ const REPLAY_OUT = loose({
 const OUT = {
   read_page: loose({ url: os, title: os, text: os, offset: on, total_chars: on, devicePixelRatio: on }),
   read_elements: loose({
-    elements: listOf({ index: on, tag: os, text: os, x: on, y: on, role: os, href: os, disabled: ob, checked: ob, expanded: ob, offscreen: ob }),
+    elements: listOf({ index: on, tag: os, text: os, label: os, x: on, y: on, role: os, href: os, disabled: ob, checked: ob, expanded: ob, offscreen: ob }),
     total: on, shown: on, note: os,
   }),
   find_text: loose({ count: on, matches: listOf({ nth: on, x: on, y: on, visible: ob, context: os, frame: os }) }),
@@ -1863,7 +1863,10 @@ function buildServer(stdio = false): McpServer {
     if (!el || !el.found) {
       return { error: `No element matches target ${JSON.stringify(target)} after waiting ${ms}ms.` };
     }
-    const label = String(el.text ?? "").trim().slice(0, 60);
+    // Say it the way the page does: a form field by its <label> (its own
+    // text is empty or what was typed in it). Display only — the gate gets
+    // el.text below.
+    const label = String(el.label || el.text || "").trim().slice(0, 60);
     const several = el.matches > 1 ? ` (${el.matches} matches, used nth=${Math.min(target.nth ?? 0, el.matches - 1)})` : "";
     return { index: el.index as number, text: el.text as string, matched: `Matched [${el.index}] "${label}"${several}. ` };
   };

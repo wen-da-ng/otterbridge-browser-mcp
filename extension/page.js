@@ -16,7 +16,7 @@
 //
 // Re-injection is cheap: a frame that already has this version returns early.
 (() => {
-  const VERSION = 9;
+  const VERSION = 10;
   if (window.__otter && window.__otter.v === VERSION) return;
 
   // What counts as interactive without looking at styles. ARIA menu/option
@@ -170,6 +170,12 @@
     else if (el.hasAttribute("aria-checked")) e.checked = el.getAttribute("aria-checked") === "true";
     if (el.hasAttribute("aria-expanded")) e.expanded = el.getAttribute("aria-expanded") === "true";
     if (el.tagName === "A" && el.href) e.href = el.href.slice(0, 200);
+    // The control's visible label, when it says something its name doesn't
+    // (an empty field, a radio named by its value).
+    if (isLabelledControl(el)) {
+      const lab = labelText(el);
+      if (lab && lab.toLowerCase() !== e.text.toLowerCase()) e.label = lab;
+    }
     if (!inViewport(r)) e.offscreen = true;
     return e;
   }
@@ -245,11 +251,23 @@
     if (tag) cands = cands.filter((i) => els[i].tagName.toLowerCase() === tag.toLowerCase());
     if (text != null && text !== "") {
       const q = text.trim().toLowerCase();
-      const lab = new Map(cands.map((i) => [i, labelOf(els[i]).toLowerCase()]));
+      // Each element's names: what it shows (labelOf) and, for a form
+      // control, its <label> — so "Customer name" finds the field labelled
+      // that, even when the field itself is empty or shows its value.
+      const names = new Map(cands.map((i) => {
+        const el = els[i];
+        const n = [labelOf(el).toLowerCase()];
+        if (isLabelledControl(el)) {
+          const lab = labelText(el).toLowerCase();
+          if (lab) n.push(lab);
+        }
+        return [i, n];
+      }));
+      const any = (i, test) => names.get(i).some(test);
       // Exact beats prefix beats substring — 'Log' finds 'Log', not 'Log out'.
-      let hits = cands.filter((i) => lab.get(i) === q);
-      if (!hits.length) hits = cands.filter((i) => lab.get(i).startsWith(q));
-      if (!hits.length) hits = cands.filter((i) => lab.get(i).includes(q));
+      let hits = cands.filter((i) => any(i, (s) => s === q));
+      if (!hits.length) hits = cands.filter((i) => any(i, (s) => s.startsWith(q)));
+      if (!hits.length) hits = cands.filter((i) => any(i, (s) => s.includes(q)));
       cands = hits;
     }
     return { matches: cands };
@@ -268,8 +286,14 @@
     return !!el.isContentEditable;
   }
 
-  function fieldLabel(el) {
-    const tidy = (s) => String(s || "").trim().replace(/\s+/g, " ");
+  // A form control's own label as a person sees it — aria-label,
+  // aria-labelledby, or its <label> (wrapping or for=) — with no fallbacks.
+  // Shown next to the control and matched by text targets, but never used as
+  // its name (labelOf): the approval gate checks that name, and a text field
+  // labelled "Send to" or "Order notes" must not turn a click into it into a
+  // "destructive" one.
+  const tidy = (s) => String(s || "").trim().replace(/\s+/g, " ");
+  function labelText(el) {
     let t = tidy(el.getAttribute("aria-label"));
     const ids = el.getAttribute("aria-labelledby");
     if (!t && ids) {
@@ -292,7 +316,17 @@
       }
       t = tidy(s);
     }
-    if (!t) t = tidy(el.placeholder) || tidy(el.title) || tidy(el.getAttribute("name")) || tidy(el.id);
+    return t.slice(0, 80);
+  }
+  // Form controls that carry a label: text fields, dropdowns, checkboxes and
+  // radios (not buttons — their own text is their label).
+  const isLabelledControl = (el) =>
+    !!el && el.nodeType === 1 &&
+    (isTextField(el) || el.tagName === "SELECT" || (el.tagName === "INPUT" && /^(checkbox|radio)$/i.test(el.type || "")));
+
+  function fieldLabel(el) {
+    const t = labelText(el) ||
+      tidy(el.placeholder) || tidy(el.title) || tidy(el.getAttribute("name")) || tidy(el.id);
     return t.slice(0, 80);
   }
 
@@ -618,6 +652,7 @@
         const d = describe(el);
         const isPw = el.tagName === "INPUT" && (el.type || "").toLowerCase() === "password";
         let line = `${roleOf(el) || d.tag} "${d.text}"`;
+        if (d.label) line += ` label "${d.label}"`;
         if ((el.tagName === "INPUT" || el.tagName === "TEXTAREA") && roleOf(el) === "textbox") {
           const v = isPw ? (el.value ? "••••" : "") : String(el.value || "").slice(0, 60);
           if (v && v !== d.text) line += ` = "${v}"`;
