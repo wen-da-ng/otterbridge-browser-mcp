@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.12.0 — 2026-11-22
+
+Tools a script can rely on — for clients where the AI writes code that calls
+tools (Claude Code's experimental Code Mode, programmatic tool calling), and
+fewer steps everywhere else.
+
+### Added
+
+- **Find elements by description.** `click_element`, `fill_element`,
+  `select_option`, `hover` and `screenshot` take `target: { selector?, text?,
+  tag?, nth? }` instead of a `read_elements` index, and wait up to
+  `timeout_ms` (default 5 s) for the element to appear — one call instead of
+  two, and no stale index after the page re-renders. The result says what
+  matched (`Matched [3] "Next". …`, plus how many matched when several did).
+  Elements found this way go through exactly the same approval gate.
+- **Typed results.** `read_page`, `read_elements`, `find_text`, `wait_for`,
+  `read_console`, `read_network`, `get_network_body`, `list_tabs`,
+  `get_user_tab`, `list_profiles`, `run_script` and `run_flow` declare an
+  output schema and return `structuredContent` (lists wrapped as
+  `{ elements }` / `{ tabs }`). The text result is unchanged. Schemas are
+  deliberately loose, so a new field from the extension can't break a tool.
+  Profile notes also appear as `notes` in typed results.
+- README: *Scripts & Code Mode*.
+
+### Changed
+
+- **Failures are errors.** A declined approval, a click aborted (something
+  covering the target) or refused by the extension, an element index that no
+  longer exists, a missing argument, an invalid file path, "Cannot go back" —
+  all now return `isError: true` (same text), so a script stops instead of
+  carrying on. A `run_script` / `run_flow` replay that stops is an error too,
+  with the same JSON.
+- **Denials say not to retry.** Every "Action denied by user" — including
+  site-rule denials — adds: *The user declined this: stop and ask them how to
+  continue. Don't retry it or look for another way to do it.*
+- The server instructions describe working in scripts (explore first, then
+  script the repetitive part; `target`, `tab`, stop at the first error).
+
+### Fixed
+
+- `run_script` / `run_flow` counted a click the extension refused ("Click
+  refused by the browser extension") as a successful step and carried on; the
+  step now fails.
+- After a step the user declined, a stopped replay told the AI to "take over
+  … and finish the task" — the work-around a denial forbids. It now says to
+  stop and ask.
+
+### Notes
+
+- Form fields labelled only by a wrapping `<label>` have no name yet, so a
+  `text` target can't find them — use a `selector` (e.g.
+  `input[name=custname]`). Same limitation as `run_script` text targets.
+
 ## 0.11.0 — 2026-11-22
 
 ### Added

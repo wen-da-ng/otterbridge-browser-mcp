@@ -117,7 +117,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.11.0";
+const SERVER_VERSION = "0.12.0";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -972,6 +972,90 @@ const SITE_BLOCK_RE = /^Otter's site rules block AI agents on (\S+)\. /;
 const SITE_READ_RE = /^(\S+) is read-only for AI agents \(Otter site rules\)\./;
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
+const fail = (s: string) => ({ content: [{ type: "text" as const, text: s }], isError: true as const });
+
+// ===== Typed results =====
+// Tools that already build an object also return it as structuredContent,
+// with a declared outputSchema, so calling code gets typed objects instead of
+// parsing text. The text block stays byte-for-byte what it was (existing
+// callers parse it). sc: the structured form when it differs from the text
+// (structuredContent must be an object: arrays get wrapped).
+const json = (o: unknown, sc?: Record<string, unknown>) => ({
+  content: [{ type: "text" as const, text: JSON.stringify(o) }],
+  structuredContent: sc ?? (o as Record<string, unknown>),
+});
+// LOOSE on purpose: once a tool declares an outputSchema the SDK rejects any
+// successful result that doesn't match it, so a shape change in the extension
+// must not break the tool. Every field is optional and nullable, extra fields
+// are allowed; the schema documents the shape rather than policing it.
+const os = z.string().nullish();
+const on = z.number().nullish();
+const ob = z.boolean().nullish();
+const loose = (shape: z.ZodRawShape) => z.looseObject(shape);
+const listOf = (shape: z.ZodRawShape) => z.array(loose(shape)).nullish();
+const STEP_RESULT = { step: on, action: os, ok: ob, ms: on, error: os };
+const REPLAY_OUT = loose({
+  ok: ob, steps_run: on, total_steps: on, from_step: on, elapsed_ms: on,
+  failed_step: on, hint: os, error: os, results: listOf(STEP_RESULT),
+});
+const OUT = {
+  read_page: loose({ url: os, title: os, text: os, offset: on, total_chars: on, devicePixelRatio: on }),
+  read_elements: loose({
+    elements: listOf({ index: on, tag: os, text: os, x: on, y: on, role: os, href: os, disabled: ob, checked: ob, expanded: ob, offscreen: ob }),
+    total: on, shown: on, note: os,
+  }),
+  find_text: loose({ count: on, matches: listOf({ nth: on, x: on, y: on, visible: ob, context: os, frame: os }) }),
+  wait_for: loose({ found: ob, elapsed_ms: on, timeout_ms: on, response: loose({ url: os, status: on }).nullish() }),
+  read_console: loose({ count: on, entries: listOf({ level: os, text: os, url: os }), note: os }),
+  read_network: loose({ count: on, requests: listOf({ requestId: os, url: os, method: os, type: os, status: on, mimeType: os }), note: os }),
+  get_network_body: loose({ base64Encoded: ob, total_chars: on, truncated: ob, body: os }),
+  list_tabs: loose({ tabs: listOf({ tabId: on, title: os, url: os, active: ob, profile: os }) }),
+  get_user_tab: loose({ tabId: on, title: os, url: os, profile: os }),
+  list_profiles: loose({ session_profile: os, profiles: listOf({ id: os, name: os, email: os, browser: os, in_use_by_this_session: ob }) }),
+  run_script: REPLAY_OUT,
+  run_flow: REPLAY_OUT.extend({ flow: os }),
+};
+
+// ===== Failures are errors =====
+// Code that calls these tools (Claude Code's Code Mode, programmatic tool
+// calling) can't read prose: a refusal returned as a normal result looks like
+// success, and the next line of the script runs. Results starting with one of
+// these known failure phrases — the server's own and the extension's — are
+// flagged isError in one place, the tool() wrapper. Must stay anchored: a
+// successful result never starts with any of them (test/script.mjs pins each).
+const SOFT_FAIL_RE =
+  /^(Action denied by user|Click aborted|Click refused|No interactive element|No JavaScript dialog|Cannot go (back|forward)|Provide |'[^']*' isn't (an absolute path|a file)|File not found|'path' must be|No connected browser profile matches|'[^']*' matches several profiles|Already recording|A finished recording|Record in one of your own tabs|No Otter extension is waiting)/;
+// A declined approval must not be retried or worked around: models tend to
+// retry errors, so every denial says so, whether returned or thrown (site
+// rules throw theirs).
+const DENIED_RE = /^Action denied by user/;
+const DENIED_HINT =
+  " The user declined this: stop and ask them how to continue. Don't retry it or look for another way to do it.";
+// The gate's own outcomes as runSteps sees them (strings from gatedClick /
+// answerDialog): a step that ends in one of these failed.
+const STEP_REFUSED_RE = /^(Action denied|Click aborted|Click refused)/;
+
+type ToolResult = { content?: { type: string; text?: string }[]; isError?: boolean };
+const withFailures =
+  (cb: (...a: unknown[]) => Promise<ToolResult>) =>
+  async (...a: unknown[]): Promise<ToolResult> => {
+    let res: ToolResult;
+    try {
+      res = await cb(...a);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (DENIED_RE.test(msg)) return fail(msg + DENIED_HINT);
+      throw e; // the SDK turns it into an isError result
+    }
+    const first = res?.content?.[0];
+    if (first?.type === "text" && typeof first.text === "string") {
+      if (!res.isError && SOFT_FAIL_RE.test(first.text)) res.isError = true;
+      if (res.isError && DENIED_RE.test(first.text) && !first.text.endsWith(DENIED_HINT)) {
+        first.text += DENIED_HINT;
+      }
+    }
+    return res;
+  };
 
 // ===== Measuring web apps: turning raw browser data into reports =====
 // The extension returns raw timings; the verdicts are made here, where they
@@ -1262,7 +1346,8 @@ function buildServer(stdio = false): McpServer {
         "Method: observe with page_snapshot (a compact outline of the page " +
         "with element indices — cheaper than a screenshot), read_page or " +
         "screenshot; act by element index with click_element / fill_element / " +
-        "select_option (more reliable than click(x, y)). Actions report what " +
+        "select_option (more reliable than click(x, y)), or by 'target' (CSS " +
+        "selector and/or visible text) to skip the read step. Actions report what " +
         "changed (navigation, new tab, dialog), so you rarely need to re-read " +
         "just to check. Call wait_for after anything that loads content. If a " +
         "result mentions a JavaScript dialog, answer it with handle_dialog. " +
@@ -1272,10 +1357,17 @@ function buildServer(stdio = false): McpServer {
         "popup) and replay it with run_flow. Debug web apps with read_console, read_network, " +
         "get_network_body and evaluate_js; measure them with perf_audit (page " +
         "load), perf_record (an interaction), css_coverage and throttle.\n\n" +
+        "In a script that calls these tools (e.g. Claude Code's Code Mode): " +
+        "explore a page interactively first, then script the repetitive part. " +
+        "Find elements with 'target' rather than indices, pass 'tab' on every " +
+        "call, stop at the first error, and return only what you need — not " +
+        "whole pages. Reading tools also return typed results " +
+        "(structuredContent).\n\n" +
         "Clicks on controls like buy, pay, delete, send or submit, and " +
         "evaluate_js, ask the user for approval unless they switched on Full " +
         "Auto in the extension. If the user denies one, stop and ask them — " +
-        "don't look for another way to do it.",
+        "don't look for another way to do it. A denial, like any failed action, " +
+        "comes back as an error, so a script that calls these tools should stop there.",
     },
   );
 
@@ -1463,20 +1555,25 @@ function buildServer(stdio = false): McpServer {
       }
     };
 
-  // Append profile comings and goings this session hasn't heard about yet.
-  const withProfileNotes = (cb: (...a: unknown[]) => Promise<{ content?: unknown[] }>) =>
+  // Append profile comings and goings this session hasn't heard about yet —
+  // as an extra text block, and as `notes` in a typed result.
+  const withProfileNotes = (
+    cb: (...a: unknown[]) => Promise<{ content?: unknown[]; structuredContent?: Record<string, unknown> }>,
+  ) =>
     async (...a: unknown[]) => {
       const res = await cb(...a);
       const fresh = profileEvents.slice(sess.eventIx);
       sess.eventIx = profileEvents.length;
       if (fresh.length && Array.isArray(res?.content)) {
         res.content.push({ type: "text", text: fresh.join("\n") });
+        if (res.structuredContent) res.structuredContent = { ...res.structuredContent, notes: fresh };
       }
       return res;
     };
 
   // registerTool, with each tool's title + annotations filled in from META,
-  // and profile notes appended to every result.
+  // known failures flagged isError (withFailures), and profile notes appended
+  // to every result.
   const tool = ((name: string, config: Record<string, unknown>, cb: unknown) => {
     const m = META[name];
     return server.registerTool(
@@ -1492,7 +1589,7 @@ function buildServer(stdio = false): McpServer {
           openWorldHint: m.world ?? false,
         },
       },
-      withProfileNotes(withPairing(cb as never)) as never,
+      withProfileNotes(withFailures(withPairing(cb as never) as never)) as never,
     );
   }) as typeof server.registerTool;
 
@@ -1705,6 +1802,75 @@ function buildServer(stdio = false): McpServer {
       ),
   };
 
+  // ----- Elements by description (selector / visible text) -----
+  // The durable element descriptor run_script uses, also accepted by the
+  // interactive element tools in place of a read_elements index: one call
+  // instead of read_elements + pick + act, no stale index after a re-render,
+  // and safe for scripts that can't look at the page in between.
+  const TARGET_FIELDS = {
+    selector: z.string().optional().describe("CSS selector for the element (most durable)."),
+    text: z.string().optional().describe("Visible text / label / placeholder / aria-label. Exact match wins over prefix over substring."),
+    tag: z.string().optional().describe("Restrict to a tag, e.g. 'button', 'input', 'a'."),
+    nth: z.number().int().min(0).optional().describe("Which match to use when several remain (default 0)."),
+  };
+  const TARGET = {
+    target: z
+      .object(TARGET_FIELDS)
+      .optional()
+      .describe("Instead of index: find the element by CSS selector and/or visible text, waiting for it to appear."),
+    timeout_ms: z
+      .number()
+      .int()
+      .min(100)
+      .max(30000)
+      .optional()
+      .describe("With target: how long to wait for the element to appear (default 5000)."),
+  };
+  const TARGET_NOTE =
+    " Or pass 'target' (CSS selector and/or visible text) instead of an index: it waits for the element to appear.";
+  // Poll until the element appears (Selenium's implicit wait): single-page
+  // apps routinely mount controls a moment after the heading above them.
+  const resolveTarget = async (
+    tab: number | undefined,
+    t: { selector?: string; text?: string; tag?: string; nth?: number },
+    timeoutMs: number,
+    extra: Record<string, unknown> = {},
+  ): Promise<any> => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const el = await act("resolve_element", tab, { selector: t.selector, text: t.text, tag: t.tag, nth: t.nth, ...extra });
+      if (el && el.found) return el;
+      if (Date.now() >= deadline) return el;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  };
+  type Picked = { index: number; text?: string; matched: string } | { error: string };
+  // index or target -> the element's live index (+ what matched), or a failure.
+  const pickElement = async (
+    tab: number | undefined,
+    index: number | undefined,
+    target: { selector?: string; text?: string; tag?: string; nth?: number } | undefined,
+    timeoutMs: number | undefined,
+  ): Promise<Picked> => {
+    if (index != null && target) return { error: "Provide either 'index' or 'target', not both." };
+    if (index != null) return { index, matched: "" };
+    if (!target) return { error: "Provide 'index' (from read_elements) or 'target' (selector and/or text)." };
+    if (target.selector == null && target.text == null) {
+      return { error: "Provide 'target' with a selector and/or text." };
+    }
+    const ms = timeoutMs ?? 5000;
+    const el = await resolveTarget(tab, target, ms);
+    if (!el || !el.found) {
+      return { error: `No element matches target ${JSON.stringify(target)} after waiting ${ms}ms.` };
+    }
+    const label = String(el.text ?? "").trim().slice(0, 60);
+    const several = el.matches > 1 ? ` (${el.matches} matches, used nth=${Math.min(target.nth ?? 0, el.matches - 1)})` : "";
+    return { index: el.index as number, text: el.text as string, matched: `Matched [${el.index}] "${label}"${several}. ` };
+  };
+  // Say what a target matched — on success only: a failure must keep its
+  // leading phrase so withFailures still flags it.
+  const noteMatch = (p: { matched: string }, s: string) => (p.matched && !SOFT_FAIL_RE.test(s) ? p.matched + s : s);
+
   // Gate + press a click atomically with respect to the destructive-action
   // check. The danger check runs on `expectText`; the click is dispatched with
   // that same text so the extension REFUSES to press if the live element no
@@ -1912,9 +2078,9 @@ function buildServer(stdio = false): McpServer {
           .describe("Max characters to return (default 20000)."),
         ...READ_TAB,
       },
+      outputSchema: OUT.read_page,
     },
-    async ({ offset, max_chars, tab }) =>
-      text(JSON.stringify(await act("read_page", tab, { offset, maxChars: max_chars }))),
+    async ({ offset, max_chars, tab }) => json(await act("read_page", tab, { offset, maxChars: max_chars })),
   );
 
   tool(
@@ -1937,9 +2103,14 @@ function buildServer(stdio = false): McpServer {
         max: z.number().int().min(1).max(2000).optional().describe("Max entries (default 300)."),
         ...READ_TAB,
       },
+      outputSchema: OUT.read_elements,
     },
-    async ({ scope, query, max, tab }) =>
-      text(JSON.stringify(await act("read_elements", tab, { scope, query, max }))),
+    async ({ scope, query, max, tab }) => {
+      // The extension sends a plain list, or { total, shown, elements, note }
+      // when it had to cut the list short: structured, always the object.
+      const r = await act("read_elements", tab, { scope, query, max });
+      return json(r, Array.isArray(r) ? { elements: r } : r);
+    },
   );
 
   tool(
@@ -1982,21 +2153,33 @@ function buildServer(stdio = false): McpServer {
         "row actions in web apps). Then find the menu items with read_elements " +
         "(lists standard ARIA menus) or find_text / screenshot (custom menus " +
         "built from plain list items), and click the one you need. " +
-        "double=true double-clicks.",
-      inputSchema: { index: z.number().int(), ...BUTTON, ...TAB },
+        "double=true double-clicks." + TARGET_NOTE,
+      inputSchema: {
+        index: z.number().int().optional().describe("Element index from read_elements."),
+        ...TARGET,
+        ...BUTTON,
+        ...TAB,
+      },
     },
-    async ({ index, button, double, tab }) => {
-      const info = await act("locate_element", tab, { index });
-      if (!info || !info.found) {
-        return text(
-          `No interactive element with index ${index}. ` +
-            `Call read_elements to refresh the list first.`,
-        );
+    async ({ index, target, timeout_ms, button, double, tab }) => {
+      const p = await pickElement(tab, index, target, timeout_ms);
+      if ("error" in p) return fail(p.error);
+      let label = p.text;
+      if (target == null) {
+        const info = await act("locate_element", tab, { index: p.index });
+        if (!info || !info.found) {
+          return text(
+            `No interactive element with index ${p.index}. ` +
+              `Call read_elements to refresh the list first.`,
+          );
+        }
+        label = info.text;
       }
       // gatedClick passes the index through to the extension, which re-resolves
       // the live position right before pressing (immune to reflow during the
-      // cursor animation) and re-gates via `expectText` if it changed.
-      return text(await gatedClick(tab, { index }, info.text ?? "", { button, double }));
+      // cursor animation) and re-gates via `expectText` if it changed. A
+      // target-found element goes through exactly the same gate.
+      return text(noteMatch(p, await gatedClick(tab, { index: p.index }, label ?? "", { button, double })));
     },
   );
 
@@ -2009,18 +2192,20 @@ function buildServer(stdio = false): McpServer {
         "content, and type the text over it with real keystrokes. Empty text " +
         "clears the field.\n\n" +
         "PREFERRED over click + type_text for form inputs: focusing and " +
-        "clearing are atomic, so the text can't land in the wrong field.",
+        "clearing are atomic, so the text can't land in the wrong field." + TARGET_NOTE,
       inputSchema: {
-        index: z.number().int().describe("Element index from read_elements."),
+        index: z.number().int().optional().describe("Element index from read_elements."),
         text: z.string().describe("Text to type; empty string clears the field."),
+        ...TARGET,
         ...TAB,
       },
     },
-    async ({ index, text: t, tab }) =>
-      text(await (async () => {
-        const g = HAS_NEWLINE.test(t) ? await enterGate(tab, index) : {};
-        return typeof g === "string" ? g : act("fill_element", tab, { index, text: t, ...g });
-      })()),
+    async ({ index, text: t, target, timeout_ms, tab }) => {
+      const p = await pickElement(tab, index, target, timeout_ms);
+      if ("error" in p) return fail(p.error);
+      const g = HAS_NEWLINE.test(t) ? await enterGate(tab, p.index) : {};
+      return text(noteMatch(p, typeof g === "string" ? g : await act("fill_element", tab, { index: p.index, text: t, ...g })));
+    },
   );
 
   tool(
@@ -2029,19 +2214,22 @@ function buildServer(stdio = false): McpServer {
       description:
         "Pick an option in a native <select> dropdown on the web page by value or visible " +
         "label (native dropdowns can't be driven by clicks). On no match, the " +
-        "error lists the available options.",
+        "error lists the available options." + TARGET_NOTE,
       inputSchema: {
-        index: z.number().int().describe("read_elements index of the <select> element."),
+        index: z.number().int().optional().describe("read_elements index of the <select> element."),
         value: z.string().optional().describe("Option value attribute (exact match)."),
         label: z.string().optional().describe("Visible option text (exact, then substring match)."),
+        ...TARGET,
         ...TAB,
       },
     },
-    async ({ index, value, label, tab }) => {
+    async ({ index, value, label, target, timeout_ms, tab }) => {
       if (value == null && label == null) {
         return text("Provide 'value' or 'label' to pick an option.");
       }
-      return text(await act("select_option", tab, { index, value, label }));
+      const p = await pickElement(tab, index, target, timeout_ms);
+      if ("error" in p) return fail(p.error);
+      return text(noteMatch(p, await act("select_option", tab, { index: p.index, value, label })));
     },
   );
 
@@ -2051,19 +2239,25 @@ function buildServer(stdio = false): McpServer {
       description:
         "Hover the mouse over an element of the web page (by read_elements index) or viewport " +
         "coordinates and hover there — triggers :hover styles, tooltips, and " +
-        "hover-opened menus. Prefer index over raw coordinates.",
+        "hover-opened menus. Prefer index (or target) over raw coordinates." + TARGET_NOTE,
       inputSchema: {
         index: z.number().int().optional().describe("Element index from read_elements (preferred)."),
         x: z.number().int().optional().describe("Viewport x, if no index is given."),
         y: z.number().int().optional().describe("Viewport y, if no index is given."),
+        ...TARGET,
         ...TAB,
       },
     },
-    async ({ index, x, y, tab }) => {
-      if (index == null && (x == null || y == null)) {
-        return text("Provide 'index', or both 'x' and 'y'.");
+    async ({ index, x, y, target, timeout_ms, tab }) => {
+      if (target != null || index != null) {
+        const p = await pickElement(tab, index, target, timeout_ms);
+        if ("error" in p) return fail(p.error);
+        return text(noteMatch(p, await act("hover", tab, { index: p.index })));
       }
-      return text(await act("hover", tab, { index, x, y }));
+      if (x == null || y == null) {
+        return text("Provide 'index', 'target', or both 'x' and 'y'.");
+      }
+      return text(await act("hover", tab, { x, y }));
     },
   );
 
@@ -2109,9 +2303,9 @@ function buildServer(stdio = false): McpServer {
           .describe("Scroll the nth match into view (default true; never on the user's tab)."),
         ...READ_TAB,
       },
+      outputSchema: OUT.find_text,
     },
-    async ({ query, nth, scroll, tab }) =>
-      text(JSON.stringify(await act("find_text", tab, { query, nth, scroll }))),
+    async ({ query, nth, scroll, tab }) => json(await act("find_text", tab, { query, nth, scroll })),
   );
 
   tool(
@@ -2137,6 +2331,7 @@ function buildServer(stdio = false): McpServer {
           .describe("Max wait in milliseconds (default 10000)."),
         ...READ_TAB,
       },
+      outputSchema: OUT.wait_for,
     },
     async ({ text: t, selector, url, timeout_ms, tab }) => {
       if (t == null && selector == null && url == null) {
@@ -2148,7 +2343,7 @@ function buildServer(stdio = false): McpServer {
         { text: t, selector, url, timeoutMs: timeout_ms },
         (timeout_ms ?? 10000) + 15000, // bridge timeout must outlast the poll
       );
-      return text(JSON.stringify(result));
+      return json(result);
     },
   );
 
@@ -2225,10 +2420,17 @@ function buildServer(stdio = false): McpServer {
           .int()
           .optional()
           .describe("Capture just this element (read_elements index), scrolled into view."),
+        target: TARGET.target.describe("Instead of index: capture the element found by CSS selector and/or visible text."),
+        timeout_ms: TARGET.timeout_ms,
         ...READ_TAB,
       },
     },
-    async ({ full_page, index, tab }) => {
+    async ({ full_page, index, target, timeout_ms, tab }) => {
+      if (target != null) {
+        const p = await pickElement(tab, index, target, timeout_ms);
+        if ("error" in p) return fail(p.error);
+        index = p.index;
+      }
       const result = await act("screenshot", tab, { fullPage: full_page, index });
       await audit(
         "screenshot",
@@ -2274,9 +2476,9 @@ function buildServer(stdio = false): McpServer {
         clear: z.boolean().optional().describe("Clear the buffer after reading."),
         ...TAB,
       },
+      outputSchema: OUT.read_console,
     },
-    async ({ level, limit, clear, tab }) =>
-      text(JSON.stringify(await act("read_console", tab, { level, limit, clear }))),
+    async ({ level, limit, clear, tab }) => json(await act("read_console", tab, { level, limit, clear })),
   );
 
   tool(
@@ -2302,9 +2504,9 @@ function buildServer(stdio = false): McpServer {
         clear: z.boolean().optional().describe("Clear the buffer after reading."),
         ...TAB,
       },
+      outputSchema: OUT.read_network,
     },
-    async ({ filter, limit, clear, tab }) =>
-      text(JSON.stringify(await act("read_network", tab, { filter, limit, clear }))),
+    async ({ filter, limit, clear, tab }) => json(await act("read_network", tab, { filter, limit, clear })),
   );
 
   tool(
@@ -2319,9 +2521,9 @@ function buildServer(stdio = false): McpServer {
         request_id: z.string().describe("requestId from read_network."),
         ...TAB,
       },
+      outputSchema: OUT.get_network_body,
     },
-    async ({ request_id, tab }) =>
-      text(JSON.stringify(await act("get_network_body", tab, { requestId: request_id }))),
+    async ({ request_id, tab }) => json(await act("get_network_body", tab, { requestId: request_id })),
   );
 
   tool(
@@ -2354,10 +2556,7 @@ function buildServer(stdio = false): McpServer {
   // one recorded flow serves ever-changing inputs. The destructive-action
   // gate applies to every click step exactly as in interactive mode.
   const StepTarget = z.object({
-    selector: z.string().optional().describe("CSS selector for the element (most durable)."),
-    text: z.string().optional().describe("Visible text / label / placeholder / aria-label. Exact match wins over prefix over substring."),
-    tag: z.string().optional().describe("Restrict to a tag, e.g. 'button', 'input', 'a'."),
-    nth: z.number().int().min(0).optional().describe("Which match to use when several remain (default 0)."),
+    ...TARGET_FIELDS,
     label: z.string().optional().describe("Human-readable description of the element (recorded flows); ignored when resolving."),
   });
   const Step = z.object({
@@ -2465,26 +2664,12 @@ function buildServer(stdio = false): McpServer {
     const ap = (action: string, params: Record<string, unknown>, timeoutMs?: number) =>
       act(action, tab, { ...params, background: bg, noReport: true }, timeoutMs);
 
-    // Implicit wait on element resolution (Selenium's implicit-wait
-    // semantics). Single-page apps routinely satisfy a wait_for on a
-    // heading one frame before the controls below it mount, so a target
-    // that resolves on the very first try is the exception, not the rule.
-    // Poll until the element appears rather than failing on a race.
-    const resolveTarget = async (
+    // Implicit wait on element resolution: the shared resolveTarget, with
+    // this replay's background / no-report flags on every probe.
+    const resolveStepTarget = (
       t: { selector?: string; text?: string; tag?: string; nth?: number },
       timeoutMs: number,
-    ): Promise<any> => {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const el = await ap(
-          "resolve_element",
-          { selector: t.selector, text: t.text, tag: t.tag, nth: t.nth },
-        );
-        if (el && el.found) return el;
-        if (Date.now() >= deadline) return el;
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    };
+    ) => resolveTarget(tab, t, timeoutMs, { background: bg, noReport: true });
     type StepResult = {
       step: number;
       action: string;
@@ -2546,14 +2731,14 @@ function buildServer(stdio = false): McpServer {
               const r = await gatedClick(tab, { x: st.x, y: st.y }, targetText, {
                 fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
               });
-              if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
+              if (STEP_REFUSED_RE.test(r)) throw new Error(r);
               out = r;
               break;
             }
             if (!st.target || (st.target.selector == null && st.target.text == null)) {
               throw new Error(`${st.action} needs a 'target' with selector and/or text (or x/y for click).`);
             }
-            const el = await resolveTarget(st.target, st.timeout_ms ?? 8000);
+            const el = await resolveStepTarget(st.target, st.timeout_ms ?? 8000);
             if (!el || !el.found) {
               throw new Error(
                 `No element matches target ${JSON.stringify(st.target)} ` +
@@ -2576,7 +2761,7 @@ function buildServer(stdio = false): McpServer {
               const r = await gatedClick(tab, { index: el.index }, el.text ?? "", {
                 fast: speed, background: bg, button: st.button, double: st.double, noReport: true,
               });
-              if (/^(Action denied|Click aborted)/.test(r)) throw new Error(r);
+              if (STEP_REFUSED_RE.test(r)) throw new Error(r);
               out = r;
             } else if (st.action === "fill") {
               if (st.text == null) throw new Error("fill needs 'text'.");
@@ -2639,6 +2824,9 @@ function buildServer(stdio = false): McpServer {
       }
     }
 
+    // A step the user declined is not a broken script: taking over to
+    // "finish the task" would be exactly the work-around a denial forbids.
+    const declined = failed != null && DENIED_RE.test(results[results.length - 1]?.error ?? "");
     return {
       ok: failed == null,
       steps_run: results.length,
@@ -2648,15 +2836,23 @@ function buildServer(stdio = false): McpServer {
       ...(failed != null
         ? {
             failed_step: failed,
-            hint:
-              "Script stopped at the failed step. Take over with the interactive tools " +
-              "(screenshot / read_elements) from the current page state, finish the task, " +
-              "then update the saved script so the next replay succeeds.",
+            hint: declined
+              ? `The user declined step ${failed}. Stop and ask them how to continue; ` +
+                "don't finish the task another way."
+              : "Script stopped at the failed step. Take over with the interactive tools " +
+                "(screenshot / read_elements) from the current page state, finish the task, " +
+                "then update the saved script so the next replay succeeds.",
           }
         : {}),
       results,
     };
   };
+  // A replay that stopped is a failed call (isError), with the same JSON —
+  // typed too, so calling code can read failed_step / hint either way.
+  const replayResult = <T extends { ok: boolean }>(res: T) => ({
+    ...(res.ok ? text : fail)(JSON.stringify(res)),
+    structuredContent: res as unknown as Record<string, unknown>,
+  });
 
   const FAST = z.boolean().optional().describe("Skip cursor animation and typing delays (default true).");
   const BACKGROUND = z
@@ -2695,9 +2891,10 @@ function buildServer(stdio = false): McpServer {
         background: BACKGROUND,
         ...TAB,
       },
+      outputSchema: OUT.run_script,
     },
     async ({ steps, vars, fast, background, tab }) =>
-      text(JSON.stringify(await runSteps(steps, vars, { fast, background, tab }))),
+      replayResult(await runSteps(steps, vars, { fast, background, tab })),
   );
 
   // ===== Flow recorder: record what the user does, replay it by name =====
@@ -2903,19 +3100,18 @@ function buildServer(stdio = false): McpServer {
         background: BACKGROUND,
         ...TAB,
       },
+      outputSchema: OUT.run_flow,
     },
     async ({ name, vars, from_step, fast, background, tab }) => {
       const flow = await cmd("flows_get", { name });
       const parsed = z.array(Step).min(1).safeParse(flow?.steps);
       if (!parsed.success) {
-        return text(
-          JSON.stringify({
-            ok: false,
-            error:
-              `The saved flow "${name}" has invalid steps (${parsed.error.issues[0]?.message ?? "bad shape"}). ` +
-              `Fix it with flows get / save.`,
-          }),
-        );
+        return replayResult({
+          ok: false,
+          error:
+            `The saved flow "${name}" has invalid steps (${parsed.error.issues[0]?.message ?? "bad shape"}). ` +
+            `Fix it with flows get / save.`,
+        });
       }
       const defaults: Record<string, string> = {};
       for (const [k, val] of Object.entries((flow.vars ?? {}) as Record<string, unknown>)) {
@@ -2939,7 +3135,7 @@ function buildServer(stdio = false): McpServer {
           },
         },
       });
-      return text(JSON.stringify({ flow: name, ...res }));
+      return replayResult({ flow: name, ...res });
     },
   );
 
@@ -3222,16 +3418,15 @@ function buildServer(stdio = false): McpServer {
         "each with its name, signed-in Google account and browser — and which " +
         "one this session uses. Each profile has its own logins, cookies and " +
         "history. When several are connected, pick one with use_profile.",
+      outputSchema: OUT.list_profiles,
     },
     async () =>
-      text(
-        JSON.stringify({
-          session_profile: currentProfileLabel() || null,
-          profiles: profileList().map((pr) => ({ ...pr, in_use_by_this_session: pr.id === sess.profile })),
-          ...(unpairedSockets.size > 0 ? { unpaired_extension_waiting: true } : {}),
-          ...(openSockets.size > 0 ? { extension_waiting_to_work_without_pairing: true } : {}),
-        }),
-      ),
+      json({
+        session_profile: currentProfileLabel() || null,
+        profiles: profileList().map((pr) => ({ ...pr, in_use_by_this_session: pr.id === sess.profile })),
+        ...(unpairedSockets.size > 0 ? { unpaired_extension_waiting: true } : {}),
+        ...(openSockets.size > 0 ? { extension_waiting_to_work_without_pairing: true } : {}),
+      }),
   );
 
   tool(
@@ -3323,13 +3518,15 @@ function buildServer(stdio = false): McpServer {
       inputSchema: {
         profile: z.string().optional().describe("Browser profile (name or email from list_profiles); default: the session's."),
       },
+      outputSchema: OUT.list_tabs,
     },
     async ({ profile: wanted }) => {
       const pid = resolveProfileArg(wanted) ?? (await profileFor());
       const tabs = (await cmd("list_tabs", { agentId }, undefined, pid)) as Record<string, unknown>[];
       const profile = labelOfProfile(pid);
       for (const t of tabs) if (typeof t.tabId === "number") tabProfiles.set(t.tabId, pid);
-      return text(JSON.stringify(tabs.map((t) => ({ ...t, profile }))));
+      const out = tabs.map((t) => ({ ...t, profile }));
+      return json(out, { tabs: out });
     },
   );
 
@@ -3345,12 +3542,13 @@ function buildServer(stdio = false): McpServer {
       inputSchema: {
         profile: z.string().optional().describe("Browser profile (name or email from list_profiles); default: the session's."),
       },
+      outputSchema: OUT.get_user_tab,
     },
     async ({ profile }) => {
       const pid = resolveProfileArg(profile) ?? (await profileFor());
       const res = await cmd("user_tab", { agentId }, undefined, pid);
       if (res && typeof res.tabId === "number") tabProfiles.set(res.tabId, pid);
-      return text(JSON.stringify({ ...res, profile: labelOfProfile(pid) }));
+      return json({ ...res, profile: labelOfProfile(pid) });
     },
   );
 

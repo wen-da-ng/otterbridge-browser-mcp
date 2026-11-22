@@ -149,7 +149,7 @@ AI rarely needs a second call just to check.
 | `read_elements(scope?, query?, max?, tab?)` | Numbered interactive elements with center coordinates and state; filter to what's on screen or by text, capped at 300 by default. |
 | `find_text(query, nth?, scroll?, tab?)` | Case-insensitive text search: match coordinates + context, auto-scrolls a match into view. |
 | `wait_for(text?, selector?, url?, timeout_ms?, tab?)` | Wait for dynamic content — text, a CSS selector, and/or a network response whose URL contains `url` — instead of polling screenshots. |
-| `screenshot(full_page?, index?, tab?)` | JPEG of the viewport, the whole page, or one element — via CDP (works on background tabs too). |
+| `screenshot(full_page?, index?/target?, tab?)` | JPEG of the viewport, the whole page, or one element — via CDP (works on background tabs too). |
 </details>
 
 <details>
@@ -157,11 +157,11 @@ AI rarely needs a second call just to check.
 
 | Tool | Does |
 |---|---|
-| `click_element(index, button?, double?, tab?)` | **Preferred.** Clicks a `read_elements` entry by index; coordinate resolved in-page, so it never drifts through screenshot scaling. `button: "right"` right-clicks (context menus), `double: true` double-clicks. Never clicks through an overlay — it says what's in the way. |
+| `click_element(index?/target?, button?, double?, tab?)` | **Preferred.** Clicks a `read_elements` entry by index — or finds it by `target` (CSS selector and/or visible text, waiting for it to appear); coordinate resolved in-page, so it never drifts through screenshot scaling. `button: "right"` right-clicks (context menus), `double: true` double-clicks. Never clicks through an overlay — it says what's in the way. |
 | `click(x, y, button?, double?, tab?)` | Animated-cursor move + trusted CDP click at raw coordinates. Destructive targets prompt for approval (left clicks — a right-click only opens a menu). |
-| `fill_element(index, text, tab?)` | Focus + select-all + type over, atomically — the reliable way to fill form fields. Empty text clears. |
-| `select_option(index, value?/label?, tab?)` | Pick an option in a native `<select>` (dropdowns can't be clicked). |
-| `hover(index?/x,y?, tab?)` | Animated hover — opens hover menus, tooltips, `:hover` states. |
+| `fill_element(index?/target?, text, tab?)` | Focus + select-all + type over, atomically — the reliable way to fill form fields. Empty text clears. |
+| `select_option(index?/target?, value?/label?, tab?)` | Pick an option in a native `<select>` (dropdowns can't be clicked). |
+| `hover(index?/target?/x,y?, tab?)` | Animated hover — opens hover menus, tooltips, `:hover` states. |
 | `drag(from_x, from_y, to_x, to_y, tab?)` | Press–glide–release — sliders, sortable lists, canvas tools. |
 | `type_text(text, tab?)` | Per-character typing with human-like jitter, into the focused element. |
 | `press_key(key, tab?)` | A key or shortcut: `Enter`, `Tab`, `Escape`, `F5`, or combinations like `Control+A`, `Shift+Tab`, `Control+Shift+P`. |
@@ -289,6 +289,57 @@ page. A target that isn't unique inside an **iframe** is remembered by its
 position among matches in that frame, but replay counts matches across all
 frames — so it can pick the wrong frame's element; unique targets (the usual
 case) aren't affected.
+</details>
+
+<details>
+<summary><b>Scripts &amp; Code Mode</b></summary>
+
+Browser work is chatty — look, act, wait, look again — and each step is
+normally a model turn. Clients that let the AI **write a script that calls
+tools** (Claude Code's experimental [Code Mode](https://code.claude.com/docs/en/code-mode),
+programmatic tool calling in the Claude API) can run the predictable stretches
+in one go: page through results, loop over items, filter a long page in code
+and return only the answer. OtterBridge's tools are built to be called that way:
+
+- **Failures are errors.** A declined approval, a click that was aborted (an
+  overlay in the way) or refused, an element that isn't there, a missing
+  argument — all come back as `isError` results, so a script stops instead of
+  carrying on. A denial also says not to retry it.
+- **Typed results.** The reading tools (`read_page`, `read_elements`,
+  `find_text`, `wait_for`, `read_console`, `read_network`, `get_network_body`,
+  `list_tabs`, `get_user_tab`, `list_profiles`) and the replays (`run_script`,
+  `run_flow`) declare an output schema and return `structuredContent`, so
+  script code gets objects instead of parsing text. The text is unchanged.
+- **Elements by description.** `click_element`, `fill_element`,
+  `select_option`, `hover` and `screenshot` take `target: { selector?, text?,
+  tag?, nth? }` instead of an index and wait for the element to appear — one
+  call instead of `read_elements` + pick, and no stale indices after the page
+  re-renders. The result says what matched.
+- **Approvals still ask, per click.** Scripts go through the same gate: a
+  destructive click inside a script prompts you like any other. (In Claude
+  Code's auto mode the client reviews a script once, not each call — the gate
+  is what still checks every click.)
+
+The pattern that works: **explore interactively first, then script the
+repetitive part**, passing `tab` on every call. A sketch (how a client exposes
+tools to code varies):
+
+```js
+const titles = [];
+for (let page = 1; page <= 3; page++) {
+  const { elements } = (await read_elements({ query: "pricing", tab })).structuredContent;
+  titles.push(...elements.map((e) => e.text));
+  if (page < 3) {
+    await click_element({ target: { text: "Next" }, tab });
+    await wait_for({ selector: ".results", tab });
+  }
+}
+return titles;
+```
+
+Scripts can't look at the page between steps, so keep surprises (logins,
+pop-ups, unfamiliar layouts) in interactive mode. For flows you repeat often,
+`run_script` / `run_flow` work in every client, with or without Code Mode.
 </details>
 
 <details>

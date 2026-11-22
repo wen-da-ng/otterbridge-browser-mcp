@@ -196,7 +196,7 @@ async function main() {
     // --- MCP client that CANNOT elicit (fail-safe deny) ---
     const noElicit = await mkClient({ elicit: false });
     const denied = await noElicit.callTool({ name: "click_element", arguments: { index: 1 } });
-    ok("destructive + no elicitation -> fail-safe DENY", firstText(denied).startsWith("Action denied by user"), `got "${firstText(denied)}"`);
+    ok("destructive + no elicitation -> fail-safe DENY", denied.isError && firstText(denied).startsWith("Action denied by user"), `got "${firstText(denied)}"`);
 
     // An overlay over the target: never click through it, say what's in the way.
     const covered = await noElicit.callTool({ name: "click_element", arguments: { index: 2 } });
@@ -205,14 +205,14 @@ async function main() {
     // Uploads send the user's files to a website: approval required.
     const pkg = join(process.cwd(), "package.json");
     const up = await noElicit.callTool({ name: "upload_file", arguments: { files: [pkg] } });
-    ok("upload_file without approval -> DENIED", firstText(up).startsWith("Action denied by user: upload of package.json"), `got "${firstText(up)}"`);
+    ok("upload_file without approval -> DENIED", up.isError && firstText(up).startsWith("Action denied by user: upload of package.json"), `got "${firstText(up)}"`);
     const upRel = await noElicit.callTool({ name: "upload_file", arguments: { files: ["package.json"] } });
     ok("upload_file rejects relative paths", firstText(upRel).includes("isn't an absolute path"), `got "${firstText(upRel)}"`);
 
     // OK on a destructive confirm() = a destructive click: gated. Cancel never is.
     dialog = { open: true, type: "confirm", message: "Delete 3 files?" };
     const dOk = await noElicit.callTool({ name: "handle_dialog", arguments: { accept: true } });
-    ok("accepting a destructive confirm without approval -> DENIED", firstText(dOk).startsWith("Action denied by user"), `got "${firstText(dOk)}"`);
+    ok("accepting a destructive confirm without approval -> DENIED", dOk.isError && firstText(dOk).startsWith("Action denied by user"), `got "${firstText(dOk)}"`);
     const dNo = await noElicit.callTool({ name: "handle_dialog", arguments: { accept: false } });
     ok("dismissing a dialog is never gated", firstText(dNo) === "Dismissed the dialog.", `got "${firstText(dNo)}"`);
 
@@ -225,7 +225,7 @@ async function main() {
     // Enter submits forms and sends chat messages: gated like a click.
     enterLabels = ["Send"];
     const enterNo = await noElicit.callTool({ name: "press_key", arguments: { key: "Enter" } });
-    ok("Enter that would 'Send', no approval -> DENIED", firstText(enterNo) === "Action denied by user: Enter would trigger 'Send'.", `got "${firstText(enterNo)}"`);
+    ok("Enter that would 'Send', no approval -> DENIED", enterNo.isError && firstText(enterNo).startsWith("Action denied by user: Enter would trigger 'Send'. The user declined this: stop and ask them"), `got "${firstText(enterNo)}"`);
     const ctrlEnter = await noElicit.callTool({ name: "press_key", arguments: { key: "Control+Enter" } });
     ok("Control+Enter is gated too", firstText(ctrlEnter).startsWith("Action denied by user"), `got "${firstText(ctrlEnter)}"`);
     enterProbes.length = 0;
@@ -251,7 +251,7 @@ async function main() {
 
     // The extension saw a destructive target the server didn't gate.
     const refusedNew = await noElicit.callTool({ name: "click_element", arguments: { index: 3 } });
-    ok("ungated 'Delete' seen by the extension -> server asks -> denied", firstText(refusedNew) === "Action denied by user: click on 'Delete'.", `got "${firstText(refusedNew)}"`);
+    ok("ungated 'Delete' seen by the extension -> server asks -> denied", refusedNew.isError && firstText(refusedNew).startsWith("Action denied by user: click on 'Delete'. The user declined"), `got "${firstText(refusedNew)}"`);
     const refusedSame = await noElicit.callTool({ name: "click_element", arguments: { index: 4 } });
     ok("extension refusal with unchanged text -> refused, no loop", firstText(refusedSame).startsWith("Click refused by the browser extension: 'Weird'"), `got "${firstText(refusedSame)}"`);
 
