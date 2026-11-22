@@ -1871,6 +1871,35 @@ const READ_ONLY = new Set([
   "read_page", "read_elements", "find_text", "wait_for", "screenshot", "page_snapshot",
   "hit_test", "locate_element", "resolve_element",
 ]);
+// ===== Site rules (the user's; see OtterConfig.siteRuleFor) =====
+// block: agents may do nothing on the site. read: only these. ask: these
+// freely, anything else after the user's OK (the server asks — see handle).
+const SITE_READ_OK = new Set([
+  "read_page", "read_elements", "page_snapshot", "find_text", "wait_for", "screenshot",
+  "read_console", "read_network", "get_network_body",
+  "hit_test", "locate_element", "resolve_element", "enter_target", "dialog_info", "field_filled",
+  "perf_record", "css_coverage", "throttle",
+]);
+const siteHost = (url) => { try { return new URL(url).hostname; } catch (_) { return String(url); } };
+// Must match SITE_BLOCK_RE in server/src/index.ts.
+const siteBlockMsg = (host) =>
+  `Otter's site rules block AI agents on ${host}. The user can change this in the Otter popup.`;
+// A URL about to be opened: refused before it loads.
+function refuseBlockedUrl(url) {
+  const rule = OtterConfig.siteRuleFor(url, S.siteRules);
+  if (rule && rule.mode === "block") throw new Error(siteBlockMsg(siteHost(url)));
+}
+// After a navigation: landed on a blocked site (a redirect)? Leave it.
+async function leaveIfBlocked(tabId) {
+  let t;
+  try { t = await chrome.tabs.get(tabId); } catch (_) { return; }
+  const rule = OtterConfig.siteRuleFor(t.url, S.siteRules);
+  if (rule && rule.mode === "block") {
+    await chrome.tabs.update(tabId, { url: "about:blank" }).catch(() => {});
+    throw new Error(siteBlockMsg(siteHost(t.url)));
+  }
+}
+
 // Actions that still work while a JS dialog is open.
 const DIALOG_OK = new Set(["handle_dialog", "dialog_info", "read_console", "read_network", "get_network_body"]);
 // Visible actions bring the agent's tab to the front of ITS OWN window.
@@ -1919,12 +1948,17 @@ async function handle(action, p) {
 
   // ----- Multi-tab management (no pre-existing active tab required) -----
   if (action === "open_tab") {
+    await settingsReady;
+    if (p.url) refuseBlockedUrl(p.url); // before anything loads
     const { tab: created, ag } = await openAgentTab(p.agentId, p.clientName, p.url, p.reuse, p.sessionNo);
     agentIdleSoon(p.agentId);
     // Attach CDP immediately (not lazily on first click) so console/network
     // capture covers the page load. Best-effort: chrome:// pages can't attach.
     try { await ensureDebugger(created.id); } catch (_) {}
-    if (p.url) await waitForLoad(created.id);
+    if (p.url) {
+      await waitForLoad(created.id);
+      await leaveIfBlocked(created.id); // redirected into a blocked site
+    }
     const fresh = await chrome.tabs.get(created.id);
     return {
       tabId: created.id, url: fresh.url, title: fresh.title,
@@ -1941,7 +1975,15 @@ async function handle(action, p) {
       if (owner !== p.agentId) continue;
       try { tabs.push(await chrome.tabs.get(Number(id))); } catch (_) {}
     }
-    return tabs.map((t) => ({ tabId: t.id, title: t.title, url: t.url, active: t.active }));
+    await settingsReady;
+    return tabs.map((t) => {
+      const rule = OtterConfig.siteRuleFor(t.url, S.siteRules);
+      // A blocked site's page isn't read — not even its title.
+      if (rule && rule.mode === "block") {
+        return { tabId: t.id, title: "(blocked by Otter site rules)", url: siteHost(t.url), active: t.active };
+      }
+      return { tabId: t.id, title: t.title, url: t.url, active: t.active };
+    });
   }
   if (action === "close_tab") {
     await agentsReady;
@@ -1960,7 +2002,11 @@ async function handle(action, p) {
     return { closed: p.tabId };
   }
   if (action === "user_tab") {
-    return userTab();
+    const t = await userTab();
+    await settingsReady;
+    const rule = OtterConfig.siteRuleFor(t.url, S.siteRules);
+    if (rule && rule.mode === "block") throw new Error(siteBlockMsg(siteHost(t.url)));
+    return t;
   }
   if (action === "wait_for_download") {
     return waitForDownload(p);
@@ -1993,6 +2039,30 @@ async function handle(action, p) {
       );
     }
     p = { ...p, scroll: false, readOnly: true };
+  }
+
+  // Site rules: the user's, enforced here where the tab's live URL is known.
+  // Before the dialog checks, so a blocked page isn't even asked about.
+  if ((action === "navigate" || action === "perf_audit") && p.url) refuseBlockedUrl(p.url);
+  const rule = OtterConfig.siteRuleFor(tab.url, S.siteRules);
+  if (rule) {
+    const host = siteHost(tab.url);
+    if (rule.mode === "block") {
+      // An agent's own tab that got here (a link, a redirect): leave the
+      // site, so the tab is usable again. The user's tabs are never touched.
+      if (owned && p.agentId) await chrome.tabs.update(tab.id, { url: "about:blank" }).catch(() => {});
+      throw new Error(siteBlockMsg(host));
+    }
+    if (SITE_READ_OK.has(action)) {
+      if (action === "find_text") p = { ...p, scroll: false };
+    } else if (rule.mode === "read") {
+      throw new Error(`${host} is read-only for AI agents (Otter site rules).`);
+    } else if (rule.mode === "ask" && p.siteApproved !== true && !(p.gated === true && p.gatedBy === "user")) {
+      // Not acting: the server asks the user (even in Full Auto) and resends
+      // with siteApproved. A person approving this very action at the danger
+      // gate (gatedBy "user") counts too; Full Auto's auto-approval doesn't.
+      return { siteAsk: { host, pattern: rule.pattern } };
+    }
   }
 
   // The agent's window carries its group while it works (see above).
@@ -2050,9 +2120,12 @@ async function handleTab(action, p, tab, owned) {
 
 async function perform(action, p, tab, fast) {
   switch (action) {
+    // Each navigation ends with a site-rules check: a redirect into a blocked
+    // site leaves it again (about:blank) and fails.
     case "navigate": {
       await chrome.tabs.update(tab.id, { url: p.url });
       await waitForLoad(tab.id);
+      await leaveIfBlocked(tab.id);
       return `Navigated to ${p.url}`;
     }
 
@@ -2061,6 +2134,7 @@ async function perform(action, p, tab, fast) {
       catch (_) { return "Cannot go back: no earlier history entry."; }
       // Same-document (SPA pushState) moves fire no load event; cap the wait.
       await waitForLoad(tab.id, 4000);
+      await leaveIfBlocked(tab.id);
       const fresh = await chrome.tabs.get(tab.id);
       return `Went back to ${fresh.url}`;
     }
@@ -2069,6 +2143,7 @@ async function perform(action, p, tab, fast) {
       try { await chrome.tabs.goForward(tab.id); }
       catch (_) { return "Cannot go forward: no later history entry."; }
       await waitForLoad(tab.id, 4000);
+      await leaveIfBlocked(tab.id);
       const fresh = await chrome.tabs.get(tab.id);
       return `Went forward to ${fresh.url}`;
     }
@@ -2076,6 +2151,7 @@ async function perform(action, p, tab, fast) {
     case "reload": {
       await chrome.tabs.reload(tab.id, { bypassCache: !!p.hard });
       await waitForLoad(tab.id);
+      await leaveIfBlocked(tab.id);
       return p.hard ? "Hard-reloaded (cache bypassed)" : "Reloaded";
     }
 

@@ -369,7 +369,41 @@ and a live preview. Settings sync via `chrome.storage.sync` and apply live.
 ## Safety & security
 
 Every action is **audit-logged**, destructive clicks require **your approval**,
-and everything binds to **localhost only** — nothing is exposed to the network.
+sites you choose can be **blocked, read-only or always-ask**, and everything
+binds to **localhost only** — nothing is exposed to the network.
+
+<details>
+<summary><b>Site rules: block, read-only, always ask</b></summary>
+
+Decide per website what AI agents may do there. In the Otter popup, the row
+under the header shows the site of the tab you're on with
+**Normal · Ask · Read · Block**; the full list is in Options → *Site rules*.
+
+| Mode | AI agents may | Good for |
+|---|---|---|
+| **Block** | nothing — not open, read, screenshot or act | online banking, password managers |
+| **Read** | read and look (page text, elements, screenshots, console / network, measurements), not click, type or navigate | admin consoles you want summarised, not touched |
+| **Ask** | read freely; **every action** needs your OK — one OK covers that site in that tab for 5 minutes | sites where any slip matters |
+| *(no rule)* | as usual | |
+
+- **Ask works with Full Auto on.** Full Auto skips the destructive-action
+  prompts, but an Ask site still asks before every action (and
+  `BROWSER_AGENT_GATE=off` doesn't switch it off either). That's what makes
+  Full Auto safe to leave on: put the sites that matter on Ask or Block. An AI
+  app that can't show prompts is simply refused on Ask sites. A click you
+  approved as destructive ("Delete …") counts as your OK for that click.
+- A rule covers the site and all its subdomains (`bank.com` covers
+  `www.bank.com` and `login.bank.com`). When several match, the most specific
+  wins, so you can carve out exceptions: `bank.com` on Block with
+  `news.bank.com` on Read.
+- The extension enforces the rules, where the tab's real address is known:
+  opening a blocked site is refused before it loads, and an agent's tab that is
+  redirected into one is sent back to a blank page. A link an agent's page
+  follows by itself can still *load* a blocked site, but nothing can be read
+  or done there.
+- **Only you can change rules** — in the popup or Options. No AI tool can, just
+  like Full Auto. They sync with your other Otter settings.
+</details>
 
 <details>
 <summary><b>Full security model</b></summary>
@@ -394,6 +428,10 @@ and everything binds to **localhost only** — nothing is exposed to the network
   (hover the icon for "Full Auto is ON"). It is deliberately a
   browser-side switch: no MCP tool can change it, so a prompt-injected agent
   can't turn its own approvals off. Auto-approvals are still audit-logged.
+  Sites you set to **Ask** keep asking with Full Auto on (see *Site rules*).
+- **Site rules:** block a site, make it read-only, or make every action there
+  ask first — set by you only, enforced by the extension, and logged
+  (`site` entries: allowed / denied / blocked). See *Site rules* above.
 - **Destructive-action gate:** a `click` (or an Enter that would trigger one —
   see below) whose target text matches danger words
   (`buy/pay/delete/send/submit/checkout/confirm/transfer/…`) is hit-tested at
@@ -594,6 +632,7 @@ setup scripts (`bootstrap` + `start`) and docs. It's single-tab only. See
 - [x] Several AI clients at once (Claude Code + Claude Desktop + background sessions)
 - [x] Script replay (`run_script`) — recorded flows in one call
 - [x] Flow recorder — record a task in your own tab, replay it by name (`record_flow`, `flows`, `run_flow`)
+- [x] Per-site rules — block, read-only or always-ask sites, set only by you
 - [x] Iframes, shadow DOM, JS dialogs, file upload/download, key combinations
 - [x] Page snapshot + "what changed" reports — fewer screenshots and round trips
 - [x] Rookie-friendly releases — prebuilt `.mcpb` + extension zip on every release

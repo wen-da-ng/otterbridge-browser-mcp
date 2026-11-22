@@ -37,6 +37,35 @@ ok("new install: auto-close agent windows is on", C.normalize(undefined).autoClo
 ok("settings saved before v2: auto-close switched on", C.normalize({ autoCloseWindows: false }).autoCloseWindows === true);
 ok("switched off after v2: stays off", C.normalize({ autoCloseWindows: false, settingsVersion: 2 }).autoCloseWindows === false);
 
+// Site rules (0.11.0): which rule applies to a page.
+{
+  const rules = [
+    { pattern: "bank.com", mode: "block" },
+    { pattern: "news.bank.com", mode: "read" },
+    { pattern: "shop.example", mode: "ask" },
+  ];
+  const rule = (u) => C.siteRuleFor(u, rules)?.mode ?? null;
+  ok("site rule: exact host", rule("https://bank.com/login") === "block");
+  ok("site rule: subdomain", rule("https://accounts.bank.com/") === "block");
+  ok("site rule: www.", rule("https://www.shop.example/cart") === "ask");
+  ok("site rule: the longest pattern wins (exception carved out)", rule("https://news.bank.com/") === "read" && rule("https://a.news.bank.com/x") === "read");
+  ok("site rule: a similar name doesn't match", rule("https://notbank.com/") === null && rule("https://bank.com.evil.net/") === null);
+  ok("site rule: only http(s) pages", rule("chrome://settings") === null && rule("file:///C:/bank.com/x") === null && rule("about:blank") === null && rule("not a url") === null);
+  ok("site rule: ports and paths don't matter", rule("http://bank.com:8080/a?b#c") === "block");
+  ok("site rule: no rules -> none", C.siteRuleFor("https://bank.com/", []) === null && C.siteRuleFor("https://bank.com/", undefined) === null);
+  ok("site rule: patterns stored with a scheme / port / path / *. still match",
+    C.siteRuleFor("https://x.bank.com/", [{ pattern: "https://*.Bank.com:443/login", mode: "ask" }])?.mode === "ask");
+  const n = C.normalizeSitePattern;
+  ok("normalizeSitePattern: scheme, port, path, *. and case", n("https://*.Bank.COM:443/login?x=1") === "bank.com" && n("www.bank.com") === "www.bank.com");
+  ok("normalizeSitePattern: rejects what isn't a hostname", [
+    "", "   ", "bank com", "bank..com", "ba_nk.com", "*", "*.", "[::1]", "javascript:alert(1)", "bank.com:abc",
+  ].every((x) => n(x) === null), JSON.stringify(["", "bank com", "bank..com", "ba_nk.com", "*", "[::1]"].map(n)));
+  ok("normalize(): no stored rules -> []", Array.isArray(C.normalize(undefined).siteRules) && C.normalize({}).siteRules.length === 0);
+  const kept = C.normalize({ siteRules: [{ pattern: "Bank.com", mode: "block" }, { pattern: "bad host", mode: "ask" }, { pattern: "x.com", mode: "allow" }, { pattern: "bank.com", mode: "read" }] }).siteRules;
+  ok("normalize(): keeps valid rules, normalised, last one per pattern wins", JSON.stringify(kept) === '[{"pattern":"bank.com","mode":"read"}]', JSON.stringify(kept));
+  ok("normalize() never shares the defaults' list", C.normalize(undefined).siteRules !== C.DEFAULTS.siteRules);
+}
+
 // page.js is one big closure: a second function with an existing name
 // silently replaces the first (this once broke read_elements).
 // recorder.js is built the same way.

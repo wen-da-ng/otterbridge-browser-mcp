@@ -187,8 +187,95 @@ function setupPreview() {
   preview.raf = requestAnimationFrame(loop);
 }
 
+// ---- Site rules ----
+// The user's list of { pattern, mode }; saved with the other settings.
+const MODE_LABELS = [["ask", "Ask before every action"], ["read", "Read only"], ["block", "Block"]];
+
+function renderSiteRules() {
+  const box = document.getElementById("siteRules");
+  box.textContent = "";
+  const rules = [...(state.siteRules || [])].sort((a, b) => a.pattern.localeCompare(b.pattern));
+  if (!rules.length) {
+    const p = document.createElement("div");
+    p.className = "rules-empty";
+    p.textContent = "No site rules yet: AI agents may use every site (approval prompts still apply).";
+    box.appendChild(p);
+    return;
+  }
+  for (const r of rules) {
+    const row = document.createElement("div");
+    row.className = "rule-row";
+    const name = document.createElement("span");
+    name.className = "pattern";
+    name.textContent = r.pattern;
+    const sel = document.createElement("select");
+    sel.setAttribute("aria-label", `What AI agents may do on ${r.pattern}`);
+    for (const [v, lbl] of MODE_LABELS) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = lbl;
+      sel.appendChild(o);
+    }
+    sel.value = r.mode;
+    sel.addEventListener("change", () => {
+      state.siteRules = state.siteRules.map((x) => (x.pattern === r.pattern ? { pattern: x.pattern, mode: sel.value } : x));
+      persist();
+    });
+    const del = document.createElement("button");
+    del.className = "rule-del";
+    del.textContent = "✕";
+    del.title = "Remove";
+    del.setAttribute("aria-label", `Remove the rule for ${r.pattern}`);
+    del.addEventListener("click", () => {
+      state.siteRules = state.siteRules.filter((x) => x.pattern !== r.pattern);
+      persist();
+      renderSiteRules();
+    });
+    row.append(name, sel, del);
+    box.appendChild(row);
+  }
+}
+
+function setupSiteRules() {
+  const input = document.getElementById("sitePattern");
+  const err = document.getElementById("siteErr");
+  const showErr = (msg) => {
+    err.textContent = msg;
+    err.hidden = !msg;
+    input.setAttribute("aria-invalid", String(!!msg));
+  };
+  const add = () => {
+    const pattern = C.normalizeSitePattern(input.value);
+    if (!pattern) {
+      showErr(input.value.trim()
+        ? "That isn't a website name. Use something like mybank.com or mail.example.org."
+        : "Type a website, e.g. mybank.com.");
+      input.focus();
+      return;
+    }
+    showErr("");
+    const mode = document.getElementById("siteMode").value;
+    state.siteRules = [...(state.siteRules || []).filter((r) => r.pattern !== pattern), { pattern, mode }];
+    input.value = "";
+    persist();
+    renderSiteRules();
+  };
+  document.getElementById("siteAdd").addEventListener("click", add);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+  input.addEventListener("input", () => { if (!err.hidden) showErr(""); });
+  // Changed in the popup meanwhile: show it (and don't save over it).
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "sync" && changes[C.KEY]) {
+      state.siteRules = C.normalize(changes[C.KEY].newValue).siteRules;
+      renderSiteRules();
+    }
+  });
+  renderSiteRules();
+}
+
 async function init() {
   state = await C.load();
+  setupSiteRules();
   for (const item of SCHEMA) {
     const container = document.querySelector(`.controls[data-group="${item.group}"]`);
     container.appendChild(makeRow(item));
@@ -205,7 +292,8 @@ async function init() {
     });
   });
   document.getElementById("reset").addEventListener("click", () => {
-    state = { ...C.DEFAULTS };
+    // Resets how the cursor behaves — not the user's site rules.
+    state = { ...C.DEFAULTS, siteRules: state.siteRules };
     syncControls(); persist();
   });
 }

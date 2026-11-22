@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.11.0 — 2026-11-22
+
+### Added
+
+- **Site rules: decide per website what AI agents may do there.** In the Otter
+  popup, the row under the header shows the current tab's site with
+  **Normal · Ask · Read · Block**; Options has the full list (*Site rules*:
+  add, change, remove).
+  - **Block:** agents can't open, read, screenshot or act on the site — e.g.
+    online banking, password managers.
+  - **Read:** agents can read and look (page text, elements, screenshots,
+    console / network, measurements) but not click, type or navigate.
+  - **Ask:** agents read freely, but every action needs your OK; one OK covers
+    that site in that tab for 5 minutes, and a whole `run_script` / `run_flow`
+    replay there asks once.
+  - A rule covers the site and its subdomains; the most specific rule wins
+    (`news.bank.com: Read` inside `bank.com: Block`).
+
+### Security
+
+- **Ask still asks with Full Auto on** — and with `BROWSER_AGENT_GATE=off`.
+  An AI app that can't show prompts is refused on Ask sites (never the
+  "allow" fallback). A click you approved yourself as destructive counts as
+  your OK for that click; Full Auto's automatic approval doesn't.
+- **Only you can set rules**, in the popup or Options — no tool can change
+  them, like Full Auto. They sync with your other Otter settings.
+- The extension enforces the rules against the tab's real address: opening a
+  blocked site (`navigate`, `open_tab`, `perf_audit`) is refused before it
+  loads; an agent's tab that is redirected into a blocked site — or is found on
+  one — is sent back to `about:blank`; `get_user_tab` refuses a blocked tab,
+  and `list_tabs` doesn't show a blocked tab's title.
+- Every site decision is audit-logged (`site`: allowed / denied / blocked).
+
+### Changed
+
+- "Reset to defaults" in Options no longer clears your site rules (it resets
+  how the cursor behaves).
+
+### Notes
+
+- A link an agent's page follows by itself can still *load* a blocked site in
+  the agent's tab; nothing can be read or done there, and the next action sends
+  the tab back to a blank page.
+- Rules are per host (and subdomains), not per path: `example.com/admin` can't
+  be ruled separately.
+
 ## 0.10.0 — 2026-11-21
 
 ### Added

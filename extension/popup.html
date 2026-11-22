@@ -100,6 +100,13 @@
     .speed-head .stack-label { margin: 0; }
     .custom-tag { font-size: 12px; color: var(--accent); font-weight: 550; }
 
+    /* This site: what AI agents may do here */
+    .site { margin-top: 12px; }
+    .site + section { margin-top: 12px; }
+    .site-host { display: block; margin-bottom: 5px; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .seg.seg4 { grid-template-columns: repeat(4, 1fr); }
+    .seg button[data-mode="block"][aria-pressed="true"] { color: var(--danger); }
+
     /* Flows */
     .rec-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--danger); margin-right: 6px; vertical-align: 1px; }
     .save-row { display: flex; gap: 6px; margin-top: 8px; }
@@ -124,6 +131,17 @@
     <img class="logo" src="icons/icon128.png" alt="" />
     <b>OtterBridge</b>
     <span class="status" id="status" role="status" data-tone="idle"><span class="dot"></span><span id="statusText">—</span></span>
+  </div>
+
+  <div class="site" id="siteRow" hidden>
+    <span class="site-host" id="siteHost"></span>
+    <div class="seg seg4" role="group" aria-label="What AI agents may do on this site" id="siteModes">
+      <button data-mode="" aria-pressed="false" title="No rule: as usual">Normal</button>
+      <button data-mode="ask" aria-pressed="false" title="Every action needs your OK, even in Full Auto">Ask</button>
+      <button data-mode="read" aria-pressed="false" title="Agents can look, not touch">Read</button>
+      <button data-mode="block" aria-pressed="false" title="Agents can't open or read this site">Block</button>
+    </div>
+    <div class="sub" id="siteHint" hidden></div>
   </div>
 
   <section aria-label="Security">

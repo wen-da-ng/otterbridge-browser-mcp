@@ -98,6 +98,23 @@
     .saved { color: var(--accent); font-weight: 600; opacity: 0; transition: opacity .2s; }
     .saved.show { opacity: 1; }
     .disabled { opacity: .45; pointer-events: none; }
+
+    /* Site rules */
+    .rules-empty { color: var(--muted); padding: 11px 0; }
+    .rule-row { display: grid; grid-template-columns: 1fr 200px 36px; align-items: center; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+    .rule-row .pattern { font-weight: 600; overflow-wrap: anywhere; }
+    .rule-del, .site-add button {
+      padding: 7px 10px; border: 1px solid var(--border); background: var(--panel);
+      border-radius: 8px; cursor: pointer; color: var(--text); font-weight: 600;
+    }
+    .site-add { display: grid; grid-template-columns: 1fr 200px auto; gap: 14px; padding: 12px 16px 4px; }
+    .site-add input {
+      padding: 7px 9px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text); font: inherit;
+    }
+    .site-add input[aria-invalid="true"] { border-color: #c5221f; }
+    .site-err { color: #c5221f; margin: 4px 16px 0; font-size: 13px; }
+    .site-note { color: var(--muted); padding: 8px 16px 12px; margin: 0; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -141,6 +158,31 @@
     <section>
       <h2>Appearance</h2>
       <div class="controls" data-group="appearance"></div>
+    </section>
+    <section>
+      <h2>Site rules</h2>
+      <div class="controls" id="siteRules" aria-live="polite"></div>
+      <div class="site-add">
+        <input id="sitePattern" type="text" spellcheck="false" placeholder="e.g. mybank.com"
+               aria-label="Site" aria-describedby="siteErr" />
+        <select id="siteMode" aria-label="What AI agents may do there">
+          <option value="ask">Ask before every action</option>
+          <option value="read">Read only</option>
+          <option value="block">Block</option>
+        </select>
+        <button id="siteAdd">Add</button>
+      </div>
+      <p class="site-err" id="siteErr" hidden></p>
+      <p class="site-note">
+        <b>Block</b>: AI agents can't open, read, screenshot or act on the site.
+        <b>Read only</b>: they can read and look, not click, type or navigate.
+        <b>Ask</b>: they read freely, but every action needs your OK — even with
+        Full Auto on (one OK covers that site in that tab for 5 minutes).
+        A rule covers the site and all its subdomains. When several match, the
+        most specific wins: with <code>bank.com</code> blocked and
+        <code>news.bank.com</code> read-only, news.bank.com is read-only and the
+        rest of bank.com blocked. Only you can change these — no AI tool can.
+      </p>
     </section>
     <section>
       <h2>Advanced</h2>

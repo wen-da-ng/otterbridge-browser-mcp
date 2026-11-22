@@ -117,7 +117,7 @@ async function audit(
   }
 }
 
-const SERVER_VERSION = "0.10.0";
+const SERVER_VERSION = "0.11.0";
 
 // ===== Pairing =====
 // The extension and every server share one secret, the pairing code, and prove
@@ -873,6 +873,10 @@ async function sendCmd(
     socket.send(JSON.stringify({ id, action, params: params ?? {} }));
   });
   if (data.error) {
+    const blocked = SITE_BLOCK_RE.exec(data.error) ?? SITE_READ_RE.exec(data.error);
+    if (blocked) {
+      await audit("site", undefined, `${blocked[1]}: ${SITE_BLOCK_RE.test(data.error) ? "blocked" : "blocked (read-only)"} (${action})`);
+    }
     if (data.error === `Unknown action: ${action}`) {
       throw new Error(
         `The Otter Chrome extension is older than this server and doesn't support ${action}. Ask the ` +
@@ -899,17 +903,20 @@ async function fullAuto(profileId: string | null): Promise<boolean> {
 }
 
 // Ask the human to approve a destructive action via MCP elicitation. Returns
-// true only on explicit approval. Fail-safe on any error (client can't elicit).
+// false unless approved, and otherwise HOW: "user" (the person said yes in a
+// prompt) or "auto" (Full Auto, BROWSER_AGENT_GATE=off, or the fallback for
+// apps that can't prompt). Fail-safe on any error (client can't elicit).
 // profileId: Full Auto is a per-profile switch — ask the profile being acted in.
+type Approval = false | "user" | "auto";
 async function approved(
   server: McpServer,
   profileId: string | null,
   message: string,
-): Promise<boolean> {
-  if (GATE_OFF) return true;
+): Promise<Approval> {
+  if (GATE_OFF) return "auto";
   if (await fullAuto(profileId)) {
     await audit("gate", undefined, `auto-approved (Full Auto): ${message}`);
-    return true;
+    return "auto";
   }
   try {
     const res = await server.server.elicitInput({
@@ -920,7 +927,7 @@ async function approved(
     });
     const ok = res.action === "accept";
     await audit("gate", undefined, `user ${ok ? "approved" : "denied"}: ${message}`);
-    return ok;
+    return ok ? "user" : false;
   } catch (e) {
     // Client can't elicit (unsupported / no prompt UI).
     await audit(
@@ -928,9 +935,41 @@ async function approved(
       undefined,
       `elicit-unavailable (${(e as Error).message}); fallback=${FALLBACK_ALLOW ? "allow" : "deny"}`,
     );
-    return FALLBACK_ALLOW;
+    return FALLBACK_ALLOW ? "auto" : false;
   }
 }
+
+// What an approved command carries to the extension: `gated` for its own
+// destructive-action check, plus `gatedBy: "user"` when a person answered
+// the prompt — only that also counts for an "always ask" site (see
+// approvedAlways): Full Auto must never wave an action through there.
+const gateMark = (how: Approval) =>
+  how === "user" ? { gated: true as const, gatedBy: "user" as const } : how ? { gated: true as const } : {};
+
+// ===== Site rules ("always ask") =====
+// The user can set a site to "always ask" in Otter: every action there needs
+// their OK — even with Full Auto on or BROWSER_AGENT_GATE=off, and an app that
+// can't show prompts is denied (never the fallback). Only a person answering
+// counts.
+async function approvedAlways(server: McpServer, message: string): Promise<boolean> {
+  try {
+    const res = await server.server.elicitInput({
+      message,
+      requestedSchema: { type: "object", properties: {} },
+    });
+    const ok = res.action === "accept";
+    await audit("gate", undefined, `user ${ok ? "approved" : "denied"}: ${message}`);
+    return ok;
+  } catch (e) {
+    await audit("gate", undefined, `elicit-unavailable (${(e as Error).message}); site rule -> deny`);
+    return false;
+  }
+}
+
+// The extension refuses actions on blocked / read-only sites with these
+// messages (extension/background.js): logged as site decisions.
+const SITE_BLOCK_RE = /^Otter's site rules block AI agents on (\S+)\. /;
+const SITE_READ_RE = /^(\S+) is read-only for AI agents \(Otter site rules\)\./;
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
 
@@ -1570,6 +1609,33 @@ function buildServer(stdio = false): McpServer {
     return opening;
   };
 
+  // "Always ask" sites: one approval covers that site in that tab for 5
+  // minutes (key: profile:tab:host -> when approved). Concurrent calls share
+  // one prompt.
+  const SITE_ASK_MS = 5 * 60 * 1000;
+  const siteApprovals = new Map<string, number>();
+  const sitePrompts = new Map<string, Promise<boolean>>();
+  const siteOk = async (key: string, host: string): Promise<boolean> => {
+    const at = siteApprovals.get(key);
+    if (at && Date.now() - at < SITE_ASK_MS) {
+      await audit("site", undefined, `${host}: allowed (approved earlier)`);
+      return true;
+    }
+    let p = sitePrompts.get(key);
+    if (!p) {
+      p = approvedAlways(
+        server,
+        `${host} is set to "always ask" in Otter. Allow the AI to act on it in this tab for the next 5 minutes?`,
+      ).then(async (ok) => {
+        if (ok) siteApprovals.set(key, Date.now());
+        await audit("site", undefined, `${host}: ${ok ? "allowed" : "denied"}`);
+        return ok;
+      }).finally(() => sitePrompts.delete(key));
+      sitePrompts.set(key, p);
+    }
+    return p;
+  };
+
   // Dispatch a tab-scoped command: explicit `tab`, else the session's tab.
   const act = async (
     action: string,
@@ -1579,7 +1645,21 @@ function buildServer(stdio = false): McpServer {
   ): Promise<any> => {
     const tabId = tab ?? (await ensureTab());
     try {
-      return await cmd(action, { ...params, agentId, tabId }, timeoutMs, profileOfTab(tabId));
+      const pid = profileOfTab(tabId);
+      let res = await cmd(action, { ...params, agentId, tabId }, timeoutMs, pid);
+      if (res && typeof res === "object" && res.siteAsk) {
+        // The tab is on a site the user set to "always ask": the extension
+        // didn't act. Ask (or use this tab's recent approval), then resend once.
+        const host = String(res.siteAsk.host ?? "this site");
+        if (!(await siteOk(`${pid ?? ""}:${tabId}:${host}`, host))) {
+          throw new Error(`Action denied by user: ${host} is set to always ask.`);
+        }
+        res = await cmd(action, { ...params, agentId, tabId, siteApproved: true }, timeoutMs, pid);
+        if (res && typeof res === "object" && res.siteAsk) {
+          throw new Error(`The page moved to another "always ask" site (${res.siteAsk.host}); try again.`);
+        }
+      }
+      return res;
     } catch (e) {
       const msg = (e as Error).message;
       if (tab == null && /^Tab \d+ not found/.test(msg)) {
@@ -1656,15 +1736,13 @@ function buildServer(stdio = false): McpServer {
       // gated: the user (or Full Auto / BROWSER_AGENT_GATE=off) approved
       // exactly this text. The extension refuses a destructive-looking click
       // that arrives without it — a second line of defence, see config.js.
-      let gated = false;
+      let gated: Approval = false;
       if (button === "left" && DANGER_RE.test(expectText)) {
         const label =
           expectText.trim().slice(0, 60) ||
           (target.index != null ? `element ${target.index}` : `(${target.x}, ${target.y})`);
-        if (!(await approved(server, profileOfTab(tab) ?? null, `Approve clicking the '${label}' element? This looks destructive.`))) {
-          return `Action denied by user: click on '${label}'.`;
-        }
-        gated = true;
+        gated = await approved(server, profileOfTab(tab) ?? null, `Approve clicking the '${label}' element? This looks destructive.`);
+        if (!gated) return `Action denied by user: click on '${label}'.`;
       }
       const res = await act("click", tab, {
         ...target,
@@ -1674,7 +1752,7 @@ function buildServer(stdio = false): McpServer {
         button,
         double: opts.double ?? false,
         noReport: opts.noReport ?? false,
-        ...(gated ? { gated: true } : {}),
+        ...gateMark(gated),
       });
       if (res && typeof res === "object" && res.covered) {
         // Something sits on top of the target (cookie banner, modal, overlay):
@@ -1724,7 +1802,10 @@ function buildServer(stdio = false): McpServer {
   // — and gate it like a click when that looks destructive. Shift+Enter alone
   // isn't gated: in chat boxes it's the newline key.
   // Returns params to send (gated when approved) or the denial text.
-  const enterGate = async (tab: number | undefined, index?: number): Promise<{ gated?: true } | string> => {
+  const enterGate = async (
+    tab: number | undefined,
+    index?: number,
+  ): Promise<{ gated?: true; gatedBy?: "user" } | string> => {
     let labels: string[] = [];
     try {
       labels = (await act("enter_target", tab, { index }))?.labels ?? [];
@@ -1734,10 +1815,9 @@ function buildServer(stdio = false): McpServer {
     const hit = labels.find((l) => DANGER_RE.test(l));
     if (!hit) return {};
     const label = hit.trim().slice(0, 60);
-    if (!(await approved(server, profileOfTab(tab) ?? null, `Approve pressing Enter? It would trigger '${label}', which looks destructive.`))) {
-      return `Action denied by user: Enter would trigger '${label}'.`;
-    }
-    return { gated: true };
+    const how = await approved(server, profileOfTab(tab) ?? null, `Approve pressing Enter? It would trigger '${label}', which looks destructive.`);
+    if (!how) return `Action denied by user: Enter would trigger '${label}'.`;
+    return gateMark(how);
   };
 
   // Answer a JS dialog. Saying OK to a confirm that reads destructive ("Delete
@@ -1753,17 +1833,16 @@ function buildServer(stdio = false): McpServer {
     // reported it). Answer anyway; Chrome says if nothing is showing. An
     // unread dialog can't be checked for danger words, so OK needs approval.
     if (!info || !info.open) {
-      if (accept && !(await approved(server, profileOfTab(tab) ?? null, "Approve answering OK to a JavaScript dialog whose text couldn't be read?"))) {
-        return "Action denied by user: accepting an unread dialog.";
-      }
-      return act("handle_dialog", tab, { accept, text: promptText, ...(accept ? { gated: true } : {}) });
+      if (!accept) return act("handle_dialog", tab, { accept, text: promptText });
+      const how = await approved(server, profileOfTab(tab) ?? null, "Approve answering OK to a JavaScript dialog whose text couldn't be read?");
+      if (!how) return "Action denied by user: accepting an unread dialog.";
+      return act("handle_dialog", tab, { accept, text: promptText, ...gateMark(how) });
     }
     if (accept && info.type !== "alert" && DANGER_RE.test(info.message ?? "")) {
       const msg = String(info.message).slice(0, 200);
-      if (!(await approved(server, profileOfTab(tab) ?? null, `Approve answering OK to this ${info.type} dialog?\n\n"${msg}"`))) {
-        return `Action denied by user: accepting the ${info.type} dialog.`;
-      }
-      return act("handle_dialog", tab, { accept, text: promptText, gated: true });
+      const how = await approved(server, profileOfTab(tab) ?? null, `Approve answering OK to this ${info.type} dialog?\n\n"${msg}"`);
+      if (!how) return `Action denied by user: accepting the ${info.type} dialog.`;
+      return act("handle_dialog", tab, { accept, text: promptText, ...gateMark(how) });
     }
     return act("handle_dialog", tab, { accept, text: promptText });
   };
@@ -2260,10 +2339,9 @@ function buildServer(stdio = false): McpServer {
     },
     async ({ code, tab }) => {
       const preview = code.length > 200 ? code.slice(0, 200) + "…" : code;
-      if (!(await approved(server, profileOfTab(tab) ?? null, `Approve running JavaScript in the page?\n\n${preview}`))) {
-        return text("Action denied by user: evaluate_js.");
-      }
-      return text(JSON.stringify(await act("evaluate_js", tab, { code, gated: true })));
+      const how = await approved(server, profileOfTab(tab) ?? null, `Approve running JavaScript in the page?\n\n${preview}`);
+      if (!how) return text("Action denied by user: evaluate_js.");
+      return text(JSON.stringify(await act("evaluate_js", tab, { code, ...gateMark(how) })));
     },
   );
 
@@ -2940,10 +3018,9 @@ function buildServer(stdio = false): McpServer {
       // Locate the input first, so the approval names the actual website.
       const probe = await act("upload_file", tab, { files, index, selector, dryRun: true });
       const names = files.map((f) => basename(f)).join(", ");
-      if (!(await approved(server, profileOfTab(tab) ?? null, `Approve uploading ${names} to ${hostOf(probe.url)}?`))) {
-        return text(`Action denied by user: upload of ${names}.`);
-      }
-      return text(await act("upload_file", tab, { files, index, selector, gated: true }));
+      const how = await approved(server, profileOfTab(tab) ?? null, `Approve uploading ${names} to ${hostOf(probe.url)}?`);
+      if (!how) return text(`Action denied by user: upload of ${names}.`);
+      return text(await act("upload_file", tab, { files, index, selector, ...gateMark(how) }));
     },
   );
 

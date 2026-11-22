@@ -61,6 +61,11 @@
     // --- Advanced ---
     allowJsEval: false, // permit the evaluate_js tool to run JS in pages (opt-in)
 
+    // --- Site rules ---
+    // [{ pattern: "bank.com", mode: "block" | "read" | "ask" }], set only by
+    // the user (popup / options) — no tool can change them. See siteRuleFor.
+    siteRules: [],
+
     // --- Appearance ---
     size: 32, // px
     colorStart: "#FFE014", // gradient top
@@ -111,7 +116,57 @@
       s.autoCloseWindows = true;
       s.settingsVersion = 2;
     }
+    s.siteRules = normalizeSiteRules(stored && stored.siteRules);
     return s;
+  }
+
+  // ---- Site rules ----
+  // What AI agents may do on a site: "block" (nothing — not open, read or
+  // act), "read" (look, not touch), "ask" (every action needs the user's OK,
+  // even in Full Auto). No rule: as usual. Enforced by background.js.
+  const SITE_MODES = ["block", "read", "ask"];
+
+  // "https://www.Bank.com:443/login" -> "www.bank.com"; "*.bank.com" ->
+  // "bank.com". null unless what's left is a hostname.
+  function normalizeSitePattern(input) {
+    let s = String(input == null ? "" : input).trim().toLowerCase();
+    s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, ""); // scheme
+    s = s.replace(/[/?#].*$/, "");                // path, query, fragment
+    s = s.replace(/^[^@]*@/, "");                 // user:pass@
+    s = s.replace(/:\d*$/, "");                   // port
+    s = s.replace(/^\*\./, "");                   // leading *.
+    s = s.replace(/\.$/, "");                     // trailing dot
+    if (!s || s.length > 253 || !/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(s)) return null;
+    return s;
+  }
+
+  // Valid rules only, one per pattern (the last one wins), patterns normalised.
+  function normalizeSiteRules(rules) {
+    const byPattern = new Map();
+    for (const r of Array.isArray(rules) ? rules : []) {
+      if (!r || !SITE_MODES.includes(r.mode)) continue;
+      const pattern = normalizeSitePattern(r.pattern);
+      if (pattern) byPattern.set(pattern, { pattern, mode: r.mode });
+    }
+    return [...byPattern.values()];
+  }
+
+  // The rule for a page, or null. A pattern covers its host and every
+  // subdomain; the longest (most specific) matching pattern wins, so
+  // "news.bank.com: read" carves an exception out of "bank.com: block".
+  function siteRuleFor(url, rules) {
+    let u;
+    try { u = new URL(url); } catch (_) { return null; }
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    const host = u.hostname.toLowerCase().replace(/\.$/, "");
+    let best = null;
+    for (const r of rules || []) {
+      if (!r || !SITE_MODES.includes(r.mode)) continue;
+      const p = normalizeSitePattern(r.pattern);
+      if (!p || !(host === p || host.endsWith("." + p))) continue;
+      if (!best || p.length > best.pattern.length) best = { pattern: p, mode: r.mode };
+    }
+    return best;
   }
 
   // ---- Derived motion values (kept here so content/background agree) ----
@@ -220,5 +275,6 @@
     load, save,
     normalizePairingCode,
     DANGER_SOURCE, isDanger, refuseUngated,
+    SITE_MODES, normalizeSitePattern, normalizeSiteRules, siteRuleFor,
   };
 })(typeof self !== "undefined" ? self : this);

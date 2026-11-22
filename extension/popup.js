@@ -315,10 +315,69 @@ async function initPairing() {
   });
 }
 
+// ---- This site: what AI agents may do on the active tab's site ----
+// Writes (or removes) the rule for this exact host (without "www."). No tool
+// can change rules: only this popup and the options page.
+let siteUrl = null;
+let sitePattern = null;
+const SITE_HINTS = {
+  ask: "Ask: every action needs your OK, even in Full Auto",
+  read: "Read: agents can look, not touch",
+  block: "Block: agents can't open or read this site",
+};
+
+async function initSite() {
+  let tab = null;
+  try { [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); } catch (_) {}
+  let u = null;
+  try { u = new URL(tab && tab.url); } catch (_) {}
+  if (!u || (u.protocol !== "http:" && u.protocol !== "https:")) return; // stays hidden
+  sitePattern = C.normalizeSitePattern(u.hostname.replace(/^www\./, ""));
+  if (!sitePattern) return;
+  siteUrl = u.href;
+  $("siteHost").textContent = u.hostname;
+  $("siteHost").title = u.hostname;
+  $("siteRow").hidden = false;
+  document.querySelectorAll("#siteModes button").forEach((b) => {
+    b.addEventListener("click", () => setSiteMode(b.dataset.mode));
+  });
+  renderSite();
+}
+
+function renderSite() {
+  if (!siteUrl) return;
+  const rule = C.siteRuleFor(siteUrl, state.siteRules);
+  const mode = rule ? rule.mode : "";
+  document.querySelectorAll("#siteModes button").forEach((b) => {
+    b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
+  });
+  const from = rule && rule.pattern !== sitePattern ? ` (rule for ${rule.pattern}, in Settings)` : "";
+  setSub($("siteHint"), rule ? [rule.mode === "block" ? "danger" : "", SITE_HINTS[rule.mode] + from] : ["", ""]);
+}
+
+async function setSiteMode(mode) {
+  const s = await C.load(); // fresh: the options page may have changed rules
+  s.siteRules = s.siteRules.filter((r) => r.pattern !== sitePattern);
+  if (mode) s.siteRules.push({ pattern: sitePattern, mode });
+  await C.save(s);
+  state = s;
+  renderSite();
+}
+
+// Settings changed elsewhere (options page, another popup): show them.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync" && changes[C.KEY]) {
+    state = C.normalize(changes[C.KEY].newValue);
+    reflect();
+    renderSite();
+  }
+});
+
 // ---- Wiring ----
 async function init() {
   state = await C.load();
   reflect();
+  initSite();
   initProfile();
   initFlows();
   initPairing();
