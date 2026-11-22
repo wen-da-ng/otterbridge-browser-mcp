@@ -1565,7 +1565,8 @@ function buildServer(stdio = false): McpServer {
       const fresh = profileEvents.slice(sess.eventIx);
       sess.eventIx = profileEvents.length;
       if (fresh.length && Array.isArray(res?.content)) {
-        res.content.push({ type: "text", text: fresh.join("\n") });
+        // Leading line break: some apps join text blocks with no separator.
+        res.content.push({ type: "text", text: "\n" + fresh.join("\n") });
         if (res.structuredContent) res.structuredContent = { ...res.structuredContent, notes: fresh };
       }
       return res;
